@@ -4,7 +4,12 @@ import test, { mock } from "node:test";
 import type { VerifiedBundleIdentity } from "@/shared/bundle-identity";
 import type { SingleMeta, RestorePhaseMetrics } from "@/shared/types";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
-import { _resetStoreForTesting, getInitializedMeta } from "@/server/store/store";
+import {
+  _resetStoreForTesting,
+  getInitializedMeta,
+  getStore,
+} from "@/server/store/store";
+import { channelConfigLockKey } from "@/server/store/keyspace";
 import {
   setSlackChannelConfig,
   setTelegramChannelConfig,
@@ -16,6 +21,7 @@ import {
 import {
   processChannelStep,
   buildExistingBootHandle,
+  drainChannelWorkflow,
   toWorkflowProcessingError,
   type DrainChannelWorkflowDependencies,
   type ChannelWorkflowHandoff,
@@ -227,6 +233,23 @@ test("processChannelStep skips ensureSandboxReady when boot returns running", as
   // the redundant public gateway probe that times out in workflow steps.
   assert.equal(ensureCalls, 0);
   assert.equal(forwardedSandboxId, "sbx-booted");
+});
+
+test("drainChannelWorkflow settles legacy Telegram work without a config generation", async () => {
+  await drainChannelWorkflow({
+    version: 1,
+    channel: "telegram",
+    payload: { update_id: 99 },
+    origin: "https://example.test",
+    requestId: "req-missing-generation",
+    workflowHandoff: null,
+  });
+
+  const staleLog = getServerLogs().find(
+    (entry) => entry.message === "channels.telegram_workflow_handoff_stale",
+  );
+  assert.equal(staleLog?.data?.reason, "missing");
+  assert.equal(staleLog?.data?.phase, "step-start");
 });
 
 test("processChannelStep revalidates lifecycle after fast-path admission closes", async () => {
@@ -732,6 +755,15 @@ test("processChannelStep forwards a queued Telegram handoff for the current gene
   let forwardedWebhookSecret: string | null = null;
 
   await setTelegramChannelConfig(currentConfig);
+  const store = getStore();
+  const acquireLock = store.acquireLock.bind(store);
+  const configLeaseTtls: number[] = [];
+  store.acquireLock = async (key, ttlSeconds) => {
+    if (key === channelConfigLockKey("telegram")) {
+      configLeaseTtls.push(ttlSeconds);
+    }
+    return acquireLock(key, ttlSeconds);
+  };
 
   const dependencies = createWorkflowDependencies({
     runWithBootMessages: async () => ({
@@ -753,6 +785,15 @@ test("processChannelStep forwards a queued Telegram handoff for the current gene
       _payload: unknown,
       meta: SingleMeta,
     ): Promise<RetryingForwardResult> => {
+      const competingConfigLock = await getStore().acquireLock(
+        channelConfigLockKey("telegram"),
+        90,
+      );
+      assert.equal(
+        competingConfigLock,
+        null,
+        "Telegram config must stay leased through native dispatch",
+      );
       forwardedWebhookSecret = meta.channels.telegram?.webhookSecret ?? null;
       return {
         ok: true,
@@ -781,6 +822,11 @@ test("processChannelStep forwards a queued Telegram handoff for the current gene
   );
 
   assert.equal(forwardedWebhookSecret, currentConfig.webhookSecret);
+  assert.ok(
+    (configLeaseTtls[0] ?? 0) >= 115,
+    "Telegram dispatch lease must cover the retry deadline and final fetch",
+  );
+  store.acquireLock = acquireLock;
 });
 
 test("processChannelStep fails closed when post-wake bundle identity cannot be verified", async () => {
@@ -2170,6 +2216,79 @@ test("processChannelStep does not report Slack boot cleanup success for API reje
           "channels.slack_boot_message_cleanup_after_accept_failed",
       ),
     );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep cleans a Slack boot message with its handoff credential after rotation", async () => {
+  const originalConfig = {
+    signingSecret: "original-signing-secret",
+    botToken: "xoxb-original-token",
+    configuredAt: Date.now(),
+  };
+  const rotatedConfig = {
+    signingSecret: "rotated-signing-secret",
+    botToken: "xoxb-rotated-token",
+    configuredAt: originalConfig.configuredAt + 1,
+  };
+  await setSlackChannelConfig(originalConfig);
+  let deleteAuthorization: string | null = null;
+  const fetchMock = mock.method(globalThis, "fetch", async (
+    _input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ) => {
+    deleteAuthorization = new Headers(init?.headers).get("authorization");
+    return Response.json({ ok: true });
+  });
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => {
+      await setSlackChannelConfig(rotatedConfig);
+      return {
+        meta: asMeta({
+          status: "running",
+          sandboxId: "sbx-slack-rotated",
+          channels: {
+            telegram: null,
+            slack: rotatedConfig,
+            discord: null,
+            whatsapp: null,
+          },
+        }),
+        bootMessageSent: true,
+        admissionReady: true,
+      };
+    },
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
+      ok: true,
+      status: 200,
+      attempts: 1,
+      totalMs: 50,
+      transport: "public",
+      retries: [],
+    }),
+  });
+
+  try {
+    await processChannelStep(
+      "slack",
+      { event: { channel: "C-rotated", ts: "1710000000.000666" } },
+      "test",
+      "req-slack-rotated",
+      "boot-slack-original",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: {
+            botToken: originalConfig.botToken,
+            configuredAt: originalConfig.configuredAt,
+          },
+        },
+      },
+    );
+
+    assert.equal(deleteAuthorization, "Bearer xoxb-original-token");
   } finally {
     fetchMock.mock.restore();
   }

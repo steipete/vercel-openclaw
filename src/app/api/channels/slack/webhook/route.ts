@@ -835,6 +835,10 @@ export async function POST(request: Request): Promise<Response> {
         bootMessageId: bootMessageTs,
         receivedAtMs,
         workflowHandoff: {
+          slackCleanupConfig: {
+            botToken: config.botToken,
+            configuredAt: config.configuredAt,
+          },
           revalidateSandboxBeforeForward,
           slackForwardHeaders,
           slackRawBody: rawBody,

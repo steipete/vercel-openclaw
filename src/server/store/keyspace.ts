@@ -159,6 +159,10 @@ export function channelUserMessageDedupKey(
   return buildKey(`channels:${channel}:user-message-dedup:${channelId}:${ts}`);
 }
 
+export function channelConfigLockKey(channel: ChannelName): string {
+  return buildKey(`channels:${channel}:config-lock`);
+}
+
 export function watchdogReportKey(): string {
   return buildKey("watchdog:latest");
 }

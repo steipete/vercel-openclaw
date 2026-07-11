@@ -11,6 +11,7 @@ import type { SingleMeta } from "@/shared/types";
 import {
   buildChannelConnectabilityMap,
 } from "@/server/channels/connectability";
+import { withChannelConfigLease } from "@/server/channels/config-lock";
 import {
   isPublicUrl,
 } from "@/server/channels/discord/application";
@@ -128,9 +129,11 @@ export async function setSlackChannelConfig(
 export async function setTelegramChannelConfig(
   config: TelegramChannelConfig | null,
 ): Promise<SingleMeta> {
-  return mutateMeta((meta) => {
-    meta.channels.telegram = config;
-  });
+  return withChannelConfigLease("telegram", () =>
+    mutateMeta((meta) => {
+      meta.channels.telegram = config;
+    }),
+  );
 }
 
 export async function setDiscordChannelConfig(

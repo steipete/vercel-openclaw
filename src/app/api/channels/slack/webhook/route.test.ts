@@ -409,6 +409,7 @@ test("Slack webhook: stopped sandbox posts boot message and starts wake workflow
         payload?: unknown;
         bootMessageId?: string | null;
         workflowHandoff?: {
+          slackCleanupConfig?: { configuredAt?: number };
           slackForwardHeaders?: Record<string, string>;
           slackRawBody?: string;
         };
@@ -417,6 +418,10 @@ test("Slack webhook: stopped sandbox posts boot message and starts wake workflow
       assert.equal(envelope.channel, "slack");
       assert.deepEqual(envelope.payload, payload);
       assert.equal(envelope.bootMessageId, "boot-wake-ts");
+      assert.equal(
+        typeof envelope.workflowHandoff?.slackCleanupConfig?.configuredAt,
+        "number",
+      );
       assert.equal(envelope.workflowHandoff?.slackRawBody, JSON.stringify(payload));
       assert.equal(
         envelope.workflowHandoff?.slackForwardHeaders?.["x-slack-signature"],

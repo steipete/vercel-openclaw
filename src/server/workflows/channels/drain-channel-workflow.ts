@@ -1,8 +1,10 @@
 import {
   isChannelName,
   type ChannelName,
+  type SlackChannelConfig,
   type TelegramChannelConfig,
 } from "@/shared/channels";
+import { acquireChannelConfigLease } from "@/server/channels/config-lock";
 import type { BootMessageHandle } from "@/server/channels/core/types";
 import type { QueuedChannelJob } from "@/server/channels/driver";
 import { deleteSlackMessage } from "@/server/channels/slack/adapter";
@@ -284,11 +286,16 @@ export type ProcessChannelStepOptions = {
   receivedAtMs?: number | null;
   dependencies?: DrainChannelWorkflowDependencies;
   workflowHandoff?: ChannelWorkflowHandoff | null;
+  requireTelegramConfigGeneration?: boolean;
 };
 
 export type ChannelWorkflowHandoff = {
   /** Re-enter lifecycle readiness when fast-path admission closed mid-stop. */
   revalidateSandboxBeforeForward?: boolean;
+  slackCleanupConfig?: Pick<
+    SlackChannelConfig,
+    "botToken" | "configuredAt"
+  > | null;
   fallbackTelegramConfig?: TelegramChannelConfig | null;
   /** Configuration generation that authenticated the queued Telegram update. */
   telegramConfigGeneration?: number | null;
@@ -440,6 +447,7 @@ export async function drainChannelWorkflow(
       {
         receivedAtMs: env.receivedAtMs ?? null,
         workflowHandoff: env.workflowHandoff ?? null,
+        requireTelegramConfigGeneration: true,
       },
     );
     return;
@@ -476,6 +484,7 @@ export async function drainChannelWorkflow(
     {
       receivedAtMs: receivedAtMs ?? null,
       workflowHandoff: workflowHandoff ?? null,
+      requireTelegramConfigGeneration: true,
     },
   );
 }
@@ -495,6 +504,10 @@ export async function processChannelStep(
   const fallbackTelegramConfig =
     channel === "telegram"
       ? options?.workflowHandoff?.fallbackTelegramConfig ?? null
+      : null;
+  const slackCleanupConfig =
+    channel === "slack"
+      ? options?.workflowHandoff?.slackCleanupConfig ?? null
       : null;
   const telegramConfigGeneration =
     channel === "telegram"
@@ -581,7 +594,10 @@ export async function processChannelStep(
     channel,
     payload,
     bootMessageId,
-    fallbackTelegramConfig,
+    {
+      slack: slackCleanupConfig,
+      telegram: fallbackTelegramConfig,
+    },
   );
   diag.hasExistingBootHandle = Boolean(existingBootHandle);
   let nativeAcceptance: NativeDeliveryAcceptance | null = null;
@@ -597,6 +613,8 @@ export async function processChannelStep(
     const state = await readTelegramWorkflowConfigState({
       fallbackTelegramConfig,
       expectedGeneration: telegramConfigGeneration,
+      requireGeneration:
+        options?.requireTelegramConfigGeneration === true,
     });
     if (state.status === "untracked" || state.status === "current") {
       return state.config;
@@ -1001,43 +1019,63 @@ export async function processChannelStep(
         });
       }
 
-      const telegramConfigBeforeForward =
-        await currentTelegramConfigOrSettle("pre-forward");
-      if (telegramConfigBeforeForward === undefined) {
-        return;
-      }
-      if (telegramConfigBeforeForward) {
-        effectiveReadyMeta = {
-          ...effectiveReadyMeta,
-          channels: {
-            ...effectiveReadyMeta.channels,
-            telegram: telegramConfigBeforeForward,
-          },
-        };
-      }
-      const capabilityAdmissions = await resolveWorkflowCapabilityAdmissions({
-        meta: effectiveReadyMeta,
-        hydrateVerifiedBundleIdentity,
-      });
+      const capabilityAdmissions =
+        await resolveWorkflowCapabilityAdmissions({
+          meta: effectiveReadyMeta,
+          hydrateVerifiedBundleIdentity,
+        });
       diag.bundleCapabilityAdmissionSource = capabilityAdmissions.source;
       diag.telegramDurableAcceptanceAdmitted =
         capabilityAdmissions.telegramDurableAcceptanceAdmitted;
       diag.gatewayAdmissionRejectionAdmitted =
         capabilityAdmissions.gatewayAdmissionRejectionAdmitted;
-      retryingResult = await forwardToNativeHandlerWithRetry(
-        channel as ChannelName,
-        payload,
-        effectiveReadyMeta,
-        getSandboxDomain,
-        forwardTelegramToNativeHandlerLocally,
-        localProbeResult?.ready === true,
-        null,
-        null,
-        deliveryId,
-        capabilityAdmissions.telegramDurableAcceptanceAdmitted,
-        capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
-        origin,
+
+      // The retry deadline is checked before each attempt, so one last fetch
+      // can consume its full timeout after the wrapper deadline. Derive the
+      // lease from both hard bounds plus cleanup margin; no config mutation
+      // can pass the final generation check before dispatch settles.
+      const telegramForwardLeaseTtlSeconds = Math.ceil(
+        (
+          RETRYING_FORWARD_TIMEOUT_MS +
+          NATIVE_FORWARD_PER_FETCH_TIMEOUT_MS +
+          30_000
+        ) / 1000,
       );
+      const configLease = await acquireChannelConfigLease("telegram", {
+        ttlSeconds: telegramForwardLeaseTtlSeconds,
+      });
+      try {
+        const telegramConfigBeforeForward =
+          await currentTelegramConfigOrSettle("pre-forward");
+        if (telegramConfigBeforeForward === undefined) {
+          return;
+        }
+        if (telegramConfigBeforeForward) {
+          effectiveReadyMeta = {
+            ...effectiveReadyMeta,
+            channels: {
+              ...effectiveReadyMeta.channels,
+              telegram: telegramConfigBeforeForward,
+            },
+          };
+        }
+        retryingResult = await forwardToNativeHandlerWithRetry(
+          channel as ChannelName,
+          payload,
+          effectiveReadyMeta,
+          getSandboxDomain,
+          forwardTelegramToNativeHandlerLocally,
+          localProbeResult?.ready === true,
+          null,
+          null,
+          deliveryId,
+          capabilityAdmissions.telegramDurableAcceptanceAdmitted,
+          capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
+          origin,
+        );
+      } finally {
+        await configLease.release();
+      }
       diag.telegramReadinessMode = readinessMode;
       diag.telegramPreForwardProbeMs = Date.now() - preForwardProbeStartedAt;
       if (retryingResult.attemptsDetail?.[0]?.startedAtMs != null) {
@@ -1740,14 +1778,18 @@ export async function processChannelStep(
 type TelegramWorkflowConfigState =
   | { status: "untracked"; config: TelegramChannelConfig | null }
   | { status: "current"; config: TelegramChannelConfig }
-  | { status: "deleted" | "rotated"; config: null };
+  | { status: "deleted" | "missing" | "rotated"; config: null };
 
 async function readTelegramWorkflowConfigState(input: {
   fallbackTelegramConfig: TelegramChannelConfig | null;
   expectedGeneration: number | null;
+  requireGeneration: boolean;
 }): Promise<TelegramWorkflowConfigState> {
   const current = (await getInitializedMeta()).channels.telegram;
   if (!input.fallbackTelegramConfig) {
+    if (input.requireGeneration) {
+      return { status: "missing", config: null };
+    }
     return { status: "untracked", config: current };
   }
 
@@ -2901,14 +2943,17 @@ export async function buildExistingBootHandle(
   channel: string,
   payload: unknown,
   bootMessageId?: number | string | null,
-  telegramCleanupConfig?: TelegramChannelConfig | null,
+  cleanupConfig?: {
+    slack?: Pick<SlackChannelConfig, "botToken" | "configuredAt"> | null;
+    telegram?: TelegramChannelConfig | null;
+  },
 ): Promise<BootMessageHandle | undefined> {
   if (typeof bootMessageId === "number" && channel === "telegram") {
     const meta = await getInitializedMeta();
     // The route posted this exact placeholder before enqueue. A handed-off
     // credential is safe only for editing/deleting that message; delivery and
     // sandbox config always use the current persisted generation.
-    const tgConfig = telegramCleanupConfig ?? meta.channels.telegram;
+    const tgConfig = cleanupConfig?.telegram ?? meta.channels.telegram;
     const chatId = extractTelegramChatId(payload);
     if (tgConfig && chatId) {
       const token = tgConfig.botToken;
@@ -2939,7 +2984,7 @@ export async function buildExistingBootHandle(
   }
   if (typeof bootMessageId === "string" && channel === "slack") {
     const meta = await getInitializedMeta();
-    const slackConfig = meta.channels.slack;
+    const slackConfig = cleanupConfig?.slack ?? meta.channels.slack;
     const slackPayload = payload as { event?: { channel?: string } } | null;
     const slackChannel = slackPayload?.event?.channel;
     if (slackConfig && slackChannel) {

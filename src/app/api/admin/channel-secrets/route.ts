@@ -12,6 +12,7 @@ import {
 import { extractRequestId, logInfo, logWarn } from "@/server/log";
 import { buildPublicDisplayUrl, buildPublicUrl } from "@/server/public-url";
 import { extractChannelPlatformDeliveryId } from "@/server/channels/delivery-id";
+import { withChannelConfigLease } from "@/server/channels/config-lock";
 import {
   smokeChannelConfigLockKey,
   smokeDiscordKeyPairKey,
@@ -41,6 +42,15 @@ const SMOKE_CHANNELS: SmokeChannel[] = ["slack", "telegram", "discord"];
 
 function isSmokeChannel(value: unknown): value is SmokeChannel {
   return value === "slack" || value === "telegram" || value === "discord";
+}
+
+function withTelegramConfigLeaseIfNeeded<T>(
+  channels: readonly SmokeChannel[],
+  operation: () => Promise<T>,
+): Promise<T> {
+  return channels.includes("telegram")
+    ? withChannelConfigLease("telegram", operation)
+    : operation();
 }
 
 function parseSmokeSetupInput(input: unknown): {
@@ -356,7 +366,8 @@ export async function PUT(request: Request): Promise<Response> {
     );
 
     const requested = new Set(requestedChannels);
-    await mutateMeta((meta) => {
+    await withTelegramConfigLeaseIfNeeded(requestedChannels, () =>
+      mutateMeta((meta) => {
       const created: SmokeChannel[] = [];
       const owned: SmokeChannel[] = [];
       if (requested.has("slack") && !meta.channels.slack) {
@@ -448,7 +459,8 @@ export async function PUT(request: Request): Promise<Response> {
       }
       createdChannels = created;
       ownedChannels = owned;
-    });
+      }),
+    );
     if (
       requestedChannels.includes("discord") &&
       !ownedChannels.includes("discord")
@@ -490,13 +502,15 @@ export async function PUT(request: Request): Promise<Response> {
     );
   } catch (error) {
     if (createdChannels.length > 0) {
-      await mutateMeta((meta) => {
-        for (const channel of createdChannels) {
-          if (smokeConfigStillOwned(channel, ownerId, meta)) {
-            meta.channels[channel] = null;
+      await withTelegramConfigLeaseIfNeeded(createdChannels, () =>
+        mutateMeta((meta) => {
+          for (const channel of createdChannels) {
+            if (smokeConfigStillOwned(channel, ownerId, meta)) {
+              meta.channels[channel] = null;
+            }
           }
-        }
-      }).catch(() => {});
+        }),
+      ).catch(() => {});
       if (
         createdChannels.includes("discord") ||
         createdDiscordKeyRecord
@@ -778,20 +792,22 @@ export async function DELETE(request: Request): Promise<Response> {
     const removedChannels: SmokeChannel[] = [];
     const preservedChannels: SmokeChannel[] = [];
     try {
-      await mutateMeta((meta) => {
-        const removed: SmokeChannel[] = [];
-        const preserved: SmokeChannel[] = [];
-        for (const channel of ownership.channels) {
-          if (smokeConfigStillOwned(channel, ownership.ownerId, meta)) {
-            meta.channels[channel] = null;
-            removed.push(channel);
-          } else {
-            preserved.push(channel);
+      await withTelegramConfigLeaseIfNeeded(ownership.channels, () =>
+        mutateMeta((meta) => {
+          const removed: SmokeChannel[] = [];
+          const preserved: SmokeChannel[] = [];
+          for (const channel of ownership.channels) {
+            if (smokeConfigStillOwned(channel, ownership.ownerId, meta)) {
+              meta.channels[channel] = null;
+              removed.push(channel);
+            } else {
+              preserved.push(channel);
+            }
           }
-        }
-        removedChannels.splice(0, removedChannels.length, ...removed);
-        preservedChannels.splice(0, preservedChannels.length, ...preserved);
-      });
+          removedChannels.splice(0, removedChannels.length, ...removed);
+          preservedChannels.splice(0, preservedChannels.length, ...preserved);
+        }),
+      );
       if (ownership.channels.includes("discord")) {
         await store.deleteValue(
           discordSmokePrivateKeyStoreKey(ownership.ownerId),

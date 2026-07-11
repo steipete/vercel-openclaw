@@ -14,8 +14,10 @@ import test from "node:test";
 import {
   _resetStoreForTesting,
   getInitializedMeta,
+  getStore,
   mutateMeta,
 } from "@/server/store/store";
+import { channelConfigLockKey } from "@/server/store/keyspace";
 import {
   callRoute,
   buildPutRequest,
@@ -215,6 +217,34 @@ test("channel-secrets: authenticated PUT requires a client owner id", async () =
       (result.json as { error?: unknown }).error,
       "OWNER_ID_REQUIRED",
     );
+  });
+});
+
+test("channel-secrets: Telegram smoke setup takes the delivery config lease", async () => {
+  await withAdminAuthEnv(async () => {
+    const store = getStore();
+    const acquireLock = store.acquireLock.bind(store);
+    const acquiredKeys: string[] = [];
+    store.acquireLock = async (key, ttlSeconds) => {
+      acquiredKeys.push(key);
+      return acquireLock(key, ttlSeconds);
+    };
+
+    try {
+      const route = getAdminChannelSecretsRoute();
+      const result = await callRoute(
+        route.PUT!,
+        buildAuthPutRequest(
+          "/api/admin/channel-secrets",
+          smokeSetupBody(["telegram"]),
+        ),
+      );
+
+      assert.equal(result.status, 200);
+      assert.ok(acquiredKeys.includes(channelConfigLockKey("telegram")));
+    } finally {
+      store.acquireLock = acquireLock;
+    }
   });
 });
 

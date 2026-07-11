@@ -201,7 +201,12 @@ function getChannelSummary(channels: StatusPayload["channels"]): StatusFact | nu
   if (channels.slack.configured) items.push("Slack");
   if (channels.telegram.configured) items.push("Telegram");
   if (channels.discord.configured) items.push("Discord (experimental)");
-  if (channels.whatsapp.configured) items.push("WhatsApp (experimental)");
+  if (
+    channels.whatsapp.mode !== "unsupported" &&
+    channels.whatsapp.configured
+  ) {
+    items.push("WhatsApp (experimental)");
+  }
   if (items.length === 0) return null;
   return { label: "Channels", value: items.join(", ") };
 }

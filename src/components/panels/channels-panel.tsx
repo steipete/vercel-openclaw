@@ -23,6 +23,7 @@ import {
   type HostedFeatureSupportEntry,
   type HostedFeatureSupportStatus,
 } from "@/shared/hosted-feature-support";
+import { HOSTED_DELIVERY_CHANNELS_LABEL } from "@/shared/channels";
 
 type PreflightCheck = {
   id: string;
@@ -560,7 +561,7 @@ export function ChannelsPanel({
 
           {preflight?.deploymentProtectionDetected && !preflight?.webhookBypassEnabled ? (
             <p className="muted-copy" style={{ margin: "4px 0 0" }}>
-              Vercel Deployment Protection is blocking webhook delivery — Slack, Telegram, WhatsApp, and Discord webhooks cannot reach this deployment.
+              Vercel Deployment Protection is blocking webhook delivery — {HOSTED_DELIVERY_CHANNELS_LABEL} webhooks cannot reach this deployment.
             </p>
           ) : null}
 
@@ -629,7 +630,6 @@ export function ChannelsPanel({
           status={status}
           busy={busy}
           runAction={runAction}
-          requestJson={requestJson}
           preflightBlockerIds={preflightBlockerIds}
         />
       </div>

@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
-import {
-  computeGatewayConfigHash,
-  toWhatsAppGatewayConfig,
-} from "@/server/openclaw/config";
+import { computeGatewayConfigHash } from "@/server/openclaw/config";
 import { buildRestoreAssetManifest } from "@/server/openclaw/restore-assets";
 import {
   _resetDecisionLogThrottleForTesting,
@@ -29,9 +26,6 @@ const desiredDynamicConfigHash = computeGatewayConfigHash({
         botToken: defaultMetaForHashes.channels.slack.botToken,
         signingSecret: defaultMetaForHashes.channels.slack.signingSecret,
       }
-    : undefined,
-  whatsappConfig: defaultMetaForHashes.channels.whatsapp
-    ? toWhatsAppGatewayConfig(defaultMetaForHashes.channels.whatsapp)
     : undefined,
 });
 const desiredAssetSha256 = buildRestoreAssetManifest().sha256;

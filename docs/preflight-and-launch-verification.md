@@ -47,7 +47,7 @@ Destructive mode runs every safe-mode phase, then adds:
 - `wakeFromSleep`
 - `restorePrepared`
 
-This is the only mode that proves the runtime prerequisites for channel delivery: queue callback, sandbox boot or resume, real gateway completion, stop-and-wake, and reusable restore preparation. It is also the only mode that can make `channelReadiness.ready` true. It does not send real Slack, Telegram, WhatsApp, or Discord webhooks; after connecting a channel, still send a real test message.
+This is the only mode that proves the runtime prerequisites for channel delivery: queue callback, sandbox boot or resume, real gateway completion, stop-and-wake, and reusable restore preparation. It is also the only mode that can make `channelReadiness.ready` true. It does not send real Slack, Telegram, or Discord webhooks; after connecting a channel, still send a real test message.
 
 ## Preflight-only is not safe mode
 

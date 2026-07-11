@@ -137,7 +137,6 @@ type FetchLike = typeof fetch;
 
 let cachedAdmissionKey: string | null = null;
 let cachedAdmissionPromise: Promise<VerifiedBundleAdmission | null> | null = null;
-let verifiedBundleIdentity: VerifiedBundleIdentity | null = null;
 let admissionOverrideForTesting: VerifiedBundleAdmission | null | undefined;
 
 function compatibilityError(detail: string): Error {
@@ -886,18 +885,16 @@ export function verifiedBundleIdentitiesEqual(
   );
 }
 
-export function markVerifiedBundleIdentity(
+export function bundleIdentityFromAdmission(
   admission: VerifiedBundleAdmission,
 ): VerifiedBundleIdentity {
-  verifiedBundleIdentity = structuredClone(admission.identity);
-  return structuredClone(verifiedBundleIdentity);
+  return structuredClone(admission.identity);
 }
 
 export async function hydrateVerifiedBundleIdentity(
   storedIdentity: unknown,
   fetchImpl: FetchLike = fetch,
 ): Promise<VerifiedBundleIdentity | null> {
-  verifiedBundleIdentity = null;
   if (!isVerifiedBundleIdentity(storedIdentity)) {
     return null;
   }
@@ -908,25 +905,13 @@ export async function hydrateVerifiedBundleIdentity(
   ) {
     return null;
   }
-  verifiedBundleIdentity = structuredClone(storedIdentity);
-  return structuredClone(verifiedBundleIdentity);
-}
-
-export function getVerifiedBundleIdentity(): VerifiedBundleIdentity | null {
-  return verifiedBundleIdentity
-    ? structuredClone(verifiedBundleIdentity)
-    : null;
-}
-
-export function hasVerifiedBundleCapability(id: string): boolean {
-  return verifiedBundleIdentity?.capabilities.includes(id) ?? false;
+  return structuredClone(storedIdentity);
 }
 
 export function _resetBundleIdentityForTesting(): void {
   if (process.env.NODE_ENV !== "test") return;
   cachedAdmissionKey = null;
   cachedAdmissionPromise = null;
-  verifiedBundleIdentity = null;
   admissionOverrideForTesting = undefined;
 }
 
@@ -936,6 +921,5 @@ export function _setBundleAdmissionForTesting(
   if (process.env.NODE_ENV !== "test") return;
   cachedAdmissionKey = null;
   cachedAdmissionPromise = null;
-  verifiedBundleIdentity = null;
   admissionOverrideForTesting = structuredClone(admission);
 }

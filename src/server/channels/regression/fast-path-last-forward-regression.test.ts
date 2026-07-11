@@ -13,7 +13,7 @@ import { createChannelRegressionHarness } from "@/test-utils/channel-regression/
 import { responseOutcome, sandboxNotListeningResponse } from "@/test-utils/channel-regression/fake-channel-gateway";
 import { assertLastForward, assertNoUserVisibleDelivery, assertStructuredSkip } from "@/test-utils/channel-regression/assertions";
 
-const ROUTE_FAST_PATH_CHANNELS: ChannelName[] = ["slack", "telegram", "whatsapp"];
+const ROUTE_FAST_PATH_CHANNELS: ChannelName[] = ["slack", "telegram"];
 
 const failureCases = [
   {
@@ -76,7 +76,7 @@ for (const channel of ROUTE_FAST_PATH_CHANNELS) {
     });
   }
 
-  test(`FP-06 ${channel}: route fast path fetch exception records lastForward and starts workflow`, async () => {
+  test(`FP-06 ${channel}: route fast path fetch exception records unknown delivery without replay`, async () => {
     const h = createChannelRegressionHarness();
     h.gateway.throwChannelOnce(channel, new Error("connect ECONNRESET"));
 
@@ -92,7 +92,7 @@ for (const channel of ROUTE_FAST_PATH_CHANNELS) {
       attempts: 1,
       userVisibleReplyStatus: "unknown",
     });
-    assert.equal(h.workflow.events.some((event) => event.type === "workflow-started"), true);
+    assert.equal(h.workflow.events.some((event) => event.type === "workflow-started"), false);
   });
 
   test(`FP-07 ${channel}: route fast path abort timeout preserves timeout reason and indeterminate flag`, async () => {

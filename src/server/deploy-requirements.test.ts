@@ -116,7 +116,7 @@ test("bypass is recommended in admin-secret mode when protection is detected", (
   });
   assert.equal(
     getWebhookBypassStatusMessage(requirement),
-    "Deployment Protection is active but bypass is not configured. Channel webhooks (Slack, Telegram, WhatsApp, Discord) will be blocked.",
+    "Deployment Protection is active but bypass is not configured. Channel webhooks (Slack, Telegram, Discord) will be blocked.",
   );
 });
 

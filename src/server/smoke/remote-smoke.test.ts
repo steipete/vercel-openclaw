@@ -25,6 +25,7 @@ import {
   channelsSummary,
   sshEcho,
   channelRoundTrip,
+  channelGatewayContinuity,
   DEFAULT_REQUEST_TIMEOUT_MS,
   classifyResponse,
   parseJsonBody,
@@ -39,16 +40,20 @@ const execFileAsync = promisify(execFile);
 
 /** Install a mock fetch that returns canned responses by URL pattern. */
 function installMockFetch(
-  routes: Array<{ pattern: RegExp; response: () => Response }>,
+  routes: Array<{
+    pattern: RegExp;
+    response: (input: RequestInfo | URL, init?: RequestInit) => Response;
+  }>,
 ): () => void {
   const original = globalThis.fetch;
   globalThis.fetch = (async (
     input: RequestInfo | URL,
+    init?: RequestInit,
   ): Promise<Response> => {
     const url = typeof input === "string" ? input : input.toString();
     for (const route of routes) {
       if (route.pattern.test(url)) {
-        return route.response();
+        return route.response(input, init);
       }
     }
     return Response.json({ error: "no mock matched" }, { status: 500 });
@@ -389,20 +394,604 @@ test("sshEcho phase: fails when stdout missing smoke-ok", async () => {
   }
 });
 
-test("channelRoundTrip phase: includes whatsapp when smoke dispatch succeeds", async () => {
+test("channelRoundTrip phase: correlates exact native acceptance", async () => {
   const restore = installMockFetch([
     {
       pattern: /\/api\/admin\/channel-secrets$/,
       response: () =>
-        Response.json({ configured: true, sent: true, status: 200, channel: "whatsapp" }),
+        Response.json({
+          configured: true,
+          sent: true,
+          webhookAccepted: true,
+          status: 200,
+          deliveryId: "synthetic:1",
+        }),
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json({
+          slack: {
+            connected: true,
+            lastError: null,
+            lastDeliveryState: {
+              deliveryId: "synthetic:1",
+              state: "visibility-unknown",
+              terminal: true,
+              native: { ok: true, classification: "accepted" },
+              reply: { status: "unknown" },
+            },
+          },
+          telegram: {
+            connected: true,
+            lastError: null,
+            lastDeliveryState: {
+              deliveryId: "synthetic:1",
+              state: "visibility-unknown",
+              terminal: true,
+              native: { ok: true, classification: "accepted" },
+              reply: { status: "unknown" },
+            },
+          },
+          discord: {
+            connected: true,
+            lastError: null,
+            lastDeliveryState: {
+              deliveryId: "synthetic:1",
+              state: "visibility-unknown",
+              terminal: true,
+              native: { ok: true, classification: "accepted" },
+              reply: { status: "unknown" },
+            },
+          },
+        }),
     },
   ]);
   try {
     const r = await channelRoundTrip(BASE);
     assertPhaseShape(r, "channelRoundTrip");
     assert.equal(r.passed, true);
-    const channels = (r.detail?.channels as Array<{ channel: string; sent: boolean }> | undefined) ?? [];
-    assert.ok(channels.some((entry) => entry.channel === "whatsapp" && entry.sent === true));
+    const channels =
+      (r.detail?.channels as
+        | Array<{
+            channel: string;
+            deliveryId: string;
+            nativeAccepted: boolean;
+            replyObserved: boolean;
+          }>
+        | undefined) ?? [];
+    assert.deepEqual(
+      channels.map((entry) => entry.channel).sort(),
+      ["discord", "slack", "telegram"],
+    );
+    assert.ok(channels.every((entry) => entry.deliveryId === "synthetic:1"));
+    assert.ok(channels.every((entry) => entry.nativeAccepted));
+    assert.ok(channels.every((entry) => entry.replyObserved === false));
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: does not promote unknown acceptance", async () => {
+  const unknownEntry = {
+    connected: true,
+    lastError: null,
+    lastDeliveryState: {
+      deliveryId: "synthetic:unknown",
+      state: "visibility-unknown",
+      terminal: true,
+      native: { ok: false, classification: "acceptance-unknown" },
+      reply: { status: "unknown" },
+    },
+  };
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: () =>
+        Response.json({
+          configured: true,
+          sent: true,
+          webhookAccepted: true,
+          status: 200,
+          deliveryId: "synthetic:unknown",
+        }),
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json({
+          slack: unknownEntry,
+          telegram: unknownEntry,
+          discord: unknownEntry,
+        }),
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "NATIVE_ACCEPTANCE_NOT_OBSERVED");
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: one configured host rejection fails the whole phase", async () => {
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { channel: string };
+        if (body.channel === "slack") {
+          return Response.json({
+            configured: true,
+            sent: false,
+            webhookAccepted: false,
+            status: 503,
+            deliveryId: "slack:rejected",
+          });
+        }
+        return Response.json({
+          configured: body.channel === "telegram",
+          sent: body.channel === "telegram",
+          webhookAccepted: body.channel === "telegram",
+          status: body.channel === "telegram" ? 200 : null,
+          deliveryId: body.channel === "telegram" ? "telegram:accepted" : null,
+        });
+      },
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json({
+          slack: { connected: true, lastError: null },
+          telegram: {
+            connected: true,
+            lastError: null,
+            lastDeliveryState: {
+              deliveryId: "telegram:accepted",
+              state: "visibility-unknown",
+              terminal: true,
+              native: { ok: true, classification: "accepted" },
+              reply: { status: "unknown" },
+            },
+          },
+          discord: { connected: false, lastError: null },
+        }),
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "NATIVE_ACCEPTANCE_NOT_OBSERVED");
+    const channels = result.detail?.channels as Array<{
+      channel: string;
+      webhookAccepted: boolean;
+      nativeAccepted: boolean;
+    }>;
+    assert.deepEqual(
+      channels.map((entry) => entry.channel).sort(),
+      ["slack", "telegram"],
+    );
+    assert.equal(
+      channels.find((entry) => entry.channel === "slack")?.webhookAccepted,
+      false,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: one host dispatch endpoint failure fails the whole phase", async () => {
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { channel: string };
+        if (body.channel === "slack") {
+          return Response.json({ error: "unavailable" }, { status: 503 });
+        }
+        return Response.json({
+          configured: body.channel === "telegram",
+          sent: body.channel === "telegram",
+          webhookAccepted: body.channel === "telegram",
+          status: body.channel === "telegram" ? 200 : null,
+          deliveryId: body.channel === "telegram" ? "telegram:accepted" : null,
+        });
+      },
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json({
+          slack: { connected: true, lastError: null },
+          telegram: {
+            connected: true,
+            lastError: null,
+            lastDeliveryState: {
+              deliveryId: "telegram:accepted",
+              state: "visibility-unknown",
+              terminal: true,
+              native: { ok: true, classification: "accepted" },
+              reply: { status: "unknown" },
+            },
+          },
+          discord: { connected: false, lastError: null },
+        }),
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, false);
+    const channels = result.detail?.channels as Array<{
+      channel: string;
+      webhookAccepted: boolean;
+    }>;
+    assert.deepEqual(
+      channels.map((entry) => entry.channel).sort(),
+      ["slack", "telegram"],
+    );
+    assert.equal(
+      channels.find((entry) => entry.channel === "slack")?.webhookAccepted,
+      false,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: all host dispatch endpoint failures fail", async () => {
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: () => Response.json({ error: "unavailable" }, { status: 503 }),
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "WEBHOOK_SEND_FAILED");
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: all disconnected summary entries allow a truthful skip", async () => {
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: () => Response.json({ error: "unavailable" }, { status: 503 }),
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json({
+          slack: { connected: false, lastError: null },
+          telegram: { connected: false, lastError: null },
+          discord: { connected: false, lastError: null },
+        }),
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, true);
+    assert.equal(result.detail?.skipped, true);
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: partial disconnected summary cannot prove a skip", async () => {
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: () => Response.json({ error: "unavailable" }, { status: 503 }),
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json({
+          slack: { connected: false, lastError: null },
+        }),
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "WEBHOOK_SEND_FAILED");
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: ambiguous setup retries the same owner and fails", async () => {
+  const setupOwnerIds: string[] = [];
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: (_input, init) => {
+        if (init?.method === "PUT") {
+          const body = JSON.parse(String(init.body)) as { ownerId: string };
+          setupOwnerIds.push(body.ownerId);
+          return Response.json(
+            { error: "unavailable" },
+            { status: setupOwnerIds.length === 1 ? 409 : 400 },
+          );
+        }
+        return Response.json({
+          configured: false,
+          sent: false,
+          webhookAccepted: false,
+        });
+      },
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "TEST_CHANNEL_SETUP_FAILED");
+    assert.equal(setupOwnerIds.length, 2);
+    assert.equal(setupOwnerIds[0], setupOwnerIds[1]);
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: owned cleanup failure fails the phase", async () => {
+  let configured = false;
+  let cleanupAttempts = 0;
+  const setupOwnerIds: string[] = [];
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: (_input, init) => {
+        if (init?.method === "PUT") {
+          const body = JSON.parse(String(init.body)) as { ownerId: string };
+          setupOwnerIds.push(body.ownerId);
+          if (setupOwnerIds.length < 3) {
+            return Response.json(
+              { error: "busy" },
+              { status: setupOwnerIds.length === 1 ? 409 : 503 },
+            );
+          }
+          configured = true;
+          return Response.json({
+            cleanupToken: "opaque-cleanup-token",
+            createdChannels: ["slack", "telegram", "discord"],
+            recoveredChannels: [],
+            preservedChannels: [],
+          });
+        }
+        if (init?.method === "DELETE") {
+          cleanupAttempts += 1;
+          return Response.json(
+            { error: "cleanup failed" },
+            { status: cleanupAttempts === 1 ? 503 : 400 },
+          );
+        }
+        const body = JSON.parse(String(init?.body)) as { channel: string };
+        return Response.json({
+          configured,
+          sent: configured,
+          webhookAccepted: configured,
+          status: configured ? 200 : null,
+          deliveryId: configured ? `${body.channel}:cleanup-proof` : null,
+        });
+      },
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json(
+          Object.fromEntries(
+            ["slack", "telegram", "discord"].map((channel) => [
+              channel,
+              {
+                connected: configured,
+                lastError: null,
+                lastDeliveryState: configured
+                  ? {
+                      deliveryId: `${channel}:cleanup-proof`,
+                      state: "visibility-unknown",
+                      terminal: true,
+                      native: { ok: true, classification: "accepted" },
+                      reply: { status: "unknown" },
+                    }
+                  : null,
+              },
+            ]),
+          ),
+        ),
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "TEST_CHANNEL_CLEANUP_FAILED");
+    assert.equal(setupOwnerIds.length, 3);
+    assert.equal(new Set(setupOwnerIds).size, 1);
+    assert.equal(cleanupAttempts, 2);
+  } finally {
+    restore();
+  }
+});
+
+test("channelRoundTrip phase: cleanup response loss recovers idempotently", async () => {
+  let configured = false;
+  let cleanupAttempts = 0;
+  const restore = installMockFetch([
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: (_input, init) => {
+        if (init?.method === "PUT") {
+          configured = true;
+          return Response.json({
+            cleanupToken: "opaque-cleanup-token",
+            createdChannels: ["slack", "telegram", "discord"],
+            recoveredChannels: [],
+            preservedChannels: [],
+          });
+        }
+        if (init?.method === "DELETE") {
+          cleanupAttempts += 1;
+          if (cleanupAttempts === 1) {
+            return Response.json(
+              { error: "response lost after removal" },
+              { status: 503 },
+            );
+          }
+          configured = false;
+          return Response.json({ removed: false, removedChannels: [] });
+        }
+        const body = JSON.parse(String(init?.body)) as { channel: string };
+        return Response.json({
+          configured,
+          sent: configured,
+          webhookAccepted: configured,
+          status: configured ? 200 : null,
+          deliveryId: configured ? `${body.channel}:cleanup-retry` : null,
+        });
+      },
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json(
+          Object.fromEntries(
+            ["slack", "telegram", "discord"].map((channel) => [
+              channel,
+              {
+                connected: configured,
+                lastError: null,
+                lastDeliveryState: configured
+                  ? {
+                      deliveryId: `${channel}:cleanup-retry`,
+                      state: "visibility-unknown",
+                      terminal: true,
+                      native: { ok: true, classification: "accepted" },
+                      reply: { status: "unknown" },
+                    }
+                  : null,
+              },
+            ]),
+          ),
+        ),
+    },
+  ]);
+  try {
+    const result = await channelRoundTrip(BASE, { pollTimeoutMs: 100 });
+    assertPhaseShape(result, "channelRoundTrip");
+    assert.equal(result.passed, true);
+    assert.equal(cleanupAttempts, 2);
+  } finally {
+    restore();
+  }
+});
+
+test("channelGatewayContinuity: exact acceptance-unknown delivery fails", async () => {
+  const restore = installMockFetch([
+    {
+      pattern: /\/gateway\/v1\/chat\/completions$/,
+      response: () =>
+        Response.json({
+          choices: [{ message: { content: "smoke-ok" } }],
+        }),
+    },
+    {
+      pattern: /\/api\/admin\/channel-secrets$/,
+      response: () =>
+        Response.json({
+          configured: true,
+          sent: true,
+          webhookAccepted: true,
+          status: 200,
+          deliveryId: "telegram:unknown",
+        }),
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () =>
+        Response.json({
+          telegram: {
+            connected: true,
+            lastError: null,
+            lastDeliveryState: {
+              deliveryId: "telegram:unknown",
+              state: "visibility-unknown",
+              terminal: true,
+              native: { ok: false, classification: "acceptance-unknown" },
+              reply: { status: "unknown" },
+            },
+          },
+        }),
+    },
+  ]);
+  try {
+    const result = await channelGatewayContinuity(
+      BASE,
+      100,
+      "telegram",
+    );
+    assertPhaseShape(result, "channelGatewayContinuity:telegram");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "NATIVE_ACCEPTANCE_NOT_OBSERVED");
+  } finally {
+    restore();
+  }
+});
+
+test("channelGatewayContinuity: unavailable channel summary fails", async () => {
+  const restore = installMockFetch([
+    {
+      pattern: /\/gateway\/v1\/chat\/completions$/,
+      response: () =>
+        Response.json({
+          choices: [{ message: { content: "smoke-ok" } }],
+        }),
+    },
+    {
+      pattern: /\/api\/channels\/summary$/,
+      response: () => Response.json({ error: "unavailable" }, { status: 503 }),
+    },
+  ]);
+  try {
+    const result = await channelGatewayContinuity(
+      BASE,
+      100,
+      "telegram",
+    );
+    assertPhaseShape(result, "channelGatewayContinuity:telegram");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "SUMMARY_UNAVAILABLE");
+  } finally {
+    restore();
+  }
+});
+
+test("channelGatewayContinuity: waiting response fails the pre-check", async () => {
+  const restore = installMockFetch([
+    {
+      pattern: /\/gateway\/v1\/chat\/completions$/,
+      response: () =>
+        Response.json({ status: "waiting" }, { status: 202 }),
+    },
+  ]);
+  try {
+    const result = await channelGatewayContinuity(
+      BASE,
+      100,
+      "telegram",
+    );
+    assertPhaseShape(result, "channelGatewayContinuity:telegram");
+    assert.equal(result.passed, false);
+    assert.equal(result.errorCode, "PRE_CHECK_FAILED");
   } finally {
     restore();
   }
@@ -547,7 +1136,7 @@ test("CLI: all-pass report has passed=true and exit 0", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else if (req.url === "/gateway/v1/chat/completions") {
@@ -613,7 +1202,7 @@ test("CLI: any-fail report has passed=false and exit 1", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -739,8 +1328,7 @@ test("DEFAULT_REQUEST_TIMEOUT_MS is exported and positive", () => {
 // CLI integration tests — exit codes and report structure
 // ---------------------------------------------------------------------------
 
-test("destructive flow: channelWakeFromSleep skips gracefully when no channels configured", async () => {
-  // Verify channelWakeFromSleep shows up in destructive mode and skips when no secrets available
+test("destructive flow: unavailable synthetic setup fails wake proof", async () => {
   const fetchedUrls: string[] = [];
   let sandboxToken = "fresh-token";
 
@@ -757,7 +1345,7 @@ test("destructive flow: channelWakeFromSleep skips gracefully when no channels c
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       let body = "";
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
@@ -800,16 +1388,15 @@ test("destructive flow: channelWakeFromSleep skips gracefully when no channels c
 
   try {
     const result = await runCli(["--base-url", baseUrl, "--destructive"]);
-    assert.equal(result.code, 0, `Expected exit 0, got ${result.code}. stderr: ${result.stderr}`);
+    assert.equal(result.code, 1);
 
     const report = JSON.parse(result.stdout);
-    assert.equal(report.passed, true);
+    assert.equal(report.passed, false);
 
-    // channelWakeFromSleep should exist and pass (skipping because no channels configured)
     const wakePhase = report.phases.find((p: PhaseResult) => p.phase === "channelWakeFromSleep");
     assert.ok(wakePhase, "channelWakeFromSleep phase should exist in destructive mode");
-    assert.equal(wakePhase.passed, true, "channelWakeFromSleep should pass (skipped)");
-    assert.equal(wakePhase.detail?.skipped, true, "should be marked as skipped");
+    assert.equal(wakePhase.passed, false);
+    assert.equal(wakePhase.errorCode, "TEST_CHANNEL_SETUP_FAILED");
 
     // channelRoundTrip should also exist (twice: safe + destructive)
     const roundTrips = report.phases.filter((p: PhaseResult) => p.phase === "channelRoundTrip");
@@ -826,10 +1413,11 @@ test("destructive flow: channelWakeFromSleep skips gracefully when no channels c
 test("CLI: safe-only mode runs 8 phases, --destructive runs 16", async () => {
   // We just test the safe count (already tested above) and verify --destructive
   // adds 8 destructive phases (ensure, chatCompletions, channelRoundTrip,
-  // channelWakeFromSleep, chatCompletions, and three per-channel self-heal phases)
+  // channelWakeFromSleep, chatCompletions, and three continuity phases)
   // by running with a mock server that handles the destructive endpoints.
   const { createServer } = await import("node:http");
   let sandboxToken = "fresh-token";
+  let smokeConfigured = false;
   const server = createServer((req, res) => {
     res.setHeader("Content-Type", "application/json");
     if (req.url === "/api/health") {
@@ -843,7 +1431,44 @@ test("CLI: safe-only mode runs 8 phases, --destructive runs 16", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      const slack = smokeConfigured
+        ? {
+            connected: true,
+            lastError: null,
+            lastDeliveryState: {
+              deliveryId: "slack:wake-proof",
+              state: "visibility-unknown",
+              terminal: true,
+              native: { ok: true, classification: "accepted" },
+              reply: { status: "unknown" },
+            },
+          }
+        : { connected: false, lastError: null };
+      res.end(JSON.stringify({ slack, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
+    } else if (req.url === "/api/admin/channel-secrets") {
+      if (req.method === "PUT") {
+        smokeConfigured = true;
+        res.end(JSON.stringify({
+          cleanupToken: "opaque-cleanup-token",
+          createdChannels: ["slack"],
+          recoveredChannels: [],
+          preservedChannels: ["telegram"],
+        }));
+      } else if (req.method === "DELETE") {
+        smokeConfigured = false;
+        res.end(JSON.stringify({ removed: true, removedChannels: ["slack"] }));
+      } else if (smokeConfigured) {
+        res.end(JSON.stringify({
+          configured: true,
+          sent: true,
+          webhookAccepted: true,
+          status: 200,
+          deliveryId: "slack:wake-proof",
+        }));
+      } else {
+        res.statusCode = 503;
+        res.end(JSON.stringify({ error: "not configured" }));
+      }
     } else if (req.url === "/api/admin/ssh") {
       let body = "";
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
@@ -890,9 +1515,9 @@ test("CLI: safe-only mode runs 8 phases, --destructive runs 16", async () => {
     const names = report.phases.map((p: PhaseResult) => p.phase);
     assert.ok(names.includes("ensureRunning"));
     assert.ok(names.includes("channelWakeFromSleep"));
-    assert.ok(names.includes("selfHealTokenRefresh:slack"));
-    assert.ok(names.includes("selfHealTokenRefresh:telegram"));
-    assert.ok(names.includes("selfHealTokenRefresh:discord"));
+    assert.ok(names.includes("channelGatewayContinuity:slack"));
+    assert.ok(names.includes("channelGatewayContinuity:telegram"));
+    assert.ok(names.includes("channelGatewayContinuity:discord"));
     // chatCompletions appears multiple times (safe + destructive)
     assert.ok(names.filter((n: string) => n === "chatCompletions").length >= 2);
 
@@ -1370,7 +1995,7 @@ test("CLI all-pass report: every phase has endpoint field", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -1424,7 +2049,7 @@ test("CLI: --request-timeout accepts a positive number", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -1472,7 +2097,7 @@ test("CLI: --json-only suppresses stderr, emits only JSON to stdout", async () =
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -1522,7 +2147,7 @@ test("CLI: --auth-cookie overrides SMOKE_AUTH_COOKIE env var", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -1565,7 +2190,7 @@ test("CLI: --admin-secret sends Authorization bearer header", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -1599,7 +2224,7 @@ test("CLI: rejects x-vercel-protection-bypass in base URL", async () => {
   assert.ok(result.stderr.includes("x-vercel-protection-bypass"));
 });
 
-test("CLI: --profile wake runs wake phases without self-heal phases", async () => {
+test("CLI: --profile wake runs wake phases without continuity phases", async () => {
   const { createServer } = await import("node:http");
   let statusCalls = 0;
 
@@ -1617,13 +2242,35 @@ test("CLI: --profile wake runs wake phases without self-heal phases", async () =
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: { connected: true, lastError: null }, telegram: null, discord: null, whatsapp: null }));
+      const accepted = {
+        connected: true,
+        lastError: null,
+        lastDeliveryState: {
+          deliveryId: "synthetic:wake",
+          state: "visibility-unknown",
+          terminal: true,
+          native: { ok: true, classification: "accepted" },
+          reply: { status: "unknown" },
+        },
+      };
+      res.end(JSON.stringify({
+        slack: accepted,
+        telegram: accepted,
+        discord: accepted,
+        whatsapp: { connected: false, lastError: null },
+      }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else if (req.url === "/api/admin/ensure") {
       res.end(JSON.stringify({ state: "running" }));
     } else if (req.url === "/api/admin/channel-secrets") {
-      res.end(JSON.stringify({ configured: true, sent: true, status: 200 }));
+      res.end(JSON.stringify({
+        configured: true,
+        sent: true,
+        webhookAccepted: true,
+        status: 200,
+        deliveryId: "synthetic:wake",
+      }));
     } else {
       res.statusCode = 404;
       res.end(JSON.stringify({ error: "not found" }));
@@ -1640,7 +2287,7 @@ test("CLI: --profile wake runs wake phases without self-heal phases", async () =
     const report = JSON.parse(result.stdout);
     const names = report.phases.map((p: PhaseResult) => p.phase);
     assert.ok(names.includes("channelWakeFromSleep"));
-    assert.ok(!names.some((name: string) => name.startsWith("selfHealTokenRefresh")));
+    assert.ok(!names.some((name: string) => name.startsWith("channelGatewayContinuity")));
   } finally {
     server.close();
   }
@@ -1659,7 +2306,7 @@ test("CLI: --auth-cookie value is never logged to stderr or stdout", async () =>
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -1739,7 +2386,7 @@ test("event stream: --json-only emits smoke-start, phase-end, and smoke-finish e
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -1826,7 +2473,7 @@ test("event stream: non-json-only mode emits events AND human-readable text", as
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else if (req.url === "/gateway/v1/chat/completions") {
@@ -1874,7 +2521,7 @@ test("event stream: each event line is independently parseable", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else {
@@ -1925,7 +2572,7 @@ test("event stream: phase-end events have correct phase order", async () => {
     } else if (req.url === "/api/firewall") {
       res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
     } else if (req.url === "/api/channels/summary") {
-      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+      res.end(JSON.stringify({ slack: { connected: false, lastError: null }, telegram: { connected: false, lastError: null }, discord: { connected: false, lastError: null }, whatsapp: { connected: false, lastError: null, deliveryMode: "unsupported", requiresRunningSandbox: false } }));
     } else if (req.url === "/api/admin/ssh") {
       res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
     } else if (req.url === "/gateway/v1/chat/completions") {

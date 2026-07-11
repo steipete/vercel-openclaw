@@ -8,7 +8,12 @@ import {
   assertScopedRedisKey,
   channelDedupKey,
   channelDrainLockKey,
+  channelFailedIndexKey,
+  channelFailedIndexLockKey,
   channelFailedKey,
+  channelFailedRecordLockKey,
+  channelFailedResolvedKey,
+  channelFailedUnknownKey,
   channelProcessingKey,
   channelQueueKey,
   channelSessionHistoryKey,
@@ -22,6 +27,8 @@ import {
   lifecycleLockKey,
   metaKey,
   setupProgressKey,
+  smokeChannelConfigLockKey,
+  smokeDiscordKeyPairKey,
   startLockKey,
   tokenRefreshLockKey,
 } from "@/server/store/keyspace";
@@ -80,6 +87,14 @@ test("keyspace: default instance id preserves existing keys", () => {
     assert.equal(learningLockKey(), "openclaw-single:lock:learning-refresh");
     assert.equal(debugLockKey(), "openclaw-single:lock:debug-timing");
     assert.equal(setupProgressKey(), "openclaw-single:setup-progress");
+    assert.equal(
+      smokeChannelConfigLockKey(),
+      "openclaw-single:smoke:channels:configuration-lock",
+    );
+    assert.equal(
+      smokeDiscordKeyPairKey("owner-1"),
+      "openclaw-single:smoke:discord:owner-1:key-pair",
+    );
   });
 });
 
@@ -91,6 +106,14 @@ test("keyspace: custom instance id updates all key prefixes lazily", () => {
     assert.equal(initLockKey(), "fork-a:lock:init");
     assert.equal(adminSecretKey(), "fork-a:admin-secret");
     assert.equal(setupProgressKey("fork-a"), "fork-a:setup-progress");
+    assert.equal(
+      smokeChannelConfigLockKey(),
+      "fork-a:smoke:channels:configuration-lock",
+    );
+    assert.equal(
+      smokeDiscordKeyPairKey("owner-1"),
+      "fork-a:smoke:discord:owner-1:key-pair",
+    );
 
     for (const channel of CHANNELS) {
       assert.equal(channelQueueKey(channel), `fork-a:channels:${channel}:queue`);
@@ -99,6 +122,18 @@ test("keyspace: custom instance id updates all key prefixes lazily", () => {
         `fork-a:channels:${channel}:processing`,
       );
       assert.equal(channelFailedKey(channel), `fork-a:channels:${channel}:failed`);
+      assert.equal(
+        channelFailedRecordLockKey(channel, "delivery-1"),
+        `fork-a:channels:${channel}:failed-lock:delivery-1`,
+      );
+      assert.equal(
+        channelFailedResolvedKey(channel, "delivery-1"),
+        `fork-a:channels:${channel}:failed-resolved:delivery-1`,
+      );
+      assert.equal(
+        channelFailedUnknownKey(channel, "delivery-1"),
+        `fork-a:channels:${channel}:failed-unknown:delivery-1`,
+      );
       assert.equal(
         channelDrainLockKey(channel),
         `fork-a:channels:${channel}:drain-lock`,
@@ -116,6 +151,11 @@ test("keyspace: custom instance id updates all key prefixes lazily", () => {
         `fork-a:channels:${channel}:user-message-dedup:C123:1234.5`,
       );
     }
+    assert.equal(channelFailedIndexKey(), "fork-a:channels:failed:index");
+    assert.equal(
+      channelFailedIndexLockKey(),
+      "fork-a:channels:failed:index-lock",
+    );
 
     _setInstanceIdOverrideForTesting("fork-b");
     assert.equal(instanceKeyPrefix(), "fork-b:");

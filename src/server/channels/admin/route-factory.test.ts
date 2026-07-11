@@ -215,7 +215,7 @@ test("DELETE handler calls spec.delete and returns updated state", async () => {
     assert.equal(result.status, 200);
     assert.equal(deleteCalled, true, "spec.delete must be called");
     const body = result.json as { configured: boolean; mode: string };
-    assert.equal(body.mode, "webhook-proxied");
+    assert.equal(body.mode, "unsupported");
   });
 });
 

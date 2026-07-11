@@ -187,7 +187,7 @@ After `vclaw create` finishes:
 1. **Sign in.** Open the printed deployment URL and enter your `ADMIN_SECRET`.
 2. **Use OpenClaw.** Visit `/gateway` or click **Start** in the admin panel. First boot takes about a minute while OpenClaw installs into the sandbox. Resumes after that take about 10 seconds (the sandbox auto-snapshots on stop and auto-resumes on get).
 3. **Verify.** `vclaw` already ran launch verification once. Re-run it from the admin panel any time you change config. Preflight is only a config-readiness check; it does not prove the sandbox can complete a real channel delivery.
-4. **Connect channels.** Wire up Slack, Telegram, WhatsApp (experimental), or Discord (experimental) from the admin panel — or pre-wire Telegram and Slack during `vclaw create` itself with `--telegram` / `--slack --slack-signing-secret`. For Slack OAuth install, set `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_SIGNING_SECRET`, or enter credentials manually. A deployment is channel-ready only after destructive launch verification passes and `channelReadiness.ready` is `true`.
+4. **Connect channels.** Wire up Slack, Telegram, or Discord (experimental) from the admin panel — or pre-wire Telegram and Slack during `vclaw create` itself with `--telegram` / `--slack --slack-signing-secret`. Hosted WhatsApp setup is disabled because OpenClaw uses linked-device transport rather than the app's former Meta Cloud API webhook path. For Slack OAuth install, set `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_SIGNING_SECRET`, or enter credentials manually. A deployment is channel-ready only after destructive launch verification passes and `channelReadiness.ready` is `true`.
 
 See [Hosted Feature Support](docs/getting-started/hosted-feature-support.md) for the exact hosted surface. Upstream-only OpenClaw features such as companion nodes, voice, canvas, arbitrary channel adapters, and arbitrary plugin/skill installation are not presented as hosted support until this wrapper has setup, persistence, wake/proxy behavior, and verification for them.
 
@@ -195,7 +195,7 @@ See [Hosted Feature Support](docs/getting-started/hosted-feature-support.md) for
 
 - **Full OpenClaw UI** proxied at `/gateway` with auth and WebSocket rewriting.
 - **Persistent sandboxes.** State is preserved on stop and restored on resume.
-- **Slack, Telegram, WhatsApp (experimental), and Discord (experimental)** channels with durable delivery.
+- **Slack, Telegram, and Discord (experimental)** channels with durable delivery. WhatsApp remains available through local/upstream OpenClaw linked-device setups, not this hosted wrapper.
 - **Bundled OpenClaw plugins and skills only.** Arbitrary plugin, skill, ClawHub, MCP, and tool installation is a local/upstream OpenClaw path until a hosted lifecycle contract exists.
 - **Egress firewall.** Learn which domains your agent talks to, then lock it down.
 - **Auto-wake.** A cron watchdog wakes your sandbox when scheduled OpenClaw jobs are due.
@@ -208,7 +208,7 @@ See [Hosted Feature Support](docs/getting-started/hosted-feature-support.md) for
 | [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) | Runs the OpenClaw instance (persistent sandboxes, auto-snapshot on stop, auto-resume on get) |
 | [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) | OIDC-authenticated model access for the agent |
 | [Redis Cloud](https://vercel.com/marketplace/redis) | Persistent state for metadata, snapshots, and channel config (any Redis-wire-protocol endpoint works) |
-| [Vercel Workflow](https://vercel.com/docs/workflow) | Durable channel message delivery (Slack, Telegram; WhatsApp and Discord experimental) |
+| [Vercel Workflow](https://vercel.com/docs/workflow) | Durable channel message delivery (Slack and Telegram; Discord experimental) |
 | [Vercel Queues](https://vercel.com/docs/queues) | Launch verification probe delivery |
 | [Vercel Cron](https://vercel.com/docs/cron-jobs) | Watchdog health checks and scheduled wake |
 
@@ -264,7 +264,7 @@ With `LOCAL_READ_ONLY=1`, `POST /api/admin/stop`, `/ensure`, `/reset`, `/snapsho
 
 ## Debugging channels with agents
 
-Channel delivery has several independent states: the app can be connected, the sandbox can be running, the native handler can accept a forward, and the user still might not see a reply. When Slack, Telegram, Discord, or WhatsApp is stuck, use the repo-local Codex agents and skills to split evidence gathering by channel instead of guessing from one readiness label.
+Channel delivery has several independent states: the app can be connected, the sandbox can be running, the native handler can accept a forward, and the user still might not see a reply. When Slack, Telegram, or Discord is stuck, use the repo-local Codex agents and skills to split evidence gathering by channel instead of guessing from one readiness label. Hosted WhatsApp should fail closed; use the local/upstream linked-device path instead.
 
 Codex custom agent roles live in `.codex/agents/*.toml`; shared debugging playbooks live in `.agents/skills/*/SKILL.md`. Use the channel agents for parallel triage and the skills for repeatable evidence collection:
 
@@ -273,7 +273,7 @@ Codex custom agent roles live in `.codex/agents/*.toml`; shared debugging playbo
 | Telegram | `channel_telegram` | `telegram-native-8787` | Native port 8787, webhook secret flow, boot cleanup, user-visible replies |
 | Slack | `channel_slack` | `slack-delivery` | OAuth vs delivery readiness, raw-body signature forwarding, `/slack/events` fast path |
 | Discord | `channel_discord` | `discord-delivery` | Ed25519 verification, interaction deferral, token expiry, workflow forwarding |
-| WhatsApp | `channel_whatsapp` | `whatsapp-delivery` | Meta verification, raw-body signatures, link-state projection, boot messages |
+| WhatsApp (hosted disabled) | `channel_whatsapp` | `whatsapp-delivery` | Fail-closed setup/webhook proof and legacy credential removal |
 
 For any channel incident, start with `$channel-debug-core`. It requires deployment-state proof, the admin readiness surfaces, a runtime path diagram, a hypothesis table, and a channel handoff before proposing a fix. Before changing webhook routes or the shared workflow, use `$channel-forward-parity` to verify every terminal path logs, updates `lastForward`, classifies failures, and refreshes stale sandbox port URLs when needed.
 
@@ -310,7 +310,7 @@ For cron incidents, start with `$cron-watchdog-debug` and keep these states sepa
 | [Architecture](docs/architecture.md) | System overview and subsystem map |
 | [Sandbox Lifecycle and Restore](docs/lifecycle-and-restore.md) | State transitions, persistent sandboxes, resume behavior |
 | [Preflight and Launch Verification](docs/preflight-and-launch-verification.md) | Deployment readiness and runtime verification |
-| [Channels and Webhooks](docs/channels-and-webhooks.md) | Channel setup (Slack, Telegram, WhatsApp, Discord), readiness, protection behavior |
+| [Channels and Webhooks](docs/channels-and-webhooks.md) | Slack, Telegram, Discord, hosted WhatsApp limitations, readiness, protection behavior |
 | [Environment Variables](docs/environment-variables.md) | Full env var reference |
 | [API Reference](docs/api-reference.md) | Endpoint and payload reference |
 | [Deployment Protection](docs/deployment-protection.md) | Bypass secret behavior and display-safe URLs |

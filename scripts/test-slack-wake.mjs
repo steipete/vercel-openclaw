@@ -35,6 +35,7 @@
  *   2 — bad arguments
  */
 
+import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
 
 // ---------------------------------------------------------------------------
@@ -84,7 +85,7 @@ FLOW
   9. Report timing breakdown and exit
 
 EXIT CODES
-  0 — success (wake + message delivery confirmed)
+  0 — success (wake + native acceptance confirmed; reply visibility reported separately)
   1 — failure (timeout, message lost, or error)
   2 — bad arguments
 `);
@@ -124,6 +125,8 @@ const requestTimeoutMs =
   Number.parseInt(values["request-timeout"], 10) * 1000;
 const jsonOnly = values["json-only"];
 const skipCleanup = values["skip-cleanup"];
+const SMOKE_CONFIG_RETRY_WINDOW_MS = 6_000;
+const SMOKE_CONFIG_RETRY_MAX_DELAY_MS = 1_000;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -205,33 +208,86 @@ function buildSlackPayload() {
 
 async function configureTestChannels() {
   log("phase: configuring smoke test channels...");
-  const res = await fetchJson("/api/admin/channel-secrets", {
-    method: "PUT",
-    mutation: true,
-    body: "{}",
-  });
-  if (!res.ok) {
-    throw new Error(
-      `configure test channels failed: HTTP ${res.status} ${JSON.stringify(res.body)}`,
-    );
+  const ownerId = randomUUID();
+  let lastError = null;
+  let retryDeadline = null;
+  let delayMs = 100;
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
+    try {
+      const res = await fetchJson("/api/admin/channel-secrets", {
+        method: "PUT",
+        mutation: true,
+        body: JSON.stringify({ channels: ["slack"], ownerId }),
+      });
+      if (!res.ok) {
+        lastError = new Error(
+          `HTTP ${res.status} ${JSON.stringify(res.body)}`,
+        );
+        if (res.status !== 409 && res.status < 500) break;
+      } else {
+        const created = res.body?.createdChannels;
+        const recovered = res.body?.recoveredChannels;
+        const preserved = res.body?.preservedChannels;
+        if (
+          Array.isArray(created) &&
+          Array.isArray(recovered) &&
+          Array.isArray(preserved) &&
+          (!(created.includes("slack") || recovered.includes("slack")) ||
+            typeof res.body?.cleanupToken === "string")
+        ) {
+          log("smoke test channels configured");
+          return res.body;
+        }
+        lastError = new Error("setup response omitted cleanup ownership");
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    retryDeadline ??= Date.now() + SMOKE_CONFIG_RETRY_WINDOW_MS;
+    if (attempts >= 3 && Date.now() >= retryDeadline) break;
+    await sleep(delayMs);
+    delayMs = Math.min(delayMs * 2, SMOKE_CONFIG_RETRY_MAX_DELAY_MS);
   }
-  log("smoke test channels configured");
-  return res.body;
+  throw new Error(
+    `configure test channels failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
 }
 
-async function cleanupTestChannels() {
+async function cleanupTestChannels(cleanupToken) {
   log("phase: cleaning up smoke test channels...");
-  const res = await fetchJson("/api/admin/channel-secrets", {
-    method: "DELETE",
-    mutation: true,
-    body: "{}",
-  });
-  if (!res.ok) {
-    throw new Error(
-      `cleanup test channels failed: HTTP ${res.status} ${JSON.stringify(res.body)}`,
-    );
+  let lastError = null;
+  let retryDeadline = null;
+  let delayMs = 100;
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
+    try {
+      const res = await fetchJson("/api/admin/channel-secrets", {
+        method: "DELETE",
+        mutation: true,
+        body: JSON.stringify({ cleanupToken }),
+      });
+      if (res.ok) {
+        log("smoke test channels removed");
+        return;
+      }
+      lastError = new Error(
+        `HTTP ${res.status} ${JSON.stringify(res.body)}`,
+      );
+      if (res.status !== 409 && res.status < 500) break;
+    } catch (error) {
+      lastError = error;
+    }
+    retryDeadline ??= Date.now() + SMOKE_CONFIG_RETRY_WINDOW_MS;
+    if (attempts >= 3 && Date.now() >= retryDeadline) break;
+    await sleep(delayMs);
+    delayMs = Math.min(delayMs * 2, SMOKE_CONFIG_RETRY_MAX_DELAY_MS);
   }
-  log("smoke test channels removed");
+  throw new Error(
+    `cleanup test channels failed: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +310,7 @@ async function ensureRunning() {
   return res.body;
 }
 
-async function ensureSlackConfigured() {
+async function ensureSlackConfigured(captureCleanupToken) {
   log("phase: verifying Slack is configured...");
   const res = await fetchJson("/api/channels/summary");
   if (!res.ok) {
@@ -269,7 +325,12 @@ async function ensureSlackConfigured() {
   }
 
   log("Slack is not configured; falling back to smoke test channel config");
-  await configureTestChannels();
+  const setup = await configureTestChannels();
+  if (typeof setup.cleanupToken === "string") {
+    // Capture ownership before any later validation can fail so main's finally
+    // block can still remove only the smoke config created by this run.
+    captureCleanupToken(setup.cleanupToken);
+  }
 
   const retry = await fetchJson("/api/channels/summary");
   if (!retry.ok) {
@@ -284,7 +345,11 @@ async function ensureSlackConfigured() {
   }
 
   log(`Slack: configured=${retrySlack.configured} status=${retrySlack.status}`);
-  return { configuredByUs: true, summary: retry.body };
+  return {
+    configuredByUs: typeof setup.cleanupToken === "string",
+    cleanupToken: setup.cleanupToken ?? null,
+    summary: retry.body,
+  };
 }
 
 async function stopSandbox() {
@@ -358,7 +423,7 @@ async function sendSlackWebhook() {
       `send webhook failed: HTTP ${res.status} ${JSON.stringify(res.body)}`,
     );
   }
-  if (!res.body?.sent) {
+  if (!res.body?.webhookAccepted) {
     if (res.body?.configured === false) {
       throw new Error("Slack channel not configured (configured=false)");
     }
@@ -366,7 +431,12 @@ async function sendSlackWebhook() {
       `webhook not sent: ${JSON.stringify(res.body)}`,
     );
   }
-  log(`webhook dispatched: sent=${res.body.sent} status=${res.body.status}`);
+  if (typeof res.body?.deliveryId !== "string") {
+    throw new Error("webhook response did not include an exact deliveryId");
+  }
+  log(
+    `webhook accepted by host: deliveryId=${res.body.deliveryId} status=${res.body.status}`,
+  );
   return res.body;
 }
 
@@ -375,7 +445,6 @@ async function waitForRunning() {
   const t0 = Date.now();
   const deadline = t0 + timeoutMs;
   let delay = 3_000;
-  let lastDiag = null;
   while (Date.now() < deadline) {
     await sleep(delay);
     try {
@@ -391,41 +460,7 @@ async function waitForRunning() {
       // ignore transient errors
     }
 
-    // Local next dev + workflow execution can leave /api/status on stale
-    // in-memory metadata even after the workflow has finished.  When that
-    // happens, treat a completed channel-forward diagnostic as the source
-    // of truth that the wake path succeeded.
-    try {
-      const diagRes = await fetchJson("/api/admin/channel-forward-diag");
-      if (diagRes.ok && diagRes.body && !diagRes.body.error) {
-        lastDiag = diagRes.body;
-        if (
-          diagRes.body.outcome === "success" ||
-          diagRes.body.forwardOk === true
-        ) {
-          log(
-            `wake confirmed by diagnostic after ${Math.round(
-              (Date.now() - t0) / 1000,
-            )}s`,
-          );
-          return {
-            wakeMs: Date.now() - t0,
-            viaDiagnostic: true,
-            diag: diagRes.body,
-          };
-        }
-      }
-    } catch {
-      // ignore diag polling errors
-    }
-
     delay = Math.min(delay * 1.3, 10_000);
-  }
-
-  if (lastDiag?.outcome || lastDiag?.forwardOk != null) {
-    throw new Error(
-      `sandbox status never became running within ${timeoutSec}s; last diagnostic was ${JSON.stringify(lastDiag)}`,
-    );
   }
 
   throw new Error(
@@ -465,6 +500,31 @@ async function readDiag() {
   }
   log("no diag data available");
   return null;
+}
+
+async function waitForNativeAcceptance(deliveryId) {
+  log(`phase: polling exact Slack delivery ${deliveryId}...`);
+  const deadline = Date.now() + 60_000;
+  let lastState = null;
+  while (Date.now() < deadline) {
+    const res = await fetchJson("/api/channels/summary");
+    const state = res.body?.slack?.lastDeliveryState ?? null;
+    if (state?.deliveryId === deliveryId) {
+      lastState = state;
+      const accepted =
+        state.native?.ok === true &&
+        state.native?.classification === "accepted";
+      if (accepted || state.terminal === true) {
+        return {
+          accepted,
+          state,
+          replyObserved: state.reply?.status === "observed",
+        };
+      }
+    }
+    await sleep(2_000);
+  }
+  return { accepted: false, state: lastState, replyObserved: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -553,15 +613,21 @@ function describeDeployedHarness(diag, wakeResult) {
 async function main() {
   const t0 = Date.now();
   let configuredByUs = false;
+  let cleanupToken = null;
   let result;
+  let exitCode = 1;
 
   try {
     // 1. Pre-check: sandbox must be running
     await ensureRunning();
 
     // 2. Verify Slack is configured, or auto-configure smoke credentials
-    const configState = await ensureSlackConfigured();
+    const configState = await ensureSlackConfigured((token) => {
+      configuredByUs = true;
+      cleanupToken = token;
+    });
     configuredByUs = configState.configuredByUs;
+    cleanupToken = configState.cleanupToken ?? null;
 
     // 3. Stop the sandbox
     await stopSandbox();
@@ -578,7 +644,9 @@ async function main() {
     const wakeResult = await waitForRunning();
     const runningAt = Date.now();
 
-    // 7. Read diagnostic
+    // 7. Prove native acceptance for this exact delivery. Diagnostic remains
+    // supporting evidence only; it is process-global and can be stale.
+    const acceptance = await waitForNativeAcceptance(webhookResult.deliveryId);
     const diag = await readDiag();
     const diagReadAt = Date.now();
 
@@ -586,8 +654,7 @@ async function main() {
     const totalMs = diagReadAt - t0;
     const stopToWebhookMs = webhookSentAt - stoppedAt;
     const webhookToRunningMs = runningAt - webhookSentAt;
-    const passed =
-      diag?.outcome === "success" || (diag?.forwardOk === true);
+    const passed = acceptance.accepted;
 
     result = {
       schemaVersion: 1,
@@ -603,9 +670,13 @@ async function main() {
         diagReadMs: diagReadAt - runningAt,
       },
       webhook: webhookResult,
+      acceptance,
+      replyObserved: acceptance.replyObserved,
       diag: diag ?? null,
       harness: describeDeployedHarness(diag, wakeResult),
-      error: passed ? null : (diag?.error ?? "diag outcome was not success"),
+      error: passed
+        ? null
+        : "exact delivery did not reach native accepted state",
     };
 
     if (!jsonOnly) {
@@ -619,12 +690,14 @@ async function main() {
         `  webhook -> running: ${webhookToRunningMs}ms\n`,
       );
       process.stderr.write(`  wake latency:       ${wakeResult.wakeMs}ms\n`);
+      process.stderr.write(
+        `  reply observed:     ${acceptance.replyObserved ? "yes" : "no / unproven"}\n`,
+      );
       process.stderr.write("\n--- Channel Forward Diagnostic ---\n\n");
       process.stderr.write(formatTimingBreakdown(diag) + "\n\n");
     }
 
-    console.log(JSON.stringify(result, null, jsonOnly ? 0 : 2));
-    return passed ? 0 : 1;
+    exitCode = passed ? 0 : 1;
   } catch (err) {
     const totalMs = Date.now() - t0;
     result = {
@@ -645,21 +718,31 @@ async function main() {
       process.stderr.write(`  elapsed: ${totalMs}ms\n\n`);
     }
 
-    console.error(JSON.stringify(result, null, jsonOnly ? 0 : 2));
-    return 1;
+    exitCode = 1;
   } finally {
-    if (configuredByUs && !skipCleanup) {
+    if (configuredByUs && cleanupToken && !skipCleanup) {
       try {
-        await cleanupTestChannels();
+        await cleanupTestChannels(cleanupToken);
       } catch (cleanupError) {
-        if (!jsonOnly) {
-          process.stderr.write(
-            `[slack-wake] cleanup warning: ${cleanupError.message}\n`,
-          );
-        }
+        const message = `owned smoke config cleanup failed: ${cleanupError.message}`;
+        process.stderr.write(
+          jsonOnly
+            ? `${JSON.stringify({ type: "cleanup-failure", channel: "slack", error: message })}\n`
+            : `[slack-wake] cleanup warning: ${message}\n`,
+        );
+        result = {
+          ...result,
+          passed: false,
+          error: result?.passed === true ? message : result?.error ?? message,
+          cleanup: { attempted: true, ok: false, error: message },
+        };
+        exitCode = 1;
       }
     }
   }
+
+  console.log(JSON.stringify(result, null, jsonOnly ? 0 : 2));
+  return exitCode;
 }
 
 main().then((code) => process.exit(code)).catch((err) => {

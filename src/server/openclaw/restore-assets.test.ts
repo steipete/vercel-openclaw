@@ -129,49 +129,6 @@ test("dynamic restore files include telegram webhookSecret in openclaw config", 
   );
 });
 
-test("dynamic restore files include whatsapp policy config in openclaw config", () => {
-  const files = buildDynamicRestoreFiles({
-    proxyOrigin: "https://whatsapp.test",
-    whatsappConfig: {
-      enabled: true,
-      dmPolicy: "open",
-      allowFrom: ["*"],
-      groupPolicy: "allowlist",
-      groupAllowFrom: [],
-    },
-  });
-
-  const configFile = files.find((file) => file.path === OPENCLAW_CONFIG_PATH);
-  assert.ok(configFile, "Expected dynamic restore files to include openclaw config");
-
-  const config = JSON.parse(configFile.content.toString("utf8")) as {
-    channels?: {
-      whatsapp?: {
-        enabled?: boolean;
-        dmPolicy?: string;
-      };
-    };
-  };
-
-  assert.equal(config.channels?.whatsapp?.enabled, true);
-  assert.equal(config.channels?.whatsapp?.dmPolicy, "open");
-});
-
-test("dynamic restore files omit whatsapp when config is undefined", () => {
-  const files = buildDynamicRestoreFiles({
-    proxyOrigin: "https://no-whatsapp.test",
-  });
-
-  const configFile = files.find((file) => file.path === OPENCLAW_CONFIG_PATH);
-  assert.ok(configFile);
-
-  const config = JSON.parse(configFile.content.toString("utf8")) as {
-    channels?: { whatsapp?: unknown };
-  };
-
-  assert.equal(config.channels?.whatsapp, undefined);
-});
-
 // --- buildWorkerSandboxRestoreFiles ---
 
 test("worker sandbox restore files contain exactly the goal-critical pair", () => {

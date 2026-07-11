@@ -1,8 +1,6 @@
 import {
   CHANNEL_NAMES,
-  createUnknownUserVisibleReply,
   isChannelName,
-  isChannelUserVisibleReply,
   normalizeChannelLastForward,
   normalizeChannelUserVisibleReply,
   type ChannelLastForward,
@@ -212,9 +210,9 @@ export const CHANNEL_DELIVERY_EXTENSIONS = {
     channel: "whatsapp",
     nativeHandlerPath: "/whatsapp-webhook",
     nativeHandlerPort: 3000,
-    replyObservation: "platform-api",
-    userNoticeSupported: true,
-    notes: ["link-state-is-separate"],
+    replyObservation: "none",
+    userNoticeSupported: false,
+    notes: ["hosted-transport-disabled"],
   },
 } as const satisfies Record<ChannelName, ChannelDeliveryExtension>;
 
@@ -231,10 +229,15 @@ export const CHANNEL_DELIVERY_TRANSITIONS = [
   { from: "fast-path-forwarding", event: "fast-path-fallback", to: "workflow-planned" },
   { from: "dedup-checked", event: "workflow-planned", to: "workflow-planned" },
   { from: "workflow-planned", event: "workflow-start-failed", to: "workflow-start-failed", terminal: true },
+  { from: "workflow-planned", event: "terminal-failed", to: "terminal-failed", terminal: true },
   { from: "workflow-planned", event: "wake-started", to: "wake-running" },
+  { from: "wake-running", event: "terminal-failed", to: "terminal-failed", terminal: true },
   { from: "wake-running", event: "native-forward-started", to: "native-forwarding" },
   { from: "native-forwarding", event: "native-forward-accepted", to: "visibility-unknown", terminal: true },
   { from: "native-forwarding", event: "native-forward-failed", to: "native-forward-failed" },
+  { from: "native-forwarding", event: "visibility-unknown", to: "visibility-unknown", terminal: true },
+  { from: "native-forwarding", event: "terminal-failed", to: "terminal-failed", terminal: true },
+  { from: "native-forward-failed", event: "visibility-unknown", to: "visibility-unknown", terminal: true },
   { from: "native-forward-failed", event: "terminal-failed", to: "terminal-failed", terminal: true },
   { from: "visibility-unknown", event: "reply-observation-started", to: "reply-observation-pending" },
   { from: "reply-observation-pending", event: "reply-observed", to: "reply-observed", terminal: true },
@@ -672,6 +675,115 @@ export function channelDeliveryFromLastForward(input: {
     }),
     transitions,
   };
+}
+
+export type ChannelDeliveryClosedOutcome = "failed" | "unknown";
+
+function createWorkflowTerminalBase(input: {
+  channel: ChannelName;
+  deliveryId: string | null;
+  now: number;
+  reason: string;
+}): ChannelDeliverySnapshot {
+  let snapshot = createInitialChannelDeliverySnapshot({
+    channel: input.channel,
+    deliveryId: input.deliveryId,
+    now: input.now,
+    source: "manual",
+  });
+  for (const event of [
+    "validated",
+    "dedup-checked",
+    "workflow-planned",
+  ] as const) {
+    snapshot = transitionChannelDelivery(snapshot, event, {
+      reason: input.reason,
+      source: "manual",
+      updatedAt: input.now,
+    });
+  }
+  return snapshot;
+}
+
+/** Close automatic delivery retries without claiming an uncertain send failed. */
+export function closeChannelDeliverySnapshot(input: {
+  current: ChannelDeliverySnapshot | null | undefined;
+  channel: ChannelName;
+  deliveryId: string | null;
+  outcome: ChannelDeliveryClosedOutcome;
+  reason: string;
+  now?: number;
+}): ChannelDeliverySnapshot {
+  const now = input.now ?? Date.now();
+  const normalized = normalizeChannelDeliverySnapshot(input.current);
+  const matchedCurrent =
+    normalized?.channel === input.channel &&
+    normalized.deliveryId === input.deliveryId
+      ? normalized
+      : null;
+  if (
+    matchedCurrent &&
+    (matchedCurrent.state === "reply-observed" ||
+      (matchedCurrent.state === "visibility-unknown" && input.outcome === "failed"))
+  ) {
+    // Closing a retry cannot downgrade evidence from an earlier attempt with
+    // the same delivery ID. Unknown remains revisable only by an observed reply.
+    return matchedCurrent;
+  }
+  let base =
+    matchedCurrent
+      ? matchedCurrent
+      : createWorkflowTerminalBase({
+          channel: input.channel,
+          deliveryId: input.deliveryId,
+          now,
+          reason: input.reason,
+        });
+  const event: ChannelDeliveryEvent =
+    input.outcome === "unknown" ? "visibility-unknown" : "terminal-failed";
+
+  if (base.state === (input.outcome === "unknown" ? "visibility-unknown" : "terminal-failed")) {
+    return {
+      ...base,
+      source: "manual",
+      finality:
+        input.outcome === "unknown" ? "terminal-revisable" : "terminal",
+      terminal: true,
+      reason: input.reason,
+      completedAt: base.completedAt ?? now,
+      updatedAt: now,
+    };
+  }
+
+  if (!findChannelDeliveryTransition(base.state, event)) {
+    base = createWorkflowTerminalBase({
+      channel: input.channel,
+      deliveryId: input.deliveryId,
+      now,
+      reason: input.reason,
+    });
+    if (input.outcome === "unknown") {
+      base = transitionChannelDelivery(base, "wake-started", {
+        reason: input.reason,
+        source: "manual",
+        updatedAt: now,
+      });
+      base = transitionChannelDelivery(base, "native-forward-started", {
+        reason: input.reason,
+        source: "manual",
+        updatedAt: now,
+      });
+    }
+  }
+
+  return transitionChannelDelivery(base, event, {
+    source: "manual",
+    reason: input.reason,
+    updatedAt: now,
+    completedAt: now,
+    finality:
+      input.outcome === "unknown" ? "terminal-revisable" : "terminal",
+  });
 }
 
 export function applyUserVisibleReplyToChannelDelivery(input: {

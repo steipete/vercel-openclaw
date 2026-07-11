@@ -11,7 +11,11 @@ import {
   type ChannelDlqSummary,
 } from "@/server/channels/dlq";
 import type { ChannelConnectability } from "@/shared/channel-connectability";
-import type { ChannelName } from "@/shared/channels";
+import {
+  HOSTED_DELIVERY_CHANNELS_LABEL,
+  HOSTED_DELIVERY_CHANNEL_NAMES,
+  type ChannelName,
+} from "@/shared/channels";
 import {
   buildDeploymentContract,
   type DeploymentContract,
@@ -278,8 +282,8 @@ function buildActions(input: {
       id: "configure-webhook-bypass",
       status: protectionConfirmed ? "required" : "recommended",
       message: protectionConfirmed
-        ? "Deployment Protection is active. Channel webhooks (Slack, Telegram, WhatsApp, Discord) are blocked. Set VERCEL_AUTOMATION_BYPASS_SECRET or disable Deployment Protection."
-        : "Enable Protection Bypass for Automation and set VERCEL_AUTOMATION_BYPASS_SECRET so channel webhooks (Slack, Telegram, WhatsApp, Discord) can reach the protected deployment.",
+        ? `Deployment Protection is active. Channel webhooks (${HOSTED_DELIVERY_CHANNELS_LABEL}) are blocked. Set VERCEL_AUTOMATION_BYPASS_SECRET or disable Deployment Protection.`
+        : `Enable Protection Bypass for Automation and set VERCEL_AUTOMATION_BYPASS_SECRET so channel webhooks (${HOSTED_DELIVERY_CHANNELS_LABEL}) can reach the protected deployment.`,
       remediation:
         "In your Vercel project, go to Settings > Deployment Protection > Protection Bypass for Automation. Enable it and copy the secret into VERCEL_AUTOMATION_BYPASS_SECRET, then redeploy.",
       env: ["VERCEL_AUTOMATION_BYPASS_SECRET"],
@@ -652,9 +656,12 @@ export async function buildDeployPreflight(
     deploymentProtectionDetected,
   });
 
+  const supportedChannelsReady = HOSTED_DELIVERY_CHANNEL_NAMES.every(
+    (channel) => channels[channel].status !== "fail",
+  );
   const ok =
     checks.every((check) => check.status !== "fail") &&
-    Object.values(channels).every((ch) => ch.status !== "fail");
+    supportedChannelsReady;
 
   const nextSteps = buildNextSteps({ ok, channels, actions });
 

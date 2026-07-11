@@ -19,19 +19,12 @@ import {
   getAdminLaunchVerifyRoute,
   drainAfterCallbacks,
 } from "@/test-utils/route-caller";
-import {
-  computeGatewayConfigHash,
-  toWhatsAppGatewayConfig,
-} from "@/server/openclaw/config";
+import { computeGatewayConfigHash } from "@/server/openclaw/config";
 import { buildRestoreAssetManifest } from "@/server/openclaw/restore-assets";
 import {
   _resetBundleIdentityForTesting,
   _setBundleAdmissionForTesting,
 } from "@/server/openclaw/bundle-identity";
-import type {
-  LaunchVerifyQueueProbe,
-  LaunchVerifyQueueResult,
-} from "@/server/launch-verify/queue-probe";
 import type {
   LaunchVerificationPayload,
   LaunchVerificationPhaseId,
@@ -40,24 +33,6 @@ import type {
   ChannelReadiness,
   RestoreTargetAttestation,
 } from "@/shared/launch-verification";
-
-type LaunchVerifyRouteTestAdapter = {
-  publishLaunchVerifyQueueProbe: (
-    probe: LaunchVerifyQueueProbe,
-  ) => Promise<{ probeId: string; messageId: string | null }>;
-  waitForLaunchVerifyQueueResult: (
-    probeId: string,
-    timeoutMs?: number,
-  ) => Promise<LaunchVerifyQueueResult>;
-};
-
-type LaunchVerifyRouteWithTestAdapter = ReturnType<
-  typeof getAdminLaunchVerifyRoute
-> & {
-  __setLaunchVerifyQueueProbeAdapterForTests?: (
-    adapter: LaunchVerifyRouteTestAdapter | null,
-  ) => void;
-};
 
 /**
  * Helper: make preflight fail fast on the auth-config check.
@@ -1211,6 +1186,11 @@ test("launch-verify POST (JSON): diagnostics include failingChannelIds matching 
       body.diagnostics.warningChannelIds,
       "failingChannelIds and warningChannelIds should match",
     );
+    assert.equal(
+      body.diagnostics.failingChannelIds.includes("whatsapp"),
+      false,
+      "unsupported WhatsApp must not be reported as a launch failure",
+    );
   });
 });
 
@@ -1640,75 +1620,6 @@ test("launch-verify POST: destructive wake failure preserves queue stage details
     assert.match(
       wakePhase.error ?? "",
       /Queue callback failed during chat completion \(queue delay 50ms, sandbox ready 1400ms, completion 90000ms, total 91450ms\)\. Expected "wake-from-sleep-ok" but got "still-waking"/,
-    );
-  });
-});
-
-// ===========================================================================
-// Restore attestation: WhatsApp-inclusive hash
-// ===========================================================================
-
-test("launch-verify POST: runtime.expectedConfigHash includes WhatsApp config in hash", async () => {
-  await withHarness(async (h) => {
-    process.env.NEXT_PUBLIC_APP_URL = "https://test.example";
-
-    await h.driveToRunning();
-
-    const whatsapp = {
-      enabled: true,
-      configuredAt: Date.now(),
-      pluginSpec: "@openclaw/whatsapp",
-      dmPolicy: "allowlist" as const,
-      allowFrom: ["15551234567"],
-      groupPolicy: "allowlist" as const,
-      groupAllowFrom: ["15557654321"],
-      groups: ["team-chat"],
-    };
-
-    await h.mutateMeta((meta) => {
-      meta.channels.whatsapp = whatsapp;
-    });
-
-    h.fakeFetch.on("POST", /v1\/chat\/completions/, () => {
-      return Response.json({
-        choices: [{ message: { content: "launch-verify-ok" } }],
-      });
-    });
-
-    const route = getAdminLaunchVerifyRoute();
-    const req = buildAuthPostRequest(
-      "/api/admin/launch-verify",
-      JSON.stringify({ mode: "safe" }),
-    );
-    const result = await callRoute(route.POST, req);
-    await drainAfterCallbacks();
-
-    const body = result.json as LaunchVerificationPayload;
-    assert.ok(body.runtime, "expected runtime in response");
-    const runtime = body.runtime as LaunchVerificationRuntime;
-
-    const withWhatsapp = computeGatewayConfigHash({
-      whatsappConfig: toWhatsAppGatewayConfig(whatsapp),
-    });
-    const withoutWhatsapp = computeGatewayConfigHash({});
-
-    assert.equal(
-      runtime.expectedConfigHash,
-      withWhatsapp,
-      "expectedConfigHash must include WhatsApp config",
-    );
-    assert.notEqual(
-      runtime.expectedConfigHash,
-      withoutWhatsapp,
-      "expectedConfigHash must differ from hash without WhatsApp",
-    );
-
-    // restoreAttestation must agree
-    assert.ok(runtime.restoreAttestation, "expected restoreAttestation");
-    assert.equal(
-      runtime.restoreAttestation.desiredDynamicConfigHash,
-      runtime.expectedConfigHash,
-      "attestation.desiredDynamicConfigHash must equal expectedConfigHash",
     );
   });
 });

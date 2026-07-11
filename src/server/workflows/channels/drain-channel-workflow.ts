@@ -1,5 +1,4 @@
 import {
-  hasWhatsAppBusinessCredentials,
   isChannelName,
   type ChannelName,
   type TelegramChannelConfig,
@@ -8,16 +7,30 @@ import type { BootMessageHandle } from "@/server/channels/core/types";
 import type { QueuedChannelJob } from "@/server/channels/driver";
 import { extractTelegramChatId } from "@/server/channels/telegram/adapter";
 import { deleteMessage, editMessageText } from "@/server/channels/telegram/bot-api";
-import { deleteMessage as deleteWhatsAppMessage } from "@/server/channels/whatsapp/whatsapp-api";
-import { extractWhatsAppMessageId } from "@/server/channels/whatsapp/adapter";
-import { recordChannelDlqFailure } from "@/server/channels/dlq";
+import { deriveChannelDeliveryId } from "@/server/channels/delivery-id";
+import {
+  recordChannelDlqFailure,
+  resolveChannelDlqFailure,
+  type ChannelDlqDeliveryOutcome,
+} from "@/server/channels/dlq";
 import { logError, logInfo, logWarn } from "@/server/log";
-import { recordChannelLastForward } from "@/server/channels/last-forward";
+import {
+  recordChannelDeliveryClosedOutcome,
+  recordChannelLastForward,
+} from "@/server/channels/last-forward";
+import {
+  OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+  OPENCLAW_TELEGRAM_DURABLE_ACK_CAPABILITY,
+  isAdmittedTelegramDurableAcceptance,
+  isDefiniteNativePreAdmissionError,
+  isAdmittedGatewayAdmissionUnavailableResponse,
+  type NativeDeliveryAcceptance,
+} from "@/server/channels/native-response-contract";
 import { ensureUsableAiGatewayCredential, markSandboxPortUrlStale } from "@/server/sandbox/lifecycle";
 import { getInitializedMeta } from "@/server/store/store";
 import { getStore } from "@/server/store/store";
 import { mutateMeta } from "@/server/store/store";
-import { createHash, createHmac } from "node:crypto";
+import { createHmac } from "node:crypto";
 import { channelForwardDiagnosticKey } from "@/server/store/keyspace";
 // Discord deferred-interaction tokens are valid for 15 minutes. Soft-
 // deadline a little under that so a reply attempt at 13.5min still
@@ -128,45 +141,6 @@ async function sendDiscordTimeoutNotice(input: {
     status: fallback?.status ?? null,
   };
 }
-function extractChannelDeliveryId(
-  channel: string,
-  payload: unknown,
-  requestId: string | null,
-  receivedAtMs: number | null,
-): string {
-  const p = payload as Record<string, unknown> | null;
-  if (channel === "telegram" && typeof p?.update_id === "number") {
-    return `telegram:${p.update_id}`;
-  }
-  if (channel === "slack") {
-    const eventId = (p as { event_id?: unknown } | null)?.event_id;
-    if (typeof eventId === "string" && eventId) {
-      return `slack:${eventId}`;
-    }
-    const event = (p as { event?: Record<string, unknown> } | null)?.event;
-    const chan = event?.channel;
-    const ts = event?.ts;
-    if (typeof chan === "string" && typeof ts === "string") {
-      return `slack:${chan}:${ts}`;
-    }
-  }
-  if (channel === "discord") {
-    const interactionId = (p as { id?: unknown } | null)?.id;
-    if (typeof interactionId === "string" && interactionId.length > 0) {
-      return `discord:${interactionId}`;
-    }
-  }
-  if (channel === "whatsapp") {
-    const messageId = extractWhatsAppMessageId(payload);
-    if (messageId) {
-      return `whatsapp:${messageId}`;
-    }
-  }
-  const fallbackBody = `${requestId ?? ""}:${receivedAtMs ?? ""}:${JSON.stringify(p ?? {})}`;
-  const hash = createHash("sha256").update(fallbackBody).digest("hex").slice(0, 32);
-  return `${channel}:${hash}`;
-}
-
 async function recordWorkflowFailure(input: {
   channel: string;
   requestId: string | null;
@@ -175,6 +149,7 @@ async function recordWorkflowFailure(input: {
   error: unknown;
   diag: Record<string, unknown>;
   receivedAtMs: number | null;
+  deliveryOutcome: ChannelDlqDeliveryOutcome;
 }): Promise<void> {
   const record = await recordChannelDlqFailure({
     channel: input.channel as ChannelName,
@@ -182,6 +157,7 @@ async function recordWorkflowFailure(input: {
     phase: "workflow-step-failed",
     terminal: input.terminal,
     retryable: !input.terminal,
+    deliveryOutcome: input.deliveryOutcome,
     requestId: input.requestId,
     receivedAtMs: input.receivedAtMs,
     error: input.error,
@@ -192,13 +168,28 @@ async function recordWorkflowFailure(input: {
       input.terminal
         ? "channels.workflow_terminal_failure_recorded"
         : "channels.workflow_retryable_failure_recorded",
-      record,
+      {
+        channel: record.channel,
+        deliveryId: record.deliveryId,
+        phase: record.phase,
+        terminal: record.terminal,
+        retryable: record.retryable,
+        deliveryOutcome: record.deliveryOutcome,
+        recoveryState: record.recoveryState,
+        requestId: record.requestId,
+        failureCount: record.failureCount,
+        firstFailedAt: record.firstFailedAt,
+        failedAt: record.failedAt,
+        errorName: record.errorName,
+        errorMessage: record.errorMessage,
+      },
     );
   }
 }
 
 export type RetryingForwardResult = {
   ok: boolean;
+  acceptance?: NativeDeliveryAcceptance;
   status: number;
   attempts: number;
   totalMs: number;
@@ -212,7 +203,6 @@ export type DrainChannelWorkflowDependencies = {
   createSlackAdapter: typeof import("@/server/channels/slack/adapter").createSlackAdapter;
   createTelegramAdapter: typeof import("@/server/channels/telegram/adapter").createTelegramAdapter;
   createDiscordAdapter: typeof import("@/server/channels/discord/adapter").createDiscordAdapter;
-  createWhatsAppAdapter: typeof import("@/server/channels/whatsapp/adapter").createWhatsAppAdapter;
   reconcileDiscordIntegration: typeof import("@/server/channels/discord/reconcile").reconcileDiscordIntegration;
   runWithBootMessages: typeof import("@/server/channels/core/boot-messages").runWithBootMessages;
   ensureSandboxReady: typeof import("@/server/sandbox/lifecycle").ensureSandboxReady;
@@ -223,6 +213,7 @@ export type DrainChannelWorkflowDependencies = {
   waitForTelegramNativeHandler: typeof waitForTelegramNativeHandler;
   probeTelegramNativeHandlerLocally: typeof probeTelegramNativeHandlerLocally;
   buildExistingBootHandle: typeof buildExistingBootHandle;
+  hydrateVerifiedBundleIdentity: typeof import("@/server/openclaw/bundle-identity").hydrateVerifiedBundleIdentity;
   RetryableError: typeof import("workflow").RetryableError;
   FatalError: typeof import("workflow").FatalError;
   getStepMetadata: typeof import("workflow").getStepMetadata;
@@ -296,14 +287,47 @@ export type ProcessChannelStepOptions = {
 };
 
 export type ChannelWorkflowHandoff = {
+  /** Re-enter lifecycle readiness when fast-path admission closed mid-stop. */
+  revalidateSandboxBeforeForward?: boolean;
   fallbackTelegramConfig?: TelegramChannelConfig | null;
   slackForwardHeaders?: Record<string, string> | null;
   slackRawBody?: string | null;
   discordForwardHeaders?: Record<string, string> | null;
   discordRawBody?: string | null;
-  whatsappForwardHeaders?: Record<string, string> | null;
-  whatsappRawBody?: string | null;
 };
+
+type WorkflowCapabilityAdmissions = {
+  telegramDurableAcceptanceAdmitted: boolean;
+  gatewayAdmissionRejectionAdmitted: boolean;
+  source: "post-wake-verified" | "post-wake-unverified";
+};
+
+async function resolveWorkflowCapabilityAdmissions(input: {
+  meta: import("@/shared/types").SingleMeta;
+  hydrateVerifiedBundleIdentity: DrainChannelWorkflowDependencies["hydrateVerifiedBundleIdentity"];
+}): Promise<WorkflowCapabilityAdmissions> {
+  const verifiedIdentity = await input
+    .hydrateVerifiedBundleIdentity(input.meta.bundleIdentity)
+    .catch(() => null);
+  if (verifiedIdentity) {
+    return {
+      telegramDurableAcceptanceAdmitted:
+        verifiedIdentity.capabilities.includes(
+          OPENCLAW_TELEGRAM_DURABLE_ACK_CAPABILITY,
+        ),
+      gatewayAdmissionRejectionAdmitted:
+        verifiedIdentity.capabilities.includes(
+          OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+        ),
+      source: "post-wake-verified",
+    };
+  }
+  return {
+    telegramDurableAcceptanceAdmitted: false,
+    gatewayAdmissionRejectionAdmitted: false,
+    source: "post-wake-unverified",
+  };
+}
 
 // Versioned workflow envelope. All new callers pass a single v1 envelope
 // instead of positional args so that adding fields in future deploys can
@@ -378,22 +402,6 @@ function assessTelegramRestoreContract(
     telegramListenerReady: restore.telegramListenerReady ?? false,
     telegramListenerWaitMs: restore.telegramListenerWaitMs ?? null,
   };
-}
-
-function telegramPublicProbeSawSandboxNotListening(
-  probe: TelegramProbeResult | null,
-): boolean {
-  if (!probe) return false;
-  return (probe.timeline ?? []).some((attempt) => {
-    if (attempt.status === 502) return true;
-    if (typeof attempt.bodyHead === "string" && /sandbox is not listening/i.test(attempt.bodyHead)) {
-      return true;
-    }
-    if (typeof attempt.error === "string" && /sandbox is not listening/i.test(attempt.error)) {
-      return true;
-    }
-    return false;
-  });
 }
 
 function telegramLocalProbeSawConnectionRefused(
@@ -486,12 +494,25 @@ export async function processChannelStep(
     channel === "telegram"
       ? options?.workflowHandoff?.fallbackTelegramConfig ?? null
       : null;
-  const deliveryId = extractChannelDeliveryId(
+  const deliveryId = deriveChannelDeliveryId({
     channel,
     payload,
     requestId,
     receivedAtMs,
-  );
+  });
+  const resolvedDependencies =
+    options?.dependencies ?? (await loadDrainChannelWorkflowDependencies());
+  if (channel === "whatsapp") {
+    logWarn("channels.whatsapp_workflow_rejected", {
+      channel,
+      requestId,
+      deliveryId,
+      reason: "hosted-transport-unavailable",
+    });
+    throw new resolvedDependencies.FatalError(
+      "hosted_whatsapp_transport_unavailable",
+    );
+  }
   // Diagnostic trace — every phase appends here, written to store at the end.
   const diag: Record<string, unknown> = {
     channel,
@@ -525,8 +546,6 @@ export async function processChannelStep(
   console.log(`[DIAG] processChannelStep START channel=${channel} requestId=${requestId} bootMessageId=${bootMessageId ?? "none"}`);
   await persistDiagSnapshot("workflow-step-started");
 
-  const resolvedDependencies =
-    options?.dependencies ?? (await loadDrainChannelWorkflowDependencies());
   const {
     reconcileDiscordIntegration,
     runWithBootMessages,
@@ -537,6 +556,7 @@ export async function processChannelStep(
     forwardToNativeHandlerWithRetry,
     probeTelegramNativeHandlerLocally,
     buildExistingBootHandle,
+    hydrateVerifiedBundleIdentity,
   } = resolvedDependencies;
 
   if (channel === "discord") {
@@ -556,6 +576,8 @@ export async function processChannelStep(
 
   const existingBootHandle = await buildExistingBootHandle(channel, payload, bootMessageId);
   diag.hasExistingBootHandle = Boolean(existingBootHandle);
+  let nativeAcceptance: NativeDeliveryAcceptance | null = null;
+  let finalForwardClassification: string | null = null;
 
   // Discord interaction tokens expire 15 minutes after the user's slash
   // command. If we're already past the soft deadline on step entry
@@ -619,7 +641,10 @@ export async function processChannelStep(
       bootDurationMs: diag.bootDurationMs,
     });
 
-    const readyMeta = bootResult.meta.status === "running"
+    const revalidateSandboxBeforeForward =
+      options?.workflowHandoff?.revalidateSandboxBeforeForward === true;
+    const readyMeta =
+      bootResult.meta.status === "running" && !revalidateSandboxBeforeForward
       ? bootResult.meta
       : await ensureSandboxReady({
           origin,
@@ -642,7 +667,9 @@ export async function processChannelStep(
     diag.readyMetaPortUrlKeys = effectiveReadyMeta.portUrls ? Object.keys(effectiveReadyMeta.portUrls) : null;
     diag.readyMetaPortUrls = effectiveReadyMeta.portUrls;
     diag.readyMetaHasWebhookSecret = Boolean(effectiveReadyMeta.channels?.telegram?.webhookSecret);
-    diag.usedBootMetaDirectly = bootResult.meta.status === "running";
+    diag.usedBootMetaDirectly =
+      bootResult.meta.status === "running" && !revalidateSandboxBeforeForward;
+    diag.revalidatedSandboxBeforeForward = revalidateSandboxBeforeForward;
     diag.telegramRestoreContractStatus = telegramRestoreContract?.status ?? null;
     diag.telegramRestoreContractRecordedAt =
       telegramRestoreContract?.restoreMetricsRecordedAt ?? null;
@@ -737,7 +764,11 @@ export async function processChannelStep(
     }
 
     // --- Phase 2: Forward raw payload to native handler ---
-    let forwardResult: { ok: boolean; status: number };
+    let forwardResult: {
+      ok: boolean;
+      status: number;
+      acceptance: NativeDeliveryAcceptance;
+    };
     let retryingResult: RetryingForwardResult | null = null;
 
     const forwardStartedAt = Date.now();
@@ -876,6 +907,15 @@ export async function processChannelStep(
         });
       }
 
+      const capabilityAdmissions = await resolveWorkflowCapabilityAdmissions({
+        meta: effectiveReadyMeta,
+        hydrateVerifiedBundleIdentity,
+      });
+      diag.bundleCapabilityAdmissionSource = capabilityAdmissions.source;
+      diag.telegramDurableAcceptanceAdmitted =
+        capabilityAdmissions.telegramDurableAcceptanceAdmitted;
+      diag.gatewayAdmissionRejectionAdmitted =
+        capabilityAdmissions.gatewayAdmissionRejectionAdmitted;
       retryingResult = await forwardToNativeHandlerWithRetry(
         channel as ChannelName,
         payload,
@@ -886,6 +926,8 @@ export async function processChannelStep(
         null,
         null,
         deliveryId,
+        capabilityAdmissions.telegramDurableAcceptanceAdmitted,
+        capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
       );
       diag.telegramReadinessMode = readinessMode;
       diag.telegramPreForwardProbeMs = Date.now() - preForwardProbeStartedAt;
@@ -895,7 +937,13 @@ export async function processChannelStep(
           retryingResult.attemptsDetail[0].startedAtMs - workflowStartedAt,
         );
       }
-      forwardResult = { ok: retryingResult.ok, status: retryingResult.status };
+      forwardResult = {
+        ok: retryingResult.ok,
+        status: retryingResult.status,
+        acceptance:
+          retryingResult.acceptance ??
+          (retryingResult.ok ? "accepted" : "rejected"),
+      };
     } else if (channel === "slack") {
       // Slack on port 3000 returns 404 until Bolt's HTTPReceiver registers
       // /slack/events (no base-server catch-all to worry about). The retry
@@ -977,6 +1025,13 @@ export async function processChannelStep(
       diag.slackForwardHasTimestamp = Boolean(
         slackForwardHeaders?.["x-slack-request-timestamp"],
       );
+      const capabilityAdmissions = await resolveWorkflowCapabilityAdmissions({
+        meta: effectiveReadyMeta,
+        hydrateVerifiedBundleIdentity,
+      });
+      diag.bundleCapabilityAdmissionSource = capabilityAdmissions.source;
+      diag.gatewayAdmissionRejectionAdmitted =
+        capabilityAdmissions.gatewayAdmissionRejectionAdmitted;
       retryingResult = await forwardToNativeHandlerWithRetry(
         channel as ChannelName,
         payload,
@@ -987,9 +1042,17 @@ export async function processChannelStep(
         slackForwardHeaders,
         slackRawBody,
         deliveryId,
+        false,
+        capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
       );
-      forwardResult = { ok: retryingResult.ok, status: retryingResult.status };
-    } else if (channel === "discord" || channel === "whatsapp") {
+      forwardResult = {
+        ok: retryingResult.ok,
+        status: retryingResult.status,
+        acceptance:
+          retryingResult.acceptance ??
+          (retryingResult.ok ? "accepted" : "rejected"),
+      };
+    } else if (channel === "discord") {
       // Second Discord deadline check: sandbox wake can eat most of the
       // 15-minute interaction token budget. If we're past the soft
       // deadline now, don't bother forwarding — OpenClaw's native
@@ -1017,12 +1080,9 @@ export async function processChannelStep(
           );
         }
       }
-      const extraForwardHeaders = channel === "discord"
-        ? options?.workflowHandoff?.discordForwardHeaders ?? null
-        : options?.workflowHandoff?.whatsappForwardHeaders ?? null;
-      const rawBody = channel === "discord"
-        ? options?.workflowHandoff?.discordRawBody ?? null
-        : options?.workflowHandoff?.whatsappRawBody ?? null;
+      const extraForwardHeaders =
+        options?.workflowHandoff?.discordForwardHeaders ?? null;
+      const rawBody = options?.workflowHandoff?.discordRawBody ?? null;
       diag[`${channel}ForwardHeaderKeys`] = extraForwardHeaders
         ? Object.keys(extraForwardHeaders).sort()
         : null;
@@ -1038,9 +1098,15 @@ export async function processChannelStep(
         rawBody,
         deliveryId,
       );
-      forwardResult = { ok: retryingResult.ok, status: retryingResult.status };
+      forwardResult = {
+        ok: retryingResult.ok,
+        status: retryingResult.status,
+        acceptance:
+          retryingResult.acceptance ??
+          (retryingResult.ok ? "accepted" : "rejected"),
+      };
     } else {
-      forwardResult = await forwardToNativeHandler(
+      const directResult = await forwardToNativeHandler(
         channel as ChannelName,
         payload,
         effectiveReadyMeta,
@@ -1049,11 +1115,34 @@ export async function processChannelStep(
         null,
         deliveryId,
       );
+      forwardResult = {
+        ok: directResult.ok,
+        status: directResult.status,
+        acceptance: directResult.ok ? "accepted" : "rejected",
+      };
+    }
+
+    const gatewayAdmissionClosed = retryingResult?.attemptsDetail?.some(
+      (attempt) => attempt.classification === "gateway-unavailable",
+    ) === true;
+    if (gatewayAdmissionClosed) {
+      // The native gateway explicitly closed admission while quiescing. Re-enter
+      // lifecycle readiness once, then let the rejected result retry the step.
+      // Replaying against the same closing gateway cannot become accepted.
+      diag.gatewayAdmissionClosedRevalidation = "started";
+      await ensureSandboxReady({
+        origin,
+        reason: `channel:${channel}:gateway-admission-closed`,
+        timeoutMs: WORKFLOW_SANDBOX_READY_TIMEOUT_MS,
+      });
+      diag.gatewayAdmissionClosedRevalidation = "completed";
     }
 
     const forwardCompletedAt = Date.now();
+    nativeAcceptance = forwardResult.acceptance;
     diag.forwardOk = forwardResult.ok;
     diag.forwardStatus = forwardResult.status;
+    diag.forwardAcceptance = forwardResult.acceptance;
     diag.forwardDurationMs = forwardCompletedAt - forwardStartedAt;
     diag.forwardAttempts = retryingResult?.attempts ?? null;
     diag.forwardRetries = retryingResult?.retries ?? null;
@@ -1080,6 +1169,7 @@ export async function processChannelStep(
       sandboxId: effectiveReadyMeta.sandboxId,
       ok: forwardResult.ok,
       status: forwardResult.status,
+      acceptance: forwardResult.acceptance,
       transport: retryingResult?.transport
         ?? (channel === "telegram" || channel === "slack" ? "public" : null),
       retryingForwardAttempts: retryingResult?.attempts ?? null,
@@ -1099,23 +1189,35 @@ export async function processChannelStep(
         retryingResult && retryingResult.attempts >= RETRYING_FORWARD_MAX_ATTEMPTS && !forwardResult.ok
           ? "exhausted"
           : lastAttempt?.classification ?? (forwardResult.ok ? "accepted" : "handler-error");
+      finalForwardClassification = finalClassification;
       const port = portForChannel(channel);
       const sandboxUrl = effectiveReadyMeta.portUrls?.[String(port)] ?? null;
-      await recordChannelLastForward(channel, {
-        ok: forwardResult.ok,
-        status: forwardResult.status,
-        classification: finalClassification,
-        attempts: retryingResult?.attempts ?? 1,
-        totalMs: retryingResult?.totalMs ?? (forwardCompletedAt - forwardStartedAt),
-        transport: retryingResult?.transport
-          ?? (channel === "telegram" || channel === "slack" ? "public" : null),
-        sandboxUrl,
-        sandboxId: effectiveReadyMeta.sandboxId ?? null,
-        finalReasonHead: lastAttempt?.bodyHead ? lastAttempt.bodyHead.slice(0, 200) : null,
-        startedAt: forwardStartedAt,
-        completedAt: forwardCompletedAt,
-        deliveryId: deliveryId ?? null,
-      });
+      await recordChannelLastForward(
+        channel,
+        {
+          ok: forwardResult.ok,
+          status: forwardResult.status,
+          classification: finalClassification,
+          attempts: retryingResult?.attempts ?? 1,
+          totalMs:
+            retryingResult?.totalMs ??
+            (forwardCompletedAt - forwardStartedAt),
+          transport:
+            retryingResult?.transport ??
+            (channel === "telegram" || channel === "slack" ? "public" : null),
+          sandboxUrl,
+          sandboxId: effectiveReadyMeta.sandboxId ?? null,
+          finalReasonHead: lastAttempt?.bodyHead
+            ? lastAttempt.bodyHead.slice(0, 200)
+            : null,
+          startedAt: forwardStartedAt,
+          completedAt: forwardCompletedAt,
+          deliveryId: deliveryId ?? null,
+        },
+        forwardResult.acceptance === "unknown"
+          ? { closedOutcome: "unknown" }
+          : undefined,
+      );
     }
 
     // Emit one end-to-end Telegram wake summary per request.
@@ -1217,7 +1319,7 @@ export async function processChannelStep(
       });
     }
 
-    if (channel === "discord" || channel === "whatsapp") {
+    if (channel === "discord") {
       const restore = effectiveReadyMeta.lastRestoreMetrics;
       logInfo(`channels.${channel}_wake_summary`, {
         channel,
@@ -1251,12 +1353,11 @@ export async function processChannelStep(
       });
     }
 
-    // Boot-message cleanup. Slack keeps a "dead-time" status message visible
-    // while the sandbox wakes. Once the native Slack handler accepts the
-    // event, clear the wrapper message so Slack's own assistant/thread status
-    // owns the visible reply lifecycle. Telegram has no bot-message webhook
-    // signal yet, so native accept must not be treated as proof of
-    // user-visible reply delivery.
+    // Native acceptance and user-visible reply are separate states. There is
+    // not yet a reply observer that could clear a retained wake notice, so
+    // acceptance transfers UI ownership to the native handler and clears it;
+    // otherwise every successful delivery would leave a permanent placeholder.
+    // Uncertain native acceptance keeps an explicit warning visible instead.
     if (existingBootHandle) {
       if (channel === "slack" && forwardResult.ok) {
         diag.bootMessageAction = "slack-cleared-after-native-accept";
@@ -1293,7 +1394,7 @@ export async function processChannelStep(
             });
           });
       } else if (channel === "telegram" && forwardResult.ok) {
-        diag.bootMessageAction = "telegram-cleared-after-native-accept";
+        diag.bootMessageAction = "telegram-cleared-after-durable-accept";
         diag.bootMessageClearedAt = Date.now();
         await existingBootHandle
           .clear()
@@ -1309,7 +1410,7 @@ export async function processChannelStep(
               forwardTotalMs: retryingResult?.totalMs ?? null,
               placeholderAction: "cleared",
               clearOnAccept: true,
-              reason: "native_handler_accepted_update",
+              reason: "native_handler_durably_accepted_update",
             });
           })
           .catch((bootError) => {
@@ -1326,21 +1427,26 @@ export async function processChannelStep(
                   : String(bootError),
             });
           });
-      } else if (channel === "whatsapp" && forwardResult.ok) {
-        diag.bootMessageAction = "whatsapp-retained-after-native-accept";
-        diag.bootMessageRetainedAt = Date.now();
-        logInfo("channels.whatsapp_boot_message_retained_after_accept", {
-          channel,
-          requestId,
-          deliveryId,
-          bootMessageId: bootMessageId ?? null,
-          forwardStatus: forwardResult.status,
-          forwardAttempts: retryingResult?.attempts ?? null,
-          forwardTotalMs: retryingResult?.totalMs ?? null,
-          placeholderAction: "retained",
-          clearOnAccept: false,
-          reason: "whatsapp_delete_not_supported",
-        });
+      } else if (
+        (channel === "slack" || channel === "telegram") &&
+        forwardResult.acceptance === "unknown"
+      ) {
+        diag.bootMessageAction = `${channel}-terminal-acceptance-unknown`;
+        await existingBootHandle
+          .update(
+            "🦞 Delivery could not be confirmed. Check for a reply before retrying.",
+          )
+          .catch((bootError) => {
+            logWarn("channels.workflow_boot_unknown_update_failed", {
+              channel,
+              requestId,
+              deliveryId,
+              error:
+                bootError instanceof Error
+                  ? bootError.message
+                  : String(bootError),
+            });
+          });
       } else {
         // Forward failed. Instead of silently deleting the boot message
         // (which left the user staring at an empty channel after their
@@ -1373,7 +1479,12 @@ export async function processChannelStep(
       }
     }
 
-    diag.outcome = forwardResult.ok ? "success" : `failed:${forwardResult.status}`;
+    diag.outcome =
+      forwardResult.acceptance === "accepted"
+        ? "success"
+        : forwardResult.acceptance === "unknown"
+          ? "delivery-unknown"
+          : `failed:${forwardResult.status}`;
     diag.completedAt = Date.now();
     diag.totalDurationMs = Date.now() - workflowStartedAt;
     console.log(`[DIAG] processChannelStep END outcome=${diag.outcome} totalMs=${diag.totalDurationMs}`);
@@ -1383,10 +1494,46 @@ export async function processChannelStep(
       await getStore().setValue(channelForwardDiagnosticKey(), diag, 3600);
     } catch { /* best effort */ }
 
-    if (!forwardResult.ok) {
+    if (forwardResult.acceptance === "rejected") {
       throw new Error(
         `native_forward_failed status=${forwardResult.status}`,
       );
+    }
+    if (
+      forwardResult.acceptance === "unknown" &&
+      isChannelName(channel)
+    ) {
+      // Unknown supersedes any older definite rejection for this delivery.
+      const blockedRecord = await recordChannelDlqFailure({
+        channel,
+        deliveryId,
+        phase: "workflow-step-failed",
+        terminal: true,
+        retryable: false,
+        deliveryOutcome: "unknown",
+        requestId,
+        receivedAtMs,
+        error: new Error("native_delivery_outcome_unknown"),
+        diag,
+      }).catch(() => null);
+      if (!blockedRecord) {
+        logWarn("channels.dlq_unknown_outcome_record_failed", {
+          channel,
+          deliveryId,
+        });
+      }
+    }
+    if (
+      forwardResult.acceptance === "accepted" &&
+      isChannelName(channel)
+    ) {
+      await resolveChannelDlqFailure(channel, deliveryId).catch((error) => {
+        logWarn("channels.dlq_resolution_failed", {
+          channel,
+          deliveryId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
     }
   } catch (error) {
     diag.outcome = "error";
@@ -1414,6 +1561,19 @@ export async function processChannelStep(
     );
     const terminal = workflowError.name === "FatalError";
     const persistentFailure = terminal && retryBudget.exceeded;
+    if (terminal && isChannelName(channel)) {
+      const closedOutcome =
+        nativeAcceptance === "unknown" ? "unknown" : "failed";
+      await recordChannelDeliveryClosedOutcome({
+        channel,
+        deliveryId,
+        outcome: closedOutcome,
+        reason:
+          closedOutcome === "unknown"
+            ? "native-delivery-outcome-unknown"
+            : `terminal_${finalForwardClassification ?? "workflow-failure"}`,
+      });
+    }
 
     // Pre-forward exceptions (sandbox ready timeout, probe failure, etc.)
     // and post-forward throws both land here. Slack/Telegram pass
@@ -1457,6 +1617,8 @@ export async function processChannelStep(
       error,
       diag,
       receivedAtMs,
+      deliveryOutcome:
+        nativeAcceptance === "unknown" ? "unknown" : "not-accepted",
     });
     throw workflowError;
   }
@@ -1532,6 +1694,7 @@ export type DiagnosticHeaders = {
   xPoweredBy?: string | null;
   via?: string | null;
   cacheControl?: string | null;
+  openclawDeliveryAccepted?: string | null;
 };
 
 type TelegramLocalProbeJson = {
@@ -1577,6 +1740,7 @@ export type ForwardAttemptDetail = {
   headers: DiagnosticHeaders | null;
   transport: "public" | "local";
   classification: string;
+  acceptance?: NativeDeliveryAcceptance;
   error?: string | null;
   detail?: string | null;
   processSnapshot?: string | null;
@@ -1591,6 +1755,7 @@ function pickDiagnosticHeaders(headers: Headers): DiagnosticHeaders {
     xPoweredBy: headers.get("x-powered-by"),
     via: headers.get("via"),
     cacheControl: headers.get("cache-control"),
+    openclawDeliveryAccepted: headers.get("x-openclaw-delivery-accepted"),
   };
 }
 
@@ -1602,8 +1767,8 @@ function optionalDiagnosticString(value: unknown): string | null {
  * Poll the Telegram native handler on port 8787 until the webhook route
  * is registered.  The gateway starts a base HTTP server on 8787 immediately,
  * but the Telegram provider takes 2-4 seconds to register the
- * `/telegram-webhook` path.  During that window the base server returns
- * a generic 200 for POST requests, silently swallowing the payload.
+ * `/telegram-webhook` path. During that window the base server can return
+ * a response that does not carry OpenClaw's durable-acceptance marker.
  *
  * We send a GET to `/telegram-webhook` — the registered handler returns
  * 401 (missing secret header), while the base server returns 404.
@@ -1718,8 +1883,9 @@ function pick(headers) {
     contentType: headers.get("content-type"),
     contentLength: headers.get("content-length"),
     xPoweredBy: headers.get("x-powered-by"),
-    via: headers.get("via"),
-    cacheControl: headers.get("cache-control"),
+	    via: headers.get("via"),
+	    cacheControl: headers.get("cache-control"),
+	    openclawDeliveryAccepted: headers.get("x-openclaw-delivery-accepted"),
   };
 }
 fetch(url, {
@@ -1828,6 +1994,7 @@ function pick(headers) {
     xPoweredBy: headers.get("x-powered-by"),
     via: headers.get("via"),
     cacheControl: headers.get("cache-control"),
+    openclawDeliveryAccepted: headers.get("x-openclaw-delivery-accepted"),
   };
 }
 async function collectFailureContext() {
@@ -1946,6 +2113,29 @@ function buildMinimalBootAdapter() {
   };
 }
 
+class NativeForwardPreDispatchError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "NativeForwardPreDispatchError";
+    this.cause = cause;
+  }
+}
+
+async function resolveNativeForwardSandboxDomain(
+  getSandboxDomain: (port?: number) => Promise<string>,
+  port?: number,
+): Promise<string> {
+  try {
+    return await getSandboxDomain(port);
+  } catch (error) {
+    // No request can leave this process until the destination resolves.
+    // Preserve this distinction so workflow retry never closes it as unknown.
+    throw new NativeForwardPreDispatchError(error);
+  }
+}
+
 /**
  * Forward the raw webhook payload to OpenClaw's native channel handler on
  * the sandbox, matching the fast-path forwarding used in webhook routes.
@@ -1969,7 +2159,10 @@ async function forwardToNativeHandler(
 
   switch (channel) {
     case "telegram": {
-      const sandboxUrl = await getSandboxDomain(OPENCLAW_TELEGRAM_WEBHOOK_PORT);
+      const sandboxUrl = await resolveNativeForwardSandboxDomain(
+        getSandboxDomain,
+        OPENCLAW_TELEGRAM_WEBHOOK_PORT,
+      );
       forwardUrl = `${sandboxUrl}/telegram-webhook`;
       if (meta.channels.telegram?.webhookSecret) {
         headers["x-telegram-bot-api-secret-token"] = meta.channels.telegram.webhookSecret;
@@ -1977,17 +2170,19 @@ async function forwardToNativeHandler(
       break;
     }
     case "slack": {
-      const sandboxUrl = await getSandboxDomain();
+      const sandboxUrl = await resolveNativeForwardSandboxDomain(
+        getSandboxDomain,
+      );
       forwardUrl = `${sandboxUrl}/slack/events`;
       break;
     }
     case "whatsapp": {
-      const sandboxUrl = await getSandboxDomain();
-      forwardUrl = `${sandboxUrl}/whatsapp-webhook`;
-      break;
+      throw new Error("hosted_whatsapp_transport_unavailable");
     }
     case "discord": {
-      const sandboxUrl = await getSandboxDomain();
+      const sandboxUrl = await resolveNativeForwardSandboxDomain(
+        getSandboxDomain,
+      );
       forwardUrl = `${sandboxUrl}/discord-webhook`;
       break;
     }
@@ -2111,9 +2306,9 @@ function shouldAttemptAiGatewayCredentialRecovery(
  * later.  During that window the handler returns 401 (secret check against
  * an uninitialized route) or 404 (path not yet registered).
  *
- * Duplicate-safety: retries ONLY happen when the handler definitely did not
- * process the request. Any response that is 2xx, 3xx, or 4xx (other than
- * 401/404) is treated as "handler received the request" and is never retried.
+ * Duplicate-safety: retries happen only after explicit pre-admission rejection.
+ * Unmarked Telegram success, proxy failures, and fetch exceptions close as
+ * unknown because the handler may already have accepted the delivery.
  */
 async function forwardToNativeHandlerWithRetry(
   channel: ChannelName,
@@ -2141,6 +2336,8 @@ async function forwardToNativeHandlerWithRetry(
   extraForwardHeaders: Record<string, string> | null = null,
   rawBody: string | null = null,
   deliveryId: string | null = null,
+  telegramDurableAcceptanceAdmitted = false,
+  gatewayAdmissionRejectionAdmitted = false,
 ): Promise<RetryingForwardResult> {
   const startedAt = Date.now();
   const deadline = startedAt + RETRYING_FORWARD_TIMEOUT_MS;
@@ -2172,9 +2369,9 @@ async function forwardToNativeHandlerWithRetry(
           )
         : await forwardToNativeHandler(channel, payload, meta, getSandboxDomain, extraForwardHeaders, rawBody, deliveryId);
 
-      // Proxy-level failures (502/503/504): handler not listening yet. Safe to retry.
-      // Handler-not-ready (401/404): native handler is listening at TCP level
-      // but webhook route or secret validation is not yet initialized.
+      // Retry only explicit pre-admission rejection. Generic proxy errors and
+      // transport failures may occur after acceptance, so they remain unknown.
+      // Handler-not-ready (401/404) means the native route rejected the request.
       //
       // Channel-specific behavior:
       // - Telegram: retries on 401 (webhook secret validation against an
@@ -2183,26 +2380,19 @@ async function forwardToNativeHandlerWithRetry(
       //   failed re-verification — retrying won't recover since the payload
       //   body and signing secret are fixed; treat as fatal.
       //
-      // Swallowed by base server (200 with empty body in <100ms): some OpenClaw
-      // versions return a generic 200 from the base HTTP server on port 8787
-      // before the Telegram webhook handler registers its route.  The real
-      // handler processes the AI request (takes seconds) and returns a body.
-      // A near-instant 200 with no body means the payload was silently
-      // discarded.  Safe to retry — the handler never saw it.
-      // Slack on port 3000 has no equivalent base-server catch-all, so this
-      // check stays Telegram-only.
-      const swallowed = channel === "telegram"
-        && transport === "public"
-        && result.status === 200
-        && result.bodyLength === 0
-        && (
-          result.headers?.server === "Vercel"
-          || result.headers?.cacheControl === "public, max-age=0, must-revalidate"
-          || result.durationMs < 100
+      const telegramDurablyAccepted =
+        isAdmittedTelegramDurableAcceptance(
+          telegramDurableAcceptanceAdmitted,
+          result.headers?.openclawDeliveryAccepted,
         );
       const isHandlerNotReady =
         result.status === 404
         || (result.status === 401 && channel === "telegram");
+      const gatewayAdmissionClosed = isAdmittedGatewayAdmissionUnavailableResponse(
+        gatewayAdmissionRejectionAdmitted,
+        result.status,
+        result.bodyHead,
+      );
       // Vercel sandbox tunnel returns 502 with this body when the sandbox
       // process isn't listening on the requested port. This is a stale
       // public-URL signal — the cached sb-XXX.vercel.run points at a port
@@ -2212,9 +2402,20 @@ async function forwardToNativeHandlerWithRetry(
         result.status === 502
         && typeof result.bodyHead === "string"
         && /sandbox is not listening/i.test(result.bodyHead);
-      const classification = swallowed
-        ? "swallowed-by-base-server"
-        : isSandboxNotListening
+      const acceptance: NativeDeliveryAcceptance = result.ok
+        ? channel === "telegram" && !telegramDurablyAccepted
+          ? "unknown"
+          : "accepted"
+        : gatewayAdmissionClosed || isSandboxNotListening || isHandlerNotReady
+          ? "rejected"
+          : result.status >= 500 || result.status === 0
+            ? "unknown"
+            : "rejected";
+      const classification = acceptance === "unknown"
+        ? "acceptance-unknown"
+        : gatewayAdmissionClosed
+          ? "gateway-unavailable"
+          : isSandboxNotListening
           ? "sandbox-not-listening"
           : result.status >= 502
             ? "proxy-error"
@@ -2235,6 +2436,7 @@ async function forwardToNativeHandlerWithRetry(
         headers: result.headers,
         transport,
         classification,
+        acceptance,
         error: "error" in result ? optionalDiagnosticString(result.error) : null,
         detail: "detail" in result ? optionalDiagnosticString(result.detail) : null,
         processSnapshot: "processSnapshot" in result ? optionalDiagnosticString(result.processSnapshot) : null,
@@ -2246,6 +2448,7 @@ async function forwardToNativeHandlerWithRetry(
         transport,
         status: result.status,
         classification,
+        acceptance,
         elapsedMs: Date.now() - attemptStartedAt,
         bodyLength: result.bodyLength,
         error: "error" in result ? optionalDiagnosticString(result.error) : null,
@@ -2254,7 +2457,9 @@ async function forwardToNativeHandlerWithRetry(
         logTail: "logTail" in result ? optionalDiagnosticString(result.logTail) : null,
         deliveryId,
       });
-      if (result.status >= 502 || isHandlerNotReady || swallowed) {
+      const definitelyRejectedBeforeAdmission =
+        gatewayAdmissionClosed || isSandboxNotListening || isHandlerNotReady;
+      if (definitelyRejectedBeforeAdmission) {
         const reason = classification;
         const entry = { attempt, reason, status: result.status };
         retries.push(entry);
@@ -2275,6 +2480,27 @@ async function forwardToNativeHandlerWithRetry(
           retryElapsedMs: Date.now() - startedAt,
           deliveryId,
         });
+
+        if (classification === "gateway-unavailable") {
+          const totalMs = Date.now() - startedAt;
+          terminalAttemptResult = {
+            ok: false,
+            acceptance: "rejected",
+            status: result.status,
+            attempts: attempt,
+            totalMs,
+            transport,
+            retries,
+            attemptsDetail,
+          };
+          logInfo("channels.retrying_forward_gateway_admission_closed", {
+            channel,
+            attempts: attempt,
+            totalMs,
+            deliveryId,
+          });
+          break;
+        }
 
         // Sandbox public URL is dead. The cached sb-XXX.vercel.run is no
         // longer accepting connections. Hammering it 20× × 2s = 40s wasted
@@ -2303,6 +2529,7 @@ async function forwardToNativeHandlerWithRetry(
             const totalMs = Date.now() - startedAt;
             terminalAttemptResult = {
               ok: false,
+              acceptance: "rejected",
               status: result.status,
               attempts: attempt,
               totalMs,
@@ -2326,6 +2553,28 @@ async function forwardToNativeHandlerWithRetry(
           await new Promise((r) => setTimeout(r, RETRYING_FORWARD_RETRY_INTERVAL_MS));
         }
         continue;
+      }
+
+      if (acceptance === "unknown") {
+        const totalMs = Date.now() - startedAt;
+        logWarn("channels.native_forward_acceptance_unknown", {
+          channel,
+          status: result.status,
+          attempts: attempt,
+          totalMs,
+          transport,
+          deliveryId,
+        });
+        return {
+          ok: false,
+          acceptance,
+          status: result.status,
+          attempts: attempt,
+          totalMs,
+          transport,
+          retries,
+          attemptsDetail,
+        };
       }
 
       // Any other direct handler response: normally do NOT retry.
@@ -2394,7 +2643,8 @@ async function forwardToNativeHandlerWithRetry(
         deliveryId,
       });
       return {
-        ok: result.ok,
+        ok: acceptance === "accepted",
+        acceptance,
         status: result.status,
         attempts: attempt,
         totalMs,
@@ -2403,7 +2653,65 @@ async function forwardToNativeHandlerWithRetry(
         attemptsDetail,
       };
     } catch (error) {
-      // Connection refused, DNS failure, timeout — handler not reachable.
+      if (
+        error instanceof NativeForwardPreDispatchError ||
+        isDefiniteNativePreAdmissionError(error)
+      ) {
+        const errorMsg =
+          error instanceof Error ? error.message : String(error);
+        const entry = {
+          attempt,
+          reason: "pre-dispatch-exception",
+          error: errorMsg,
+        };
+        retries.push(entry);
+        attemptsDetail.push({
+          attempt,
+          startedAtMs: attemptStartedAt,
+          elapsedMs: Date.now() - startedAt,
+          durationMs: null,
+          status: null,
+          ok: false,
+          bodyLength: null,
+          bodyHead: null,
+          headers: null,
+          transport: "public",
+          classification: "pre-dispatch-exception",
+          acceptance: "rejected",
+          error: errorMsg,
+        });
+        logInfo("channels.native_forward_retry", {
+          channel,
+          attempt,
+          reason: "pre-dispatch-exception",
+          error: errorMsg,
+          retryElapsedMs: Date.now() - startedAt,
+          deliveryId,
+        });
+        if (
+          attempt < RETRYING_FORWARD_MAX_ATTEMPTS &&
+          Date.now() < deadline
+        ) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, RETRYING_FORWARD_RETRY_INTERVAL_MS),
+          );
+          continue;
+        }
+        terminalAttemptResult = {
+          ok: false,
+          acceptance: "rejected",
+          status: 503,
+          attempts: attempt,
+          totalMs: Date.now() - startedAt,
+          transport: "public",
+          retries,
+          attemptsDetail,
+        };
+        break;
+      }
+
+      // Connection refused, DNS failure, or timeout does not prove rejection;
+      // the request may have reached the handler before the response was lost.
       const errorMsg = error instanceof Error ? error.message : String(error);
       const entry = { attempt, reason: "fetch-exception" as const, error: errorMsg };
       retries.push(entry);
@@ -2419,6 +2727,7 @@ async function forwardToNativeHandlerWithRetry(
         headers: null,
         transport: "public",
         classification: "fetch-exception",
+        acceptance: "unknown",
         error: errorMsg,
       });
       logInfo("channels.native_forward_retry", {
@@ -2429,9 +2738,16 @@ async function forwardToNativeHandlerWithRetry(
         retryElapsedMs: Date.now() - startedAt,
         deliveryId,
       });
-      if (attempt < RETRYING_FORWARD_MAX_ATTEMPTS && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, RETRYING_FORWARD_RETRY_INTERVAL_MS));
-      }
+      return {
+        ok: false,
+        acceptance: "unknown",
+        status: 0,
+        attempts: attempt,
+        totalMs: Date.now() - startedAt,
+        transport: "public",
+        retries,
+        attemptsDetail,
+      };
     }
   }
 
@@ -2450,6 +2766,10 @@ async function forwardToNativeHandlerWithRetry(
   });
   return {
     ok: false,
+    acceptance:
+      attemptsDetail.at(-1)?.acceptance === "rejected"
+        ? "rejected"
+        : "unknown",
     status: 504,
     attempts: RETRYING_FORWARD_MAX_ATTEMPTS,
     totalMs,
@@ -2535,27 +2855,6 @@ async function buildExistingBootHandle(
           } catch (error) {
             logWarn("channels.slack_boot_message_cleanup_failed", {
               bootMessageTs: bootMessageId,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        },
-      };
-    }
-  }
-  if (typeof bootMessageId === "string" && channel === "whatsapp") {
-    const meta = await getInitializedMeta();
-    const waConfig = meta.channels.whatsapp;
-    if (hasWhatsAppBusinessCredentials(waConfig)) {
-      return {
-        async update() {
-          // WhatsApp does not support editing sent messages.
-        },
-        async clear() {
-          try {
-            await deleteWhatsAppMessage(waConfig.accessToken, bootMessageId);
-          } catch (error) {
-            logWarn("channels.whatsapp_boot_message_cleanup_failed", {
-              bootMessageId,
               error: error instanceof Error ? error.message : String(error),
             });
           }
@@ -2651,20 +2950,20 @@ async function loadDrainChannelWorkflowDependencies(): Promise<DrainChannelWorkf
     { createSlackAdapter },
     { createTelegramAdapter },
     { createDiscordAdapter },
-    { createWhatsAppAdapter },
     { reconcileDiscordIntegration },
     { runWithBootMessages },
     { ensureSandboxReady, getSandboxDomain },
+    { hydrateVerifiedBundleIdentity },
     { RetryableError, FatalError, getStepMetadata, getWorkflowMetadata },
   ] = await Promise.all([
     import("@/server/channels/driver"),
     import("@/server/channels/slack/adapter"),
     import("@/server/channels/telegram/adapter"),
     import("@/server/channels/discord/adapter"),
-    import("@/server/channels/whatsapp/adapter"),
     import("@/server/channels/discord/reconcile"),
     import("@/server/channels/core/boot-messages"),
     import("@/server/sandbox/lifecycle"),
+    import("@/server/openclaw/bundle-identity"),
     import("workflow"),
   ]);
 
@@ -2673,7 +2972,6 @@ async function loadDrainChannelWorkflowDependencies(): Promise<DrainChannelWorkf
     createSlackAdapter,
     createTelegramAdapter,
     createDiscordAdapter,
-    createWhatsAppAdapter,
     reconcileDiscordIntegration,
     runWithBootMessages,
     ensureSandboxReady,
@@ -2684,6 +2982,7 @@ async function loadDrainChannelWorkflowDependencies(): Promise<DrainChannelWorkf
     waitForTelegramNativeHandler,
     probeTelegramNativeHandlerLocally,
     buildExistingBootHandle,
+    hydrateVerifiedBundleIdentity,
     RetryableError,
     FatalError,
     getStepMetadata,

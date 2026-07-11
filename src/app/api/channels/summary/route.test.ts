@@ -105,10 +105,11 @@ test("GET /api/channels/summary: returns summary for all channels including what
     assert.equal(body.discord.configured, false);
     assert.equal(body.whatsapp.connected, false);
     assert.equal(body.whatsapp.configured, false);
+    assert.equal(body.whatsapp.legacyConfigPresent, false);
     assert.equal(body.whatsapp.linkState, "unconfigured");
-    assert.equal(body.whatsapp.deliveryMode, "webhook-proxied");
+    assert.equal(body.whatsapp.deliveryMode, "unsupported");
     assert.equal(body.whatsapp.requiresRunningSandbox, false);
-    assert.equal(body.whatsapp.connectionSemantics, "delivery-enabled");
+    assert.equal(body.whatsapp.connectionSemantics, "hosted-unsupported");
     assert.equal(body.whatsapp.detailRoute, "/api/channels/whatsapp");
     assert.equal(body.slack.lastDeliveryState, null);
     assert.equal(body.telegram.lastDeliveryState, null);
@@ -121,7 +122,7 @@ test("GET /api/channels/summary: returns summary for all channels including what
     );
     assert.equal(
       body.featureSupport.entries.find((entry) => entry.id === "channel-whatsapp")?.hostedStatus,
-      "experimental",
+      "not-supported",
     );
     assert.equal(
       body.featureSupport.entries.find((entry) => entry.id === "channels-upstream-rest")?.hostedStatus,
@@ -229,7 +230,7 @@ test("GET /api/channels/summary: Slack deliveryReady follows successful live con
   });
 });
 
-test("GET /api/channels/summary: whatsapp connected reflects enabled config", async () => {
+test("GET /api/channels/summary: whatsapp legacy config remains disconnected", async () => {
   await withTestEnv(async () => {
     await mutateMeta((meta) => {
       meta.channels.whatsapp = {
@@ -248,13 +249,14 @@ test("GET /api/channels/summary: whatsapp connected reflects enabled config", as
     assert.equal(result.status, 200);
     const body = result.json as ChannelSummaryResponse;
 
-    assert.equal(body.whatsapp.connected, true);
-    assert.equal(body.whatsapp.configured, true);
-    assert.equal(body.whatsapp.linkState, "linked");
-    assert.equal(body.whatsapp.deliveryMode, "webhook-proxied");
+    assert.equal(body.whatsapp.connected, false);
+    assert.equal(body.whatsapp.configured, false);
+    assert.equal(body.whatsapp.legacyConfigPresent, true);
+    assert.equal(body.whatsapp.linkState, "unconfigured");
+    assert.equal(body.whatsapp.deliveryMode, "unsupported");
     assert.equal(body.whatsapp.requiresRunningSandbox, false);
     assert.equal(body.whatsapp.lastError, null);
-    assert.equal(body.whatsapp.connectionSemantics, "delivery-enabled");
+    assert.equal(body.whatsapp.connectionSemantics, "hosted-unsupported");
     assert.equal(body.whatsapp.detailRoute, "/api/channels/whatsapp");
   });
 });
@@ -275,7 +277,7 @@ test("GET /api/channels/summary: whatsapp response has no webhookUrl field", asy
   });
 });
 
-test("GET /api/channels/summary: whatsapp disabled config reports configured false but preserves linkState", async () => {
+test("GET /api/channels/summary: whatsapp disabled config is cleanup-only", async () => {
   await withTestEnv(async () => {
     await mutateMeta((meta) => {
       meta.channels.whatsapp = {
@@ -295,16 +297,17 @@ test("GET /api/channels/summary: whatsapp disabled config reports configured fal
 
     assert.equal(body.whatsapp.connected, false);
     assert.equal(body.whatsapp.configured, false);
-    assert.equal(body.whatsapp.linkState, "linked");
+    assert.equal(body.whatsapp.legacyConfigPresent, true);
+    assert.equal(body.whatsapp.linkState, "unconfigured");
     assert.equal(body.whatsapp.lastError, null);
-    assert.equal(body.whatsapp.connectionSemantics, "delivery-enabled");
+    assert.equal(body.whatsapp.connectionSemantics, "hosted-unsupported");
     assert.equal(body.whatsapp.detailRoute, "/api/channels/whatsapp");
-    assert.equal(body.whatsapp.deliveryMode, "webhook-proxied");
+    assert.equal(body.whatsapp.deliveryMode, "unsupported");
     assert.equal(body.whatsapp.requiresRunningSandbox, false);
   });
 });
 
-test("GET /api/channels/summary: whatsapp needs-login exposes coarse and detailed state together", async () => {
+test("GET /api/channels/summary: whatsapp legacy login state is not delivery health", async () => {
   await withTestEnv(async () => {
     await mutateMeta((meta) => {
       meta.channels.whatsapp = {
@@ -322,16 +325,17 @@ test("GET /api/channels/summary: whatsapp needs-login exposes coarse and detaile
     assert.equal(result.status, 200);
     const body = result.json as ChannelSummaryResponse;
 
-    assert.equal(body.whatsapp.connected, true);
-    assert.equal(body.whatsapp.configured, true);
-    assert.equal(body.whatsapp.linkState, "needs-login");
-    assert.equal(body.whatsapp.lastError, "scan QR to continue");
-    assert.equal(body.whatsapp.connectionSemantics, "delivery-enabled");
+    assert.equal(body.whatsapp.connected, false);
+    assert.equal(body.whatsapp.configured, false);
+    assert.equal(body.whatsapp.legacyConfigPresent, true);
+    assert.equal(body.whatsapp.linkState, "unconfigured");
+    assert.equal(body.whatsapp.lastError, null);
+    assert.equal(body.whatsapp.connectionSemantics, "hosted-unsupported");
     assert.equal(body.whatsapp.detailRoute, "/api/channels/whatsapp");
   });
 });
 
-test("GET /api/channels/summary: whatsapp error exposes linkState and lastError", async () => {
+test("GET /api/channels/summary: whatsapp legacy error is not delivery health", async () => {
   await withTestEnv(async () => {
     await mutateMeta((meta) => {
       meta.channels.whatsapp = {
@@ -349,15 +353,16 @@ test("GET /api/channels/summary: whatsapp error exposes linkState and lastError"
     assert.equal(result.status, 200);
     const body = result.json as ChannelSummaryResponse;
 
-    assert.equal(body.whatsapp.connected, true);
-    assert.equal(body.whatsapp.configured, true);
-    assert.equal(body.whatsapp.linkState, "error");
-    assert.equal(body.whatsapp.lastError, "connection timeout");
+    assert.equal(body.whatsapp.connected, false);
+    assert.equal(body.whatsapp.configured, false);
+    assert.equal(body.whatsapp.legacyConfigPresent, true);
+    assert.equal(body.whatsapp.linkState, "unconfigured");
+    assert.equal(body.whatsapp.lastError, null);
     assert.equal(body.whatsapp.detailRoute, "/api/channels/whatsapp");
   });
 });
 
-test("GET /api/channels/summary: WhatsApp separates link state from native and visible reply state", async () => {
+test("GET /api/channels/summary: WhatsApp suppresses obsolete delivery diagnostics", async () => {
   await withTestEnv(async () => {
     const completedAt = Date.now() - 1_000;
     await mutateMeta((meta) => {
@@ -394,11 +399,12 @@ test("GET /api/channels/summary: WhatsApp separates link state from native and v
     assert.equal(result.status, 200);
     const body = result.json as ChannelSummaryResponse;
 
-    assert.equal(body.whatsapp.configured, true);
-    assert.equal(body.whatsapp.linkState, "linked");
-    assert.equal(body.whatsapp.lastForward?.classification, "accepted");
-    assert.equal(body.whatsapp.lastDeliveryState?.state, "visibility-unknown");
-    assert.equal(body.whatsapp.userVisibleReply?.status, "unknown");
+    assert.equal(body.whatsapp.configured, false);
+    assert.equal(body.whatsapp.legacyConfigPresent, true);
+    assert.equal(body.whatsapp.linkState, "unconfigured");
+    assert.equal(body.whatsapp.lastForward, null);
+    assert.equal(body.whatsapp.lastDeliveryState, null);
+    assert.equal(body.whatsapp.userVisibleReply, null);
     assert.equal("deliveryReady" in body.whatsapp, false);
   });
 });

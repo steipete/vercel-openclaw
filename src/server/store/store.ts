@@ -33,6 +33,13 @@ export type Store = {
   deleteValue(key: string): Promise<void>;
   acquireLock(key: string, ttlSeconds: number): Promise<string | null>;
   renewLock(key: string, token: string, ttlSeconds: number): Promise<boolean>;
+  setValueIfLockHeld<T>(
+    lockKey: string,
+    token: string,
+    key: string,
+    value: T,
+    ttlSeconds: number,
+  ): Promise<boolean>;
   releaseLock(key: string, token: string): Promise<void>;
 };
 

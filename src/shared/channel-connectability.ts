@@ -10,7 +10,8 @@ export type ChannelConnectabilityStatus = "pass" | "warn" | "fail";
 export type ChannelOnlyIssueId =
   | "public-webhook-url"
   | "launch-verification"
-  | "deployment-protection-active";
+  | "deployment-protection-active"
+  | "hosted-transport-unavailable";
 
 type LegacyChannelConnectabilityIssueId = "running-only";
 

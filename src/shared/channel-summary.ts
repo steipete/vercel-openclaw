@@ -3,7 +3,6 @@ import {
   type ChannelLastForward,
   type ChannelName,
   type ChannelUserVisibleReply,
-  type WhatsAppLinkState,
 } from "@/shared/channels";
 import {
   channelDeliveryFromLastForward,
@@ -13,7 +12,7 @@ import {
 import type { HostedFeatureSupportMatrix } from "@/shared/hosted-feature-support";
 
 export const WHATSAPP_SUMMARY_DETAIL_ROUTE = "/api/channels/whatsapp" as const;
-export const WHATSAPP_CONNECTION_SEMANTICS = "delivery-enabled" as const;
+export const WHATSAPP_CONNECTION_SEMANTICS = "hosted-unsupported" as const;
 
 /**
  * Compact projection of {@link ChannelLastForward} suitable for the summary
@@ -45,7 +44,8 @@ export type ChannelUserVisibleReplySummary = ChannelUserVisibleReply & {
 export type ChannelSummaryEntry = {
   /**
    * Legacy field kept for backward compatibility.
-   * For all current channels this is equivalent to `configured`.
+   * For supported channels this is equivalent to `configured`. Hosted
+   * WhatsApp keeps both false; `legacyConfigPresent` exposes cleanup only.
    */
   connected: boolean;
   configured: boolean;
@@ -166,14 +166,14 @@ export function projectChannelDeliveryState(
 
 export type WhatsAppSummaryEntry = ChannelSummaryEntry & {
   /**
-   * Raw gateway-side link/session state. Distinct from the coarse
-   * `connected/configured` flag so clients can reason without reading
-   * source comments.
+   * Legacy credentials/config remain visible only so operators can remove
+   * them. They are never projected as hosted delivery health.
    */
-  linkState: WhatsAppLinkState;
+  legacyConfigPresent: boolean;
+  linkState: "unconfigured";
   connectionSemantics: typeof WHATSAPP_CONNECTION_SEMANTICS;
   detailRoute: typeof WHATSAPP_SUMMARY_DETAIL_ROUTE;
-  deliveryMode: "webhook-proxied";
+  deliveryMode: "unsupported";
   requiresRunningSandbox: false;
 };
 

@@ -233,7 +233,6 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
             createSlackAdapter: () => ({}) as never,
             createTelegramAdapter: () => ({}) as never,
             createDiscordAdapter: () => ({}) as never,
-            createWhatsAppAdapter: () => ({}) as never,
             reconcileDiscordIntegration: async () => null,
             runWithBootMessages: async () => {
               await h.driveToRunning();
@@ -300,6 +299,7 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
               error: null,
             }),
             buildExistingBootHandle: async () => undefined,
+            hydrateVerifiedBundleIdentity: async () => null,
             RetryableError: TestRetryableError as never,
             FatalError: TestFatalError as never,
             getStepMetadata: (() => ({

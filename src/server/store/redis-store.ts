@@ -23,6 +23,14 @@ end
 return 0
 `;
 
+const SET_VALUE_IF_LOCK_HELD_LUA = `
+if redis.call("get", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call("set", KEYS[2], ARGV[2], "EX", tonumber(ARGV[3]))
+return 1
+`;
+
 const CAS_META_LUA = `
 local current = redis.call("get", KEYS[1])
 if not current then
@@ -202,6 +210,28 @@ export class RedisStore {
       1,
       key,
       token,
+      String(ttlSeconds),
+    );
+
+    return toNumber(result) > 0;
+  }
+
+  async setValueIfLockHeld<T>(
+    lockKey: string,
+    token: string,
+    key: string,
+    value: T,
+    ttlSeconds: number,
+  ): Promise<boolean> {
+    assertScopedRedisKey(lockKey);
+    assertScopedRedisKey(key);
+    const result = await this.redis.eval(
+      SET_VALUE_IF_LOCK_HELD_LUA,
+      2,
+      lockKey,
+      key,
+      token,
+      JSON.stringify(value),
       String(ttlSeconds),
     );
 

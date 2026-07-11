@@ -37,17 +37,93 @@ import { slackWebhookWorkflowRuntime } from "@/app/api/channels/slack/webhook/ro
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
 import { gatewayReadyResponse } from "@/test-utils/fake-fetch";
+import {
+  _setBundleAdmissionForTesting,
+  type VerifiedBundleAdmission,
+} from "@/server/openclaw/bundle-identity";
+import type { VerifiedBundleIdentity } from "@/shared/bundle-identity";
 
 const SLACK_SIGNING_SECRET = "test-slack-signing-secret-direct";
 
-async function configureSlack(h: ScenarioHarness) {
+const VERIFIED_BUNDLE_IDENTITY: VerifiedBundleIdentity = {
+  packageSpec: "openclaw@2026.7.2",
+  version: "2026.7.2",
+  forkSha: "a".repeat(40),
+  upstreamSha: "b".repeat(40),
+  canonicalSha256: "c".repeat(64),
+  capabilities: ["gateway-suspend-v1"],
+  verified: true,
+};
+
+const VERIFIED_BUNDLE_ADMISSION: VerifiedBundleAdmission = {
+  identity: VERIFIED_BUNDLE_IDENTITY,
+  canonicalTarball: "openclaw-canonical.tgz",
+  canonicalTarballUrl: "https://example.invalid/openclaw-canonical.tgz",
+  assets: {},
+  externalPlugins: [],
+};
+
+async function configureSlack(
+  h: ScenarioHarness,
+  options: { admitGatewaySuspend?: boolean } = {},
+) {
+  const admitGatewaySuspend = options.admitGatewaySuspend === true;
+  _setBundleAdmissionForTesting(
+    admitGatewaySuspend ? VERIFIED_BUNDLE_ADMISSION : null,
+  );
   await h.mutateMeta((meta) => {
     meta.channels.slack = {
       signingSecret: SLACK_SIGNING_SECRET,
       botToken: "xoxb-test-bot-token",
       configuredAt: Date.now(),
     };
+    meta.bundleIdentity = admitGatewaySuspend
+      ? structuredClone(VERIFIED_BUNDLE_IDENTITY)
+      : null;
   });
+}
+
+async function prepareSlackRouteRepair(
+  h: ScenarioHarness,
+  sandboxId: string,
+): Promise<{
+  handle: FakeSandboxHandle;
+  routeProbeCount: { value: number };
+}> {
+  process.env.NEXT_PUBLIC_APP_URL = "https://app.example.com";
+  await configureSlack(h);
+  await h.mutateMeta((meta) => {
+    meta.status = "running";
+    meta.sandboxId = sandboxId;
+    meta.snapshotId = `snap-${sandboxId}`;
+    meta.portUrls = {
+      "3000": `https://${sandboxId}-3000.fake.vercel.run`,
+    };
+  });
+  const handle = (await h.controller.get({ sandboxId })) as FakeSandboxHandle;
+  const routeProbeCount = { value: 0 };
+  handle.responders.push((cmd, args) => {
+    if (cmd !== "bash" || args?.[0] !== "-c") {
+      return undefined;
+    }
+    const script = args[1] ?? "";
+    if (
+      script.includes("http://localhost:3000/") &&
+      script.includes("openclaw-app")
+    ) {
+      return { exitCode: 0, output: async () => "ok" };
+    }
+    if (script.includes("/slack/events")) {
+      routeProbeCount.value += 1;
+      return { exitCode: 0, output: async () => "401" };
+    }
+    return undefined;
+  });
+  h.fakeFetch.onGet(
+    `https://${sandboxId}-3000.fake.vercel.run`,
+    () => gatewayReadyResponse(),
+  );
+  return { handle, routeProbeCount };
 }
 
 // ===========================================================================
@@ -402,7 +478,7 @@ test("Slack webhook: app_mention + message for same user post collapses to one w
   });
 });
 
-test("Slack webhook: fast path non-ok response falls through to workflow wake path", async () => {
+test("Slack webhook: generic fast-path 5xx closes unknown without replay", async () => {
   await withHarness(async (h) => {
     await configureSlack(h);
     await h.mutateMeta((meta) => {
@@ -429,8 +505,13 @@ test("Slack webhook: fast path non-ok response falls through to workflow wake pa
       assert.deepEqual(result.json, { ok: true });
       assert.equal(
         startMock.mock.callCount(),
-        1,
-        "workflow MUST start when native handler returned non-2xx so the event is not silently dropped",
+        0,
+        "generic 5xx cannot prove native rejection",
+      );
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.slack?.lastDeliveryState?.state,
+        "visibility-unknown",
       );
       resetAfterCallbacks();
     } finally {
@@ -439,37 +520,179 @@ test("Slack webhook: fast path non-ok response falls through to workflow wake pa
   });
 });
 
-test("Slack webhook: fast path 404 repairs config sync and retries native handler", async () => {
+test("Slack webhook: unreadable 5xx response closes unknown without replay", async () => {
   await withHarness(async (h) => {
-    process.env.NEXT_PUBLIC_APP_URL = "https://app.example.com";
     await configureSlack(h);
-    _resetLogBuffer();
     await h.mutateMeta((meta) => {
       meta.status = "running";
-      meta.sandboxId = "sbx-slack-route-repair";
-      meta.snapshotId = "snap-slack-route-repair";
+      meta.sandboxId = "sbx-slack-unreadable-5xx";
       meta.portUrls = {
-        "3000": "https://sbx-slack-route-repair-3000.fake.vercel.run",
+        "3000": "https://sbx-slack-unreadable-5xx-3000.fake.vercel.run",
       };
     });
-    const handle = await h.controller.get({ sandboxId: "sbx-slack-route-repair" }) as FakeSandboxHandle;
-    let slackRouteProbeCount = 0;
-    handle.responders.push((cmd, args) => {
-      if (cmd !== "bash" || args?.[0] !== "-c") {
-        return undefined;
-      }
-      const script = args[1] ?? "";
-      if (script.includes("http://localhost:3000/") && script.includes("openclaw-app")) {
-        return { exitCode: 0, output: async () => "ok" };
-      }
-      if (script.includes("/slack/events")) {
-        slackRouteProbeCount += 1;
-        return { exitCode: 0, output: async () => "401" };
-      }
-      return undefined;
+    h.fakeFetch.onGet(
+      "https://sbx-slack-unreadable-5xx-3000.fake.vercel.run",
+      () => gatewayReadyResponse(),
+    );
+    h.fakeFetch.onPost(/slack\/events$/, () => {
+      const response = new Response(null, { status: 502 });
+      Object.defineProperty(response, "text", {
+        value: async () => {
+          throw new Error("body unavailable");
+        },
+      });
+      return response;
     });
 
-    h.fakeFetch.onGet("https://sbx-slack-route-repair-3000.fake.vercel.run", () => gatewayReadyResponse());
+    const route = getSlackWebhookRoute();
+    const startMock = mock.method(
+      slackWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      const result = await callRoute(
+        route.POST,
+        buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 0);
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.slack?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
+    } finally {
+      startMock.mock.restore();
+      resetAfterCallbacks();
+    }
+  });
+});
+
+test("Slack webhook: unverified gateway_unavailable 503 closes unknown", async () => {
+  await withHarness(async (h) => {
+    await configureSlack(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-slack-unverified-gateway-unavailable";
+      meta.portUrls = {
+        "3000": "https://sbx-slack-unverified-gateway-unavailable-3000.fake.vercel.run",
+      };
+    });
+    h.fakeFetch.onGet(
+      "https://sbx-slack-unverified-gateway-unavailable-3000.fake.vercel.run",
+      () => gatewayReadyResponse(),
+    );
+    h.fakeFetch.onPost(/slack\/events$/, () =>
+      Response.json(
+        { error: { code: "gateway_unavailable" } },
+        { status: 503 },
+      ),
+    );
+
+    const route = getSlackWebhookRoute();
+    const startMock = mock.method(
+      slackWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      _resetLogBuffer();
+      const result = await callRoute(
+        route.POST,
+        buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 0);
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.slack?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
+      assert.equal(
+        getServerLogs().some(
+          (entry) =>
+            entry.message ===
+            "channels.slack_fast_path_acceptance_unknown",
+        ),
+        true,
+      );
+    } finally {
+      startMock.mock.restore();
+      resetAfterCallbacks();
+    }
+  });
+});
+
+test("Slack webhook: admitted gateway closure revalidates before workflow", async () => {
+  await withHarness(async (h) => {
+    await configureSlack(h, { admitGatewaySuspend: true });
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-slack-admitted-gateway-unavailable";
+      meta.portUrls = {
+        "3000":
+          "https://sbx-slack-admitted-gateway-unavailable-3000.fake.vercel.run",
+      };
+    });
+    h.fakeFetch.onGet(
+      "https://sbx-slack-admitted-gateway-unavailable-3000.fake.vercel.run",
+      () => gatewayReadyResponse(),
+    );
+    h.fakeFetch.onPost(/slack\/events$/, () =>
+      Response.json(
+        { error: { code: "gateway_unavailable" } },
+        { status: 503 },
+      ),
+    );
+
+    const route = getSlackWebhookRoute();
+    const startMock = mock.method(
+      slackWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      const result = await callRoute(
+        route.POST,
+        buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 1);
+      const workflowArgs = startMock.mock.calls[0]?.arguments?.[1] as
+        | unknown[]
+        | undefined;
+      const envelope = workflowArgs?.[0] as {
+        workflowHandoff?: {
+          revalidateSandboxBeforeForward?: boolean;
+        };
+      };
+      assert.equal(
+        envelope.workflowHandoff?.revalidateSandboxBeforeForward,
+        true,
+      );
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.slack?.lastForward?.classification,
+        "gateway-unavailable",
+      );
+    } finally {
+      startMock.mock.restore();
+      resetAfterCallbacks();
+    }
+  });
+});
+
+test("Slack webhook: fast path 404 repairs config sync and retries native handler", async () => {
+  await withHarness(async (h) => {
+    _resetLogBuffer();
+    const { handle, routeProbeCount } = await prepareSlackRouteRepair(
+      h,
+      "sbx-slack-route-repair",
+    );
     let forwardCount = 0;
     h.fakeFetch.onPost(/slack\/events$/, () => {
       forwardCount += 1;
@@ -487,7 +710,7 @@ test("Slack webhook: fast path 404 repairs config sync and retries native handle
       assert.equal(result.status, 200);
       assert.deepEqual(result.json, { ok: true });
       assert.equal(forwardCount, 2, "404 should be retried after config sync repair");
-      assert.equal(slackRouteProbeCount, 1, "repair should prove /slack/events is mounted");
+      assert.equal(routeProbeCount.value, 1, "repair should prove /slack/events is mounted");
       assert.equal(startMock.mock.callCount(), 0, "successful repair must not start workflow fallback");
       assert.ok(
         handle.commands.some((c) => c.cmd === "bash" && c.args?.[0]?.includes("restart-gateway")),
@@ -499,6 +722,98 @@ test("Slack webhook: fast path 404 repairs config sync and retries native handle
       resetAfterCallbacks();
     } finally {
       startMock.mock.restore();
+    }
+  });
+});
+
+test("Slack webhook: route-repair rejection is classified before replay", async () => {
+  await withHarness(async (h) => {
+    _resetLogBuffer();
+    await prepareSlackRouteRepair(h, "sbx-slack-repair-rejected");
+    let forwardCount = 0;
+    h.fakeFetch.onPost(/slack\/events$/, () => {
+      forwardCount += 1;
+      return forwardCount === 1
+        ? new Response("missing route", { status: 404 })
+        : Response.json(
+            { error: { code: "gateway_unavailable" } },
+            { status: 503 },
+          );
+    });
+
+    const route = getSlackWebhookRoute();
+    const startMock = mock.method(
+      slackWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      const result = await callRoute(
+        route.POST,
+        buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(forwardCount, 2);
+      assert.equal(startMock.mock.callCount(), 0);
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.slack?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
+      assert.equal(
+        meta.channelDiagnostics?.slack?.lastForward?.attempts,
+        2,
+      );
+    } finally {
+      startMock.mock.restore();
+      resetAfterCallbacks();
+    }
+  });
+});
+
+test("Slack webhook: route-repair timeout closes unknown without replay", async () => {
+  await withHarness(async (h) => {
+    _resetLogBuffer();
+    await prepareSlackRouteRepair(h, "sbx-slack-repair-timeout");
+    let forwardCount = 0;
+    h.fakeFetch.onPost(/slack\/events$/, () => {
+      forwardCount += 1;
+      if (forwardCount === 1) {
+        return new Response("missing route", { status: 404 });
+      }
+      throw Object.assign(new Error("repair response timed out"), {
+        name: "TimeoutError",
+      });
+    });
+
+    const route = getSlackWebhookRoute();
+    const startMock = mock.method(
+      slackWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      const result = await callRoute(
+        route.POST,
+        buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(forwardCount, 2);
+      assert.equal(startMock.mock.callCount(), 0);
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.slack?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
+      assert.equal(
+        meta.channelDiagnostics?.slack?.lastForward?.attempts,
+        2,
+      );
+    } finally {
+      startMock.mock.restore();
+      resetAfterCallbacks();
     }
   });
 });

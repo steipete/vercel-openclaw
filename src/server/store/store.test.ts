@@ -773,6 +773,24 @@ test("[store] acquireLock / renewLock / releaseLock", async () => {
     const badRenew = await store.renewLock(lockKey, "wrong-token", 60);
     assert.equal(badRenew, false);
 
+    const guardedWrite = await store.setValueIfLockHeld(
+      lockKey,
+      token!,
+      "guarded-value",
+      "current",
+      60,
+    );
+    assert.equal(guardedWrite, true);
+    const staleWrite = await store.setValueIfLockHeld(
+      lockKey,
+      "wrong-token",
+      "guarded-value",
+      "stale",
+      60,
+    );
+    assert.equal(staleWrite, false);
+    assert.equal(await store.getValue("guarded-value"), "current");
+
     // Release
     await store.releaseLock(lockKey, token!);
 
@@ -959,7 +977,55 @@ test("[redis-store] low-level redis methods reject unscoped keys", async () => {
       await assert.rejects(() => store.deleteValue("fork-b:key"), /outside instance prefix "fork-a:"/);
       await assert.rejects(() => store.acquireLock("fork-b:lock", 30), /outside instance prefix "fork-a:"/);
       await assert.rejects(() => store.renewLock("fork-b:lock", "token", 30), /outside instance prefix "fork-a:"/);
+      await assert.rejects(
+        () => store.setValueIfLockHeld("fork-a:lock", "token", "fork-b:key", "value", 30),
+        /outside instance prefix "fork-a:"/,
+      );
       await assert.rejects(() => store.releaseLock("fork-b:lock", "token"), /outside instance prefix "fork-a:"/);
+    },
+  );
+});
+
+test("[redis-store] lock-owned value writes are atomic", async () => {
+  await withEnv(
+    {
+      NODE_ENV: "test",
+      OPENCLAW_INSTANCE_ID: "fork-a",
+    },
+    async () => {
+      const redis = new FakeRedis();
+      redis.values.set("fork-a:lock", "current-token");
+      redis.evalHandler = (keys, args) => {
+        const [lockKey, valueKey] = keys;
+        const [token, payload] = args;
+        if (redis.values.get(lockKey) !== token) return 0;
+        redis.values.set(valueKey, payload);
+        return 1;
+      };
+      const store = new RedisStore(redis as never);
+
+      assert.equal(
+        await store.setValueIfLockHeld(
+          "fork-a:lock",
+          "current-token",
+          "fork-a:value",
+          { version: 2 },
+          60,
+        ),
+        true,
+      );
+      assert.deepEqual(await store.getValue("fork-a:value"), { version: 2 });
+      assert.equal(
+        await store.setValueIfLockHeld(
+          "fork-a:lock",
+          "stale-token",
+          "fork-a:value",
+          { version: 1 },
+          60,
+        ),
+        false,
+      );
+      assert.deepEqual(await store.getValue("fork-a:value"), { version: 2 });
     },
   );
 });

@@ -1,6 +1,7 @@
 import type { ChannelName } from "@/shared/channels";
 import {
   FastPathOutcomeKind,
+  FastPathHandledNoWorkflowReason,
   FastPathSkipReason,
   UserNoticeReason,
   WebhookRouteOutcome,
@@ -75,6 +76,22 @@ export function planWebhookAfterFastPath(
       };
 
     case FastPathOutcomeKind.FallbackToWorkflow:
+      if (fastPath.indeterminateDelivery === true) {
+        return {
+          channel,
+          routeOutcome: WebhookRouteOutcome.AckNoop,
+          fastPath,
+          workflow: {
+            kind: "do-not-start",
+            reason:
+              FastPathHandledNoWorkflowReason.DeliveryAcceptanceUnknown,
+          },
+          userNotice: {
+            kind: "do-not-send",
+            reason: UserNoticeReason.HandledNoWorkflow,
+          },
+        };
+      }
       return {
         channel,
         routeOutcome: WebhookRouteOutcome.StartWorkflow,

@@ -9,6 +9,11 @@ import {
 import { recordChannelDlqFailure } from "@/server/channels/dlq";
 import { refreshChannelFastPathGatewayToken } from "@/server/channels/fast-path-token";
 import { recordChannelLastForward } from "@/server/channels/last-forward";
+import {
+  isDefiniteNativePreAdmissionError,
+  isGatewayAdmissionUnavailableResponseShape,
+  OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+} from "@/server/channels/native-response-contract";
 import { getPublicOrigin } from "@/server/public-url";
 import {
   channelDedupKey,
@@ -25,6 +30,7 @@ import { extractRequestId, logInfo, logWarn } from "@/server/log";
 import { createOperationContext, withOperationContext } from "@/server/observability/operation-context";
 import { getSandboxDomain, markSandboxPortUrlStale, probeGatewayReady, reconcileSandboxHealth, reconcileStaleRunningStatus, syncGatewayConfigToSandbox } from "@/server/sandbox/lifecycle";
 import { getInitializedMeta, getStore } from "@/server/store/store";
+import { hydrateVerifiedBundleIdentity } from "@/server/openclaw/bundle-identity";
 const SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage";
 const SLACK_BOOT_MESSAGE_TIMEOUT_MS = 5_000;
 // The fast path intentionally awaits the native handler's full turn
@@ -194,12 +200,10 @@ export async function POST(request: Request): Promise<Response> {
       apiAppId: string | null;
       teamId: string | null;
       eventType: string | null;
-      configuredSecretPreview: string | null;
     } = {
       apiAppId: null,
       teamId: null,
       eventType: null,
-      configuredSecretPreview: null,
     };
     try {
       const parsed = rawBody.length > 0 ? JSON.parse(rawBody) : null;
@@ -213,9 +217,6 @@ export async function POST(request: Request): Promise<Response> {
     } catch {
       // ignore — payload was not JSON
     }
-    failDiag.configuredSecretPreview = config.signingSecret
-      ? `${config.signingSecret.slice(0, 4)}…${config.signingSecret.slice(-2)}`
-      : null;
     logWarn("channels.slack_webhook_rejected", {
       reason: "invalid_signature",
       requestId,
@@ -250,6 +251,30 @@ export async function POST(request: Request): Promise<Response> {
       headers: {
         "content-type": "text/plain; charset=utf-8",
       },
+    });
+  }
+
+  let verifiedBundleIdentity: Awaited<
+    ReturnType<typeof hydrateVerifiedBundleIdentity>
+  > = null;
+  try {
+    verifiedBundleIdentity = await hydrateVerifiedBundleIdentity(
+      meta.bundleIdentity,
+    );
+  } catch {
+    // Fail closed below. Bundle admission errors must not create a platform
+    // retry storm for an otherwise valid Slack webhook.
+  }
+  const gatewayAdmissionRejectionAdmitted =
+    verifiedBundleIdentity?.capabilities.includes(
+      OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+    ) === true;
+  if (!gatewayAdmissionRejectionAdmitted) {
+    logWarn("slack.delivery.bundle_capability_missing", {
+      capabilityId: OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+      bundleIdentityMissing: meta.bundleIdentity === null,
+      bundleIdentityVerified: verifiedBundleIdentity !== null,
+      requestId,
     });
   }
 
@@ -412,15 +437,11 @@ export async function POST(request: Request): Promise<Response> {
   // processing cycle (including long AI tasks like image generation).
   // Fluid Compute bills only for CPU cycles, not idle wait time.
   //
-  // Return 200 only when the native handler returned 2xx. A non-2xx response
-  // indicates the payload was NOT successfully handed off (edge error,
-  // handler unavailable, or explicit reject). Since Slack does not retry on
-  // a 200 from us, we must fall through to the durable workflow wake path
-  // rather than silently dropping the event.
-  //
-  // Network-level failure (fetch throws) is also safe to fall through on:
-  // the native handler never received the payload.
+  // A 2xx response is accepted. Replay only responses or transport failures
+  // that prove dispatch stopped before handler admission; close every other
+  // outcome as unknown so the wake path cannot duplicate an accepted event.
   let effectiveMeta = meta;
+  let revalidateSandboxBeforeForward = false;
   if (effectiveMeta.status === "running" && effectiveMeta.sandboxId) {
     const forwardHeaders: Record<string, string> = {
       "content-type": request.headers.get("content-type") ?? "application/json",
@@ -436,6 +457,8 @@ export async function POST(request: Request): Promise<Response> {
 
     const fastPathStartedAt = Date.now();
     let fastPathSandboxUrl: string | null = null;
+    let fastPathAttempts = 0;
+    let nativeDispatchInFlight = false;
     try {
       const sandboxUrl = await getSandboxDomain();
       fastPathSandboxUrl = sandboxUrl;
@@ -484,12 +507,15 @@ export async function POST(request: Request): Promise<Response> {
           ...eventInfo,
         }));
 
-        const resp = await fetch(forwardUrl, {
+        fastPathAttempts += 1;
+        nativeDispatchInFlight = true;
+        let resp = await fetch(forwardUrl, {
           method: "POST",
           headers: forwardHeaders,
           body: rawBody,
           signal: AbortSignal.timeout(SLACK_FAST_PATH_FORWARD_TIMEOUT_MS),
         });
+        nativeDispatchInFlight = false;
         if (resp.ok) {
           logInfo("channels.slack_fast_path_ok", withOperationContext(op, {
             sandboxId: effectiveMeta.sandboxId,
@@ -501,7 +527,7 @@ export async function POST(request: Request): Promise<Response> {
             ok: true,
             status: resp.status,
             classification: "accepted",
-            attempts: 1,
+            attempts: fastPathAttempts,
             totalMs: Date.now() - fastPathStartedAt,
             transport: "public",
             sandboxUrl: fastPathSandboxUrl,
@@ -527,12 +553,15 @@ export async function POST(request: Request): Promise<Response> {
           }));
 
           if (sync.liveConfigFresh) {
+            fastPathAttempts += 1;
+            nativeDispatchInFlight = true;
             const retry = await fetch(forwardUrl, {
               method: "POST",
               headers: forwardHeaders,
               body: rawBody,
               signal: AbortSignal.timeout(SLACK_FAST_PATH_FORWARD_TIMEOUT_MS),
             });
+            nativeDispatchInFlight = false;
             if (retry.ok) {
               logInfo("channels.slack_fast_path_ok", withOperationContext(op, {
                 sandboxId: effectiveMeta.sandboxId,
@@ -544,7 +573,7 @@ export async function POST(request: Request): Promise<Response> {
                 ok: true,
                 status: retry.status,
                 classification: "accepted",
-                attempts: 2,
+                attempts: fastPathAttempts,
                 totalMs: Date.now() - fastPathStartedAt,
                 transport: "public",
                 sandboxUrl: fastPathSandboxUrl,
@@ -556,6 +585,7 @@ export async function POST(request: Request): Promise<Response> {
               });
               return Response.json({ ok: true });
             }
+            resp = retry;
             logWarn("channels.slack_fast_path_route_repair_retry_failed", withOperationContext(op, {
               status: retry.status,
               sandboxId: effectiveMeta.sandboxId,
@@ -565,10 +595,8 @@ export async function POST(request: Request): Promise<Response> {
           }
         }
 
-        // Native handler returned non-2xx — fall through to workflow wake path
-        // so the event is not silently dropped. Slack does not retry on our 200.
-        // Distinguish gateway errors (502/503/504, sandbox unreachable) from
-        // other non-2xx (handler may already be processing) for log triage.
+        // Classify the final response, including a route-repair retry. Only
+        // exact pre-admission evidence may continue to workflow replay.
         const slackFallbackIsGatewayError =
           resp.status === 502 || resp.status === 503 || resp.status === 504;
 
@@ -585,6 +613,56 @@ export async function POST(request: Request): Promise<Response> {
           resp.status === 502 &&
           respBodyHead != null &&
           respBodyHead.includes("sandbox is not listening");
+        const gatewayUnavailableResponse =
+          isGatewayAdmissionUnavailableResponseShape(
+            resp.status,
+            respBodyHead,
+          );
+        const admittedGatewayUnavailable =
+          gatewayUnavailableResponse &&
+          gatewayAdmissionRejectionAdmitted;
+        const definitePreAdmissionResponse =
+          resp.status === 404 ||
+          isSandboxNotListening ||
+          admittedGatewayUnavailable;
+        if (!definitePreAdmissionResponse) {
+          await recordChannelLastForward(
+            "slack",
+            {
+              ok: false,
+              status: resp.status,
+              classification: "acceptance-unknown",
+              attempts: fastPathAttempts,
+              totalMs: Date.now() - fastPathStartedAt,
+              transport: "public",
+              sandboxUrl: fastPathSandboxUrl,
+              sandboxId: effectiveMeta.sandboxId ?? null,
+              finalReasonHead: respBodyHead,
+              startedAt: fastPathStartedAt,
+              completedAt: Date.now(),
+              deliveryId: fastPathDedupId
+                ? `slack:${fastPathDedupId}`
+                : null,
+            },
+            { closedOutcome: "unknown" },
+          );
+          logWarn(
+            "channels.slack_fast_path_acceptance_unknown",
+            withOperationContext(op, {
+              status: resp.status,
+              sandboxId: effectiveMeta.sandboxId,
+              action: "ack_without_blind_redrive",
+              reason:
+                gatewayUnavailableResponse &&
+                !gatewayAdmissionRejectionAdmitted
+                  ? "unverified_gateway_unavailable"
+                  : "native_response_acceptance_unknown",
+              ...eventInfo,
+            }),
+          );
+          return Response.json({ ok: true });
+        }
+        revalidateSandboxBeforeForward = admittedGatewayUnavailable;
 
         logWarn(
           slackFallbackIsGatewayError
@@ -598,6 +676,8 @@ export async function POST(request: Request): Promise<Response> {
               : "start_drain_channel_workflow",
             classification: isSandboxNotListening
               ? "sandbox-not-listening"
+              : admittedGatewayUnavailable
+                ? "gateway-unavailable"
               : slackFallbackIsGatewayError
                 ? "proxy-error"
                 : resp.status === 404
@@ -615,12 +695,14 @@ export async function POST(request: Request): Promise<Response> {
           status: resp.status,
           classification: isSandboxNotListening
             ? "sandbox-not-listening"
+            : admittedGatewayUnavailable
+              ? "gateway-unavailable"
             : slackFallbackIsGatewayError
               ? "proxy-error"
               : resp.status === 404
                 ? "handler-not-ready"
               : "handler-error",
-          attempts: 1,
+          attempts: fastPathAttempts,
           totalMs: Date.now() - fastPathStartedAt,
           transport: "public",
           sandboxUrl: fastPathSandboxUrl,
@@ -652,40 +734,51 @@ export async function POST(request: Request): Promise<Response> {
         effectiveMeta = await reconcileStaleRunningStatus();
       }
     } catch (error) {
-      // Network-level failure or AbortSignal timeout — native handler
-      // may or may not have received the payload. Reconcile stale
-      // status and fall through to workflow wake path so we don't
-      // silently drop. AbortError here is distinct from a 2xx timeout
-      // and means the sandbox probably wedged; the indeterminate flag
-      // captures that the delivery status is unknowable from this side.
+      // A fetch exception can happen after request bytes leave the process.
+      // Only a known pre-admission transport error is safe to replay.
       const isAbort =
         error instanceof Error && error.name === "TimeoutError";
+      const acceptanceUnknown =
+        nativeDispatchInFlight &&
+        !isDefiniteNativePreAdmissionError(error);
       logWarn("channels.slack_fast_path_failed", withOperationContext(op, {
         error: error instanceof Error ? error.message : String(error),
         errorName: error instanceof Error ? error.name : undefined,
         sandboxId: effectiveMeta.sandboxId,
-        action: "reconcile_and_wake",
+        action: acceptanceUnknown
+          ? "ack_without_blind_redrive"
+          : "reconcile_and_wake",
         reason: isAbort ? "fast_path_forward_timeout" : "network_error",
-        indeterminateDelivery: isAbort,
+        indeterminateDelivery: acceptanceUnknown,
         fastPathTimeoutMs: isAbort
           ? SLACK_FAST_PATH_FORWARD_TIMEOUT_MS
           : null,
         ...eventInfo,
       }));
-      await recordChannelLastForward("slack", {
-        ok: false,
-        status: null,
-        classification: "fetch-exception",
-        attempts: 1,
-        totalMs: Date.now() - fastPathStartedAt,
-        transport: "public",
-        sandboxUrl: fastPathSandboxUrl,
-        sandboxId: effectiveMeta.sandboxId ?? null,
-        finalReasonHead: error instanceof Error ? error.message : String(error),
-        startedAt: fastPathStartedAt,
-        completedAt: Date.now(),
-        deliveryId: fastPathDedupId ? `slack:${fastPathDedupId}` : null,
-      });
+      await recordChannelLastForward(
+        "slack",
+        {
+          ok: false,
+          status: null,
+          classification: acceptanceUnknown
+            ? "acceptance-unknown"
+            : "fetch-exception",
+          attempts: Math.max(1, fastPathAttempts),
+          totalMs: Date.now() - fastPathStartedAt,
+          transport: "public",
+          sandboxUrl: fastPathSandboxUrl,
+          sandboxId: effectiveMeta.sandboxId ?? null,
+          finalReasonHead:
+            error instanceof Error ? error.message : String(error),
+          startedAt: fastPathStartedAt,
+          completedAt: Date.now(),
+          deliveryId: fastPathDedupId ? `slack:${fastPathDedupId}` : null,
+        },
+        acceptanceUnknown ? { closedOutcome: "unknown" } : undefined,
+      );
+      if (acceptanceUnknown) {
+        return Response.json({ ok: true });
+      }
       effectiveMeta = await reconcileStaleRunningStatus();
     }
   } else {
@@ -802,7 +895,11 @@ export async function POST(request: Request): Promise<Response> {
         requestId: requestId ?? null,
         bootMessageId: bootMessageTs,
         receivedAtMs,
-        workflowHandoff: { slackForwardHeaders, slackRawBody: rawBody },
+        workflowHandoff: {
+          revalidateSandboxBeforeForward,
+          slackForwardHeaders,
+          slackRawBody: rawBody,
+        },
       },
     ]);
     logInfo("channels.slack_workflow_started", withOperationContext(op, {
@@ -861,6 +958,7 @@ export async function POST(request: Request): Promise<Response> {
       phase: "workflow-start-failed",
       terminal: false,
       retryable: true,
+      deliveryOutcome: "not-accepted",
       requestId: requestId ?? null,
       receivedAtMs,
       error,

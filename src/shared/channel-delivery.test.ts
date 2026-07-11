@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CHANNEL_DELIVERY_EXTENSIONS,
   CHANNEL_DELIVERY_STATES,
   CHANNEL_DELIVERY_TERMINAL_STATES,
   CHANNEL_DELIVERY_TRANSITIONS,
   CHANNEL_NOTICE_STATES,
   assertChannelDeliveryTransitionHistory,
   channelDeliveryFromLastForward,
+  closeChannelDeliverySnapshot,
   applyUserVisibleReplyToChannelDelivery,
   createInitialChannelDeliverySnapshot,
   renderChannelDeliveryMermaid,
@@ -38,6 +40,11 @@ function lastForward(overrides: Partial<ChannelLastForwardInput> = {}): ChannelL
 test("channel delivery model lists unique states and notice states", () => {
   assert.equal(new Set(CHANNEL_DELIVERY_STATES).size, CHANNEL_DELIVERY_STATES.length);
   assert.equal(new Set(CHANNEL_NOTICE_STATES).size, CHANNEL_NOTICE_STATES.length);
+});
+
+test("hosted WhatsApp delivery advertises no reply or notice support", () => {
+  assert.equal(CHANNEL_DELIVERY_EXTENSIONS.whatsapp.replyObservation, "none");
+  assert.equal(CHANNEL_DELIVERY_EXTENSIONS.whatsapp.userNoticeSupported, false);
 });
 
 test("terminal delivery states are part of the full state set", () => {
@@ -181,6 +188,74 @@ test("channelDeliveryFromLastForward produces legal transition histories", () =>
 
   assert.doesNotThrow(() => assertChannelDeliveryTransitionHistory(accepted));
   assert.doesNotThrow(() => assertChannelDeliveryTransitionHistory(failed));
+});
+
+test("closeChannelDeliverySnapshot records definite failure as terminal", () => {
+  const snapshot = closeChannelDeliverySnapshot({
+    current: null,
+    channel: "telegram",
+    deliveryId: "telegram:failed-1",
+    outcome: "failed",
+    reason: "terminal_gateway-unavailable",
+    now: 2000,
+  });
+
+  assert.equal(snapshot.state, "terminal-failed");
+  assert.equal(snapshot.finality, "terminal");
+  assert.equal(snapshot.terminal, true);
+  assert.equal(snapshot.reason, "terminal_gateway-unavailable");
+  assert.doesNotThrow(() => assertChannelDeliveryTransitionHistory(snapshot));
+});
+
+test("closeChannelDeliverySnapshot preserves uncertain delivery separately", () => {
+  const current = channelDeliveryFromLastForward({
+    channel: "telegram",
+    lastForward: normalizeChannelLastForward(
+      lastForward({
+        ok: false,
+        classification: "acceptance-unknown",
+        deliveryId: "telegram:unknown-1",
+      }),
+      1200,
+    )!,
+    now: 1300,
+  });
+  const snapshot = closeChannelDeliverySnapshot({
+    current,
+    channel: "telegram",
+    deliveryId: "telegram:unknown-1",
+    outcome: "unknown",
+    reason: "native-delivery-outcome-unknown",
+    now: 2000,
+  });
+
+  assert.equal(snapshot.state, "visibility-unknown");
+  assert.equal(snapshot.finality, "terminal-revisable");
+  assert.equal(snapshot.terminal, true);
+  assert.equal(snapshot.reason, "native-delivery-outcome-unknown");
+  assert.doesNotThrow(() => assertChannelDeliveryTransitionHistory(snapshot));
+});
+
+test("closeChannelDeliverySnapshot does not downgrade unknown to failed", () => {
+  const unknown = closeChannelDeliverySnapshot({
+    current: null,
+    channel: "telegram",
+    deliveryId: "telegram:monotonic",
+    outcome: "unknown",
+    reason: "native-delivery-outcome-unknown",
+    now: 2000,
+  });
+  const closed = closeChannelDeliverySnapshot({
+    current: unknown,
+    channel: "telegram",
+    deliveryId: "telegram:monotonic",
+    outcome: "failed",
+    reason: "later-rejection",
+    now: 3000,
+  });
+
+  assert.deepEqual(closed, unknown);
+  assert.equal(closed.state, "visibility-unknown");
 });
 
 test("applyUserVisibleReplyToChannelDelivery keeps reconciliation histories legal", () => {

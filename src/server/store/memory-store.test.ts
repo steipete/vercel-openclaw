@@ -245,6 +245,22 @@ test("memory-store: renewLock fails with wrong token", async () => {
   assert.equal(renewed, false);
 });
 
+test("memory-store: lock-owned value writes reject stale tokens", async () => {
+  const store = makeStore();
+  const token = await store.acquireLock("lock1", 60);
+  assert.ok(token);
+
+  assert.equal(
+    await store.setValueIfLockHeld("lock1", token, "value1", "current", 60),
+    true,
+  );
+  assert.equal(
+    await store.setValueIfLockHeld("lock1", "stale", "value1", "stale", 60),
+    false,
+  );
+  assert.equal(await store.getValue("value1"), "current");
+});
+
 test("memory-store: releaseLock frees the lock", async () => {
   const store = makeStore();
   const token = await store.acquireLock("lock1", 60);

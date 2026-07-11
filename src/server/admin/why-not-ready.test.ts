@@ -34,6 +34,44 @@ function slackForward(
 }
 
 describe("buildWhyNotReady", () => {
+  test("unsupported hosted WhatsApp never produces readiness blockers", async () => {
+    for (const legacyConfigPresent of [false, true]) {
+      const meta = metaFixture();
+      meta.channels.whatsapp = legacyConfigPresent
+        ? {
+            enabled: true,
+            pluginSpec: "@openclaw/whatsapp",
+            dmPolicy: "pairing",
+            allowFrom: [],
+            groupPolicy: "allowlist",
+            groupAllowFrom: [],
+            groups: [],
+            lastKnownLinkState: "linked",
+            linkedPhone: "+15555550100",
+            displayName: "Legacy",
+            configuredAt: Date.now(),
+            lastError: "stale legacy error",
+          }
+        : null;
+      meta.channelDiagnostics = {
+        whatsapp: {
+          lastForward: slackForward({
+            ok: false,
+            classification: "handler-not-ready",
+          }),
+        },
+      };
+
+      const report = await buildWhyNotReady(meta);
+
+      assert.equal(report.channels.whatsapp.hostedDeliverySupported, false);
+      assert.equal(report.channels.whatsapp.ready, true);
+      assert.deepEqual(report.channels.whatsapp.blockers, []);
+      assert.deepEqual(report.channels.whatsapp.observabilityGaps, []);
+      assert.equal(report.channels.whatsapp.readinessSnapshot.lastForward, null);
+    }
+  });
+
   test("flags slack with no credentials as not ready", async () => {
     const meta = metaFixture();
     meta.channels.slack = null;

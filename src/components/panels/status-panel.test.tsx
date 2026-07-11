@@ -87,7 +87,7 @@ const CHANNELS: StatusPayload["channels"] = {
   },
   whatsapp: {
     configured: false,
-    mode: "webhook-proxied",
+    mode: "unsupported",
     webhookUrl: null,
     status: "unconfigured",
     configuredAt: null,
@@ -95,7 +95,7 @@ const CHANNELS: StatusPayload["channels"] = {
     linkedPhone: null,
     lastError: null,
     requiresRunningSandbox: false,
-    loginVia: "/gateway",
+    loginVia: null,
     connectability: makeConnectability("whatsapp", null),
   },
 };
@@ -350,6 +350,25 @@ test("StatusPanel shows channel summary when channels are configured", () => {
 
   assert.ok(html.includes("Channels"));
   assert.ok(html.includes("Slack, Telegram"));
+});
+
+test("StatusPanel omits unsupported WhatsApp legacy cleanup state from configured channels", () => {
+  const html = renderPanel(
+    makeStatus({
+      status: "stopped",
+      channels: {
+        ...CHANNELS,
+        whatsapp: {
+          ...CHANNELS.whatsapp,
+          configured: true,
+          status: "disconnected",
+        },
+      },
+    }),
+  );
+
+  assert.equal(html.includes("WhatsApp (experimental)"), false);
+  assert.equal(html.includes("Channels"), false);
 });
 
 test("StatusPanel shows restore estimate from lifecycle metrics", () => {

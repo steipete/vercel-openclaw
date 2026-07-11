@@ -95,6 +95,27 @@ export function channelFailedIndexLockKey(): string {
   return buildKey("channels:failed:index-lock");
 }
 
+export function channelFailedRecordLockKey(
+  channel: ChannelName,
+  deliveryId: string,
+): string {
+  return buildKey(`channels:${channel}:failed-lock:${deliveryId}`);
+}
+
+export function channelFailedResolvedKey(
+  channel: ChannelName,
+  deliveryId: string,
+): string {
+  return buildKey(`channels:${channel}:failed-resolved:${deliveryId}`);
+}
+
+export function channelFailedUnknownKey(
+  channel: ChannelName,
+  deliveryId: string,
+): string {
+  return buildKey(`channels:${channel}:failed-unknown:${deliveryId}`);
+}
+
 export function channelDrainLockKey(channel: ChannelName): string {
   return buildKey(`channels:${channel}:drain-lock`);
 }
@@ -162,4 +183,12 @@ export function slackAppConfigKey(): string {
 
 export function slackInstallTokenKey(token: string): string {
   return buildKey(`slack:install-token:${token}`);
+}
+
+export function smokeChannelConfigLockKey(): string {
+  return buildKey("smoke:channels:configuration-lock");
+}
+
+export function smokeDiscordKeyPairKey(ownerId: string): string {
+  return buildKey(`smoke:discord:${ownerId}:key-pair`);
 }

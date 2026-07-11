@@ -25,10 +25,45 @@ import {
 import { telegramWebhookWorkflowRuntime } from "@/app/api/channels/telegram/webhook/route";
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
+import {
+  _setBundleAdmissionForTesting,
+  type VerifiedBundleAdmission,
+} from "@/server/openclaw/bundle-identity";
+import type { VerifiedBundleIdentity } from "@/shared/bundle-identity";
 
 const TELEGRAM_WEBHOOK_SECRET = "test-telegram-webhook-secret-direct";
 
-async function configureTelegram(h: ScenarioHarness) {
+const VERIFIED_BUNDLE_IDENTITY: VerifiedBundleIdentity = {
+  packageSpec: "openclaw@2026.7.2",
+  version: "2026.7.2",
+  forkSha: "a".repeat(40),
+  upstreamSha: "b".repeat(40),
+  canonicalSha256: "c".repeat(64),
+  capabilities: [
+    "admin-http-rpc-v1",
+    "cron-projection-v1",
+    "gateway-suspend-v1",
+    "telegram-durable-ack-v1",
+  ],
+  verified: true,
+};
+
+const VERIFIED_BUNDLE_ADMISSION: VerifiedBundleAdmission = {
+  identity: VERIFIED_BUNDLE_IDENTITY,
+  canonicalTarball: "openclaw-canonical.tgz",
+  canonicalTarballUrl: "https://example.invalid/openclaw-canonical.tgz",
+  assets: {},
+  externalPlugins: [],
+};
+
+async function configureTelegram(
+  h: ScenarioHarness,
+  options: { admitDurableAck?: boolean } = {},
+) {
+  const admitDurableAck = options.admitDurableAck !== false;
+  _setBundleAdmissionForTesting(
+    admitDurableAck ? VERIFIED_BUNDLE_ADMISSION : null,
+  );
   await h.mutateMeta((meta) => {
     meta.channels.telegram = {
       botToken: "test-telegram-bot-token",
@@ -37,6 +72,9 @@ async function configureTelegram(h: ScenarioHarness) {
       botUsername: "test_bot",
       configuredAt: Date.now(),
     };
+    meta.bundleIdentity = admitDurableAck
+      ? structuredClone(VERIFIED_BUNDLE_IDENTITY)
+      : null;
   });
 }
 
@@ -150,6 +188,40 @@ test("Telegram webhook: valid event enqueues job and returns 200", async () => {
   });
 });
 
+test("Telegram webhook: admission mismatch does not claim bundle identity is missing", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    _setBundleAdmissionForTesting(null);
+    h.fakeFetch.onPost(/api\.telegram\.org/, () =>
+      Response.json({ ok: true, result: { message_id: 1 } }),
+    );
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      _resetLogBuffer();
+      const result = await callRoute(
+        route.POST,
+        buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      const capabilityLog = getServerLogs().find(
+        (entry) =>
+          entry.message === "telegram.delivery.bundle_capability_missing",
+      );
+      assert.ok(capabilityLog);
+      assert.equal(capabilityLog.data?.bundleIdentityMissing, false);
+      assert.equal(capabilityLog.data?.bundleIdentityVerified, false);
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
 test("Telegram webhook: passes receivedAtMs to drainChannelWorkflow", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
@@ -168,7 +240,10 @@ test("Telegram webhook: passes receivedAtMs to drainChannelWorkflow", async () =
       // drainChannelWorkflow v1 envelope carries receivedAtMs as a field.
       const args = startMock.mock.calls[0].arguments[1] as unknown[];
       assert.equal(args.length, 1, "workflow expects a single v1 envelope");
-      const envelope = args[0] as { version?: number; receivedAtMs?: number };
+      const envelope = args[0] as {
+        version?: number;
+        receivedAtMs?: number;
+      };
       assert.equal(envelope.version, 1, "envelope must be v1");
       const receivedAtMs = envelope.receivedAtMs as number;
       assert.equal(typeof receivedAtMs, "number", "receivedAtMs should be a number");
@@ -185,7 +260,7 @@ test("Telegram webhook: passes receivedAtMs to drainChannelWorkflow", async () =
 // Stale running status — fast path failure triggers wake
 // ===========================================================================
 
-test("Telegram webhook: fast path connection failure reconciles status and starts workflow", async () => {
+test("Telegram webhook: fast path connection failure closes unknown without blind replay", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
     // Simulate stale "running" status — sandbox is actually dead
@@ -228,17 +303,117 @@ test("Telegram webhook: fast path connection failure reconciles status and start
     try {
       const result = await callRoute(route.POST, req);
       assert.equal(result.status, 200);
-      // Workflow should have been started (wake path), not silently dropped
-      assert.equal(startMock.mock.callCount(), 1, "workflow start should be called to wake the sandbox");
-      // Boot message should be sent after stale-running reconciliation
+      assert.equal(
+        startMock.mock.callCount(),
+        0,
+        "possibly accepted delivery must not be blindly replayed",
+      );
       const telegramApiCalls = h.fakeFetch
         .requests()
         .filter((entry) => entry.url.includes("api.telegram.org"));
       assert.equal(
         telegramApiCalls.length,
-        1,
-        "boot message should be sent after stale-running reconciliation",
+        0,
+        "unknown warm delivery must not invent a cold-wake notice",
       );
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
+      resetAfterCallbacks();
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
+test("Telegram webhook: pre-dispatch setup failure starts durable workflow", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "oc-pre-dispatch-missing";
+      meta.snapshotId = "snap-pre-dispatch-missing";
+      meta.portUrls = {};
+      meta.lastRestoreMetrics = null;
+    });
+    h.fakeFetch.onPost(/api\.telegram\.org/, () =>
+      Response.json({ ok: true, result: { message_id: 1 } }),
+    );
+
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      _resetLogBuffer();
+      const result = await callRoute(
+        route.POST,
+        buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 1);
+      const setupFailure = getServerLogs().find(
+        (entry) =>
+          entry.message === "channels.telegram_fast_path_setup_failed",
+      );
+      assert.ok(setupFailure);
+      assert.equal(setupFailure.data?.dispatchState, "not-started");
+      assert.equal(setupFailure.data?.action, "start_drain_channel_workflow");
+      resetAfterCallbacks();
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
+test("Telegram webhook: connection refusal remains workflow-retryable", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-connection-refused";
+      meta.snapshotId = "snap-connection-refused";
+      meta.portUrls = {
+        "8787": "https://sbx-connection-refused-8787.fake.vercel.run",
+      };
+      meta.lastRestoreMetrics = null;
+    });
+    h.fakeFetch.onPost(/telegram-webhook$/, () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: { code: "ECONNREFUSED" },
+      });
+    });
+    h.fakeFetch.onPost(/api\.telegram\.org/, () =>
+      Response.json({ ok: true, result: { message_id: 2 } }),
+    );
+
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      _resetLogBuffer();
+      const result = await callRoute(
+        route.POST,
+        buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 1);
+      const setupFailure = getServerLogs().find(
+        (entry) =>
+          entry.message === "channels.telegram_fast_path_setup_failed",
+      );
+      assert.ok(setupFailure);
+      assert.equal(setupFailure.data?.dispatchState, "started");
+      assert.equal(setupFailure.data?.classification, "gateway-unavailable");
       resetAfterCallbacks();
     } finally {
       startMock.mock.restore();
@@ -268,7 +443,10 @@ test("Telegram webhook: fast path fires when telegramListenerReady is missing", 
     let fastPathForwardCount = 0;
     h.fakeFetch.onPost(/telegram-webhook$/, () => {
       fastPathForwardCount += 1;
-      return new Response("ok", { status: 200 });
+      return new Response("ok", {
+        status: 200,
+        headers: { "x-openclaw-delivery-accepted": "durable" },
+      });
     });
     // Boot message responder for the workflow fallthrough path.
     h.fakeFetch.onPost(/api\.telegram\.org/, () =>
@@ -393,7 +571,10 @@ test("Telegram webhook: fast path fires when status=running AND telegramListener
     let capturedForwardUrl: string | null = null;
     h.fakeFetch.onPost(/telegram-webhook$/, (url) => {
       capturedForwardUrl = url;
-      return new Response("ok", { status: 200 });
+      return new Response("ok", {
+        status: 200,
+        headers: { "x-openclaw-delivery-accepted": "durable" },
+      });
     });
 
     const route = getTelegramWebhookRoute();
@@ -432,6 +613,62 @@ test("Telegram webhook: fast path fires when status=running AND telegramListener
       assert.equal(planLog.data?.workflowKind, "do-not-start");
       assert.equal(planLog.data?.userNoticeKind, "do-not-send");
       assert.equal(planLog.data?.fastPathKind, "accepted");
+      resetAfterCallbacks();
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
+test("Telegram webhook: durable marker without verified bundle capability stays unknown", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h, { admitDurableAck: false });
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-unverified-durable-marker";
+      meta.snapshotId = "snap-unverified-durable-marker";
+      meta.portUrls = {
+        "8787": "https://sbx-unverified-durable-marker-8787.fake.vercel.run",
+      };
+      meta.lastRestoreMetrics = null;
+    });
+    h.fakeFetch.onPost(/telegram-webhook$/, () =>
+      new Response("ok", {
+        status: 200,
+        headers: { "x-openclaw-delivery-accepted": "durable" },
+      }),
+    );
+
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      _resetLogBuffer();
+      const result = await callRoute(
+        route.POST,
+        buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 0);
+      const capabilityLog = getServerLogs().find(
+        (entry) =>
+          entry.message === "telegram.delivery.bundle_capability_missing",
+      );
+      assert.ok(capabilityLog);
+      assert.equal(
+        capabilityLog.data?.capabilityId,
+        "telegram-durable-ack-v1",
+      );
+      assert.equal(capabilityLog.data?.bundleIdentityMissing, true);
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
       resetAfterCallbacks();
     } finally {
       startMock.mock.restore();
@@ -509,7 +746,7 @@ test("Telegram webhook: fast path refreshes AI Gateway token before native forwa
   });
 });
 
-test("Telegram webhook: suspicious empty 200 starts workflow and sends waiting message", async () => {
+test("Telegram webhook: unmarked empty 200 closes unknown without timing inference", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
     await h.mutateMeta((meta) => {
@@ -556,25 +793,21 @@ test("Telegram webhook: suspicious empty 200 starts workflow and sends waiting m
       );
 
       assert.equal(result.status, 200);
-      assert.equal(startMock.mock.callCount(), 1);
-      assert.equal(sendMessageCalls.length, 1, "suspicious empty 200 should send a waiting message");
+      assert.equal(startMock.mock.callCount(), 0);
+      assert.equal(sendMessageCalls.length, 0);
       const logs = getServerLogs();
-      const planLog = logs.find(
-        (entry) =>
-          entry.message === "channels.telegram_webhook_plan" &&
-          entry.data?.sandboxId === "sbx-telegram-empty-200",
+      assert.ok(
+        logs.some(
+          (entry) =>
+            entry.message ===
+            "channels.telegram_fast_path_acceptance_unknown",
+        ),
       );
-      assert.ok(planLog, "suspicious empty 200 should log the planner decision");
-      assert.equal(planLog.data?.fastPathKind, "fallback-to-workflow");
-      assert.equal(planLog.data?.fastPathReason, "suspicious-empty-200");
-      assert.equal(planLog.data?.workflowReason, "fast-path-fallback");
-      assert.equal(planLog.data?.userNoticeKind, "send-before-workflow");
-      assert.equal(planLog.data?.userNoticeReason, "fast-path-fallback");
-      const fallbackLog = logs.find(
-        (entry) => entry.message === "channels.telegram_fast_path_fallback_to_workflow",
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastDeliveryState?.state,
+        "visibility-unknown",
       );
-      assert.ok(fallbackLog, "suspicious empty 200 should log fast-path fallback");
-      assert.equal(fallbackLog.data?.reason, "suspicious_empty_200");
       resetAfterCallbacks();
     } finally {
       startMock.mock.restore();
@@ -582,7 +815,7 @@ test("Telegram webhook: suspicious empty 200 starts workflow and sends waiting m
   });
 });
 
-test("Telegram webhook: generic native 500 starts workflow and sends waiting message", async () => {
+test("Telegram webhook: generic native 500 closes unknown without blind workflow", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
     await h.mutateMeta((meta) => {
@@ -624,26 +857,31 @@ test("Telegram webhook: generic native 500 starts workflow and sends waiting mes
     const startMock = mock.method(telegramWebhookWorkflowRuntime, "start", async () => {});
 
     try {
+      _resetLogBuffer();
       const result = await callRoute(
         route.POST,
         buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
       );
 
       assert.equal(result.status, 200);
-      assert.equal(startMock.mock.callCount(), 1);
-      assert.equal(sendMessageCalls.length, 1, "generic native 500 should send a waiting message");
-      const planLog = getServerLogs().find(
+      assert.equal(startMock.mock.callCount(), 0);
+      assert.equal(sendMessageCalls.length, 0);
+      const unknownLog = getServerLogs().find(
         (entry) =>
-          entry.message === "channels.telegram_webhook_plan" &&
-          entry.data?.sandboxId === "sbx-telegram-handler-500",
+          entry.message === "channels.telegram_fast_path_acceptance_unknown",
       );
-      assert.ok(planLog, "generic native 500 should log the planner decision");
-      assert.equal(planLog.data?.fastPathKind, "fallback-to-workflow");
-      assert.equal(planLog.data?.fastPathReason, "handler-error-policy-start-workflow");
-      assert.equal(planLog.data?.fastPathClassification, "handler-error");
-      assert.equal(planLog.data?.effectiveStatus, "running");
-      assert.equal(planLog.data?.workflowReason, "fast-path-fallback");
-      assert.equal(planLog.data?.userNoticeKind, "send-before-workflow");
+      assert.ok(unknownLog);
+      assert.equal(unknownLog.data?.status, 500);
+      assert.equal(unknownLog.data?.action, "ack_without_blind_redrive");
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastForward?.classification,
+        "acceptance-unknown",
+      );
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
       resetAfterCallbacks();
     } finally {
       startMock.mock.restore();
@@ -695,7 +933,10 @@ test("Telegram webhook: repairs stale Telegram port URL once before workflow wak
           { status: 502, headers: { "content-type": "application/json" } },
         );
       }
-      return new Response("ok", { status: 200 });
+      return new Response("ok", {
+        status: 200,
+        headers: { "x-openclaw-delivery-accepted": "durable" },
+      });
     });
     const sendMessageCalls: string[] = [];
     h.fakeFetch.onPost(/api\.telegram\.org.*\/sendMessage$/, (url) => {
@@ -756,6 +997,253 @@ test("Telegram webhook: repairs stale Telegram port URL once before workflow wak
       resetAfterCallbacks();
     } finally {
       startMock.mock.restore();
+    }
+  });
+});
+
+test("Telegram webhook: stale-port repair timeout closes unknown without replay", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-telegram-repair-timeout";
+      meta.snapshotId = "snap-telegram-repair-timeout";
+      meta.portUrls = {
+        "3000":
+          "https://sbx-telegram-repair-timeout-3000.fake.vercel.run",
+        "8787":
+          "https://stale-telegram-repair-timeout-8787.fake.vercel.run",
+      };
+      meta.lastRestoreMetrics = {
+        sandboxCreateMs: 0,
+        tokenWriteMs: 0,
+        assetSyncMs: 0,
+        startupScriptMs: 0,
+        forcePairMs: 0,
+        firewallSyncMs: 0,
+        localReadyMs: 0,
+        publicReadyMs: 0,
+        totalMs: 0,
+        skippedStaticAssetSync: false,
+        assetSha256: null,
+        vcpus: 1,
+        recordedAt: Date.now(),
+        telegramListenerReady: true,
+      };
+    });
+
+    let forwardCalls = 0;
+    h.fakeFetch.onPost(/telegram-webhook$/, () => {
+      forwardCalls += 1;
+      if (forwardCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "502",
+              id: "fra1:iad1::repair-timeout",
+              message:
+                "This sandbox is not listening on the requested port.",
+            },
+          }),
+          { status: 502, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw Object.assign(new Error("repair response timed out"), {
+        name: "TimeoutError",
+      });
+    });
+
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+
+    try {
+      const result = await callRoute(
+        route.POST,
+        buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.json, { ok: true });
+      assert.equal(forwardCalls, 2);
+      assert.equal(startMock.mock.callCount(), 0);
+      assert.equal(
+        h.fakeFetch
+          .requests()
+          .some((entry) => entry.url.includes("api.telegram.org")),
+        false,
+      );
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastForward?.attempts,
+        2,
+      );
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastForward?.sandboxUrl,
+        "https://sbx-telegram-repair-timeout-8787.fake.vercel.run",
+      );
+    } finally {
+      startMock.mock.restore();
+      resetAfterCallbacks();
+    }
+  });
+});
+
+test("Telegram webhook: suspension admission 503 wakes without dead-gateway reconcile", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-telegram-suspended";
+      meta.snapshotId = "snap-telegram-suspended";
+      meta.portUrls = {
+        "3000": "https://sbx-telegram-suspended-3000.fake.vercel.run",
+        "8787": "https://sbx-telegram-suspended-8787.fake.vercel.run",
+      };
+      meta.lastRestoreMetrics = {
+        sandboxCreateMs: 0,
+        tokenWriteMs: 0,
+        assetSyncMs: 0,
+        startupScriptMs: 0,
+        forcePairMs: 0,
+        firewallSyncMs: 0,
+        localReadyMs: 0,
+        publicReadyMs: 0,
+        totalMs: 0,
+        skippedStaticAssetSync: false,
+        assetSha256: null,
+        vcpus: 1,
+        recordedAt: Date.now(),
+        telegramListenerReady: true,
+      };
+    });
+
+    h.fakeFetch.onPost(/telegram-webhook$/, () =>
+      Response.json(
+        {
+          error: {
+            code: "gateway_unavailable",
+            message: "Gateway is suspended and is not accepting new work.",
+          },
+        },
+        { status: 503 },
+      ),
+    );
+    h.fakeFetch.onPost(/api\.telegram\.org.*\/sendMessage$/, () =>
+      Response.json({ ok: true, result: { message_id: 93 } }),
+    );
+    const route = getTelegramWebhookRoute();
+    let revalidateSandboxBeforeForward: boolean | undefined;
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async (_workflow: unknown, args: unknown[]) => {
+        const envelope = args[0] as {
+          workflowHandoff?: { revalidateSandboxBeforeForward?: boolean };
+        };
+        revalidateSandboxBeforeForward =
+          envelope.workflowHandoff?.revalidateSandboxBeforeForward;
+      },
+    );
+
+    try {
+      _resetLogBuffer();
+      const result = await callRoute(
+        route.POST,
+        buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 1);
+      assert.equal(revalidateSandboxBeforeForward, true);
+      const logs = getServerLogs();
+      const fallback = logs.find(
+        (entry) =>
+          entry.message ===
+          "channels.telegram_fast_path_fallback_to_workflow",
+      );
+      assert.ok(fallback);
+      assert.equal(fallback.data?.classification, "gateway-unavailable");
+      assert.equal(fallback.data?.reason, "gateway_admission_closed");
+      assert.equal(
+        logs.some(
+          (entry) =>
+            entry.message === "channels.telegram_fast_path_reconciled",
+        ),
+        false,
+      );
+      assert.equal(
+        logs.some((entry) => entry.message === "sandbox.port_url_dead"),
+        false,
+      );
+      const meta = await h.getMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.sandboxId, "sbx-telegram-suspended");
+      assert.equal(
+        meta.portUrls?.["8787"],
+        "https://sbx-telegram-suspended-8787.fake.vercel.run",
+      );
+    } finally {
+      startMock.mock.restore();
+      resetAfterCallbacks();
+    }
+  });
+});
+
+test("Telegram webhook: unverified gateway_unavailable 503 closes unknown", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h, { admitDurableAck: false });
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-unverified-gateway-unavailable";
+      meta.portUrls = {
+        "8787": "https://sbx-unverified-gateway-unavailable-8787.fake.vercel.run",
+      };
+    });
+    h.fakeFetch.onPost(/telegram-webhook$/, () =>
+      Response.json(
+        { error: { code: "gateway_unavailable" } },
+        { status: 503 },
+      ),
+    );
+
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    try {
+      _resetLogBuffer();
+      const result = await callRoute(
+        route.POST,
+        buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 0);
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.channelDiagnostics?.telegram?.lastDeliveryState?.state,
+        "visibility-unknown",
+      );
+      const capabilityLog = getServerLogs().find(
+        (entry) =>
+          entry.message === "telegram.delivery.bundle_capability_missing" &&
+          entry.data?.capabilityId === "gateway-suspend-v1",
+      );
+      assert.ok(capabilityLog);
+      assert.equal(capabilityLog.data?.bundleIdentityMissing, true);
+    } finally {
+      startMock.mock.restore();
+      resetAfterCallbacks();
     }
   });
 });

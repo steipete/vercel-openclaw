@@ -3,6 +3,7 @@ import { afterEach, test } from "node:test";
 
 import {
   recordChannelLastForward,
+  recordChannelDeliveryClosedOutcome,
   recordChannelUserVisibleReply,
 } from "@/server/channels/last-forward";
 import {
@@ -99,6 +100,72 @@ test("recordChannelLastForward maps failed forwards to latest-attempt delivery s
   assert.equal(deliveryState.native?.classification, "handler-not-ready");
 });
 
+test("recordChannelLastForward closes uncertain native acceptance", async () => {
+  await recordChannelLastForward(
+    "telegram",
+    lastForward({
+      ok: false,
+      status: 200,
+      classification: "acceptance-unknown",
+      deliveryId: "delivery-unknown",
+    }),
+    { closedOutcome: "unknown" },
+  );
+
+  const meta = await getInitializedMeta();
+  const deliveryState = meta.channelDiagnostics?.telegram?.lastDeliveryState;
+
+  assert.equal(deliveryState?.state, "visibility-unknown");
+  assert.equal(deliveryState?.terminal, true);
+  assert.equal(deliveryState?.reason, "native-delivery-outcome-unknown");
+});
+
+test("recordChannelLastForward does not downgrade unknown delivery with later rejection", async () => {
+  const deliveryId = "delivery-monotonic-unknown";
+  await recordChannelLastForward(
+    "telegram",
+    lastForward({
+      ok: false,
+      status: 502,
+      classification: "acceptance-unknown",
+      deliveryId,
+    }),
+    { closedOutcome: "unknown" },
+  );
+  await recordChannelLastForward(
+    "telegram",
+    lastForward({
+      ok: false,
+      status: 404,
+      classification: "handler-not-ready",
+      completedAt: 1400,
+      deliveryId,
+    }),
+    { closedOutcome: "failed" },
+  );
+
+  const meta = await getInitializedMeta();
+  const entry = meta.channelDiagnostics?.telegram;
+  assert.equal(entry?.lastDeliveryState?.state, "visibility-unknown");
+  assert.equal(entry?.lastForward?.classification, "acceptance-unknown");
+});
+
+test("recordChannelDeliveryClosedOutcome closes pre-forward terminal failure", async () => {
+  await recordChannelDeliveryClosedOutcome({
+    channel: "telegram",
+    deliveryId: "delivery-failed",
+    outcome: "failed",
+    reason: "terminal_gateway-unavailable",
+  });
+
+  const meta = await getInitializedMeta();
+  const deliveryState = meta.channelDiagnostics?.telegram?.lastDeliveryState;
+
+  assert.equal(deliveryState?.state, "terminal-failed");
+  assert.equal(deliveryState?.terminal, true);
+  assert.equal(deliveryState?.reason, "terminal_gateway-unavailable");
+});
+
 test("recordChannelUserVisibleReply only updates matching delivery id", async () => {
   await recordChannelLastForward("discord", lastForward({ deliveryId: "current" }));
 
@@ -132,4 +199,38 @@ test("recordChannelUserVisibleReply only updates matching delivery id", async ()
   assert.equal(meta.channelDiagnostics?.discord?.lastForward?.userVisibleReply.source, "manual");
   assert.equal(meta.channelDiagnostics?.discord?.lastDeliveryState?.state, "reply-observed");
   assert.equal(meta.channelDiagnostics?.discord?.lastDeliveryState?.reply?.source, "manual");
+});
+
+test("recordChannelLastForward does not overwrite an observed reply", async () => {
+  const deliveryId = "delivery-observed";
+  await recordChannelLastForward("discord", lastForward({ deliveryId }));
+  assert.equal(
+    await recordChannelUserVisibleReply("discord", deliveryId, {
+      status: "observed",
+      checkedAt: 1500,
+      observedAt: 1500,
+      timeoutMs: null,
+      source: "manual",
+      reason: "operator-confirmed",
+      evidence: null,
+    }),
+    true,
+  );
+  await recordChannelLastForward(
+    "discord",
+    lastForward({
+      ok: false,
+      status: 500,
+      classification: "handler-error",
+      completedAt: 1600,
+      deliveryId,
+    }),
+  );
+
+  const meta = await getInitializedMeta();
+  assert.equal(meta.channelDiagnostics?.discord?.lastDeliveryState?.state, "reply-observed");
+  assert.equal(
+    meta.channelDiagnostics?.discord?.lastForward?.userVisibleReply.status,
+    "observed",
+  );
 });

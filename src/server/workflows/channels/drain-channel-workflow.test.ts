@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { VerifiedBundleIdentity } from "@/shared/bundle-identity";
 import type { SingleMeta, RestorePhaseMetrics } from "@/shared/types";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
 import { _resetStoreForTesting, getInitializedMeta } from "@/server/store/store";
 import { setTelegramChannelConfig } from "@/server/channels/state";
+import {
+  getChannelDlqRecord,
+  recordChannelDlqFailure,
+} from "@/server/channels/dlq";
 import {
   processChannelStep,
   toWorkflowProcessingError,
@@ -53,6 +58,19 @@ function createFallbackTelegramConfig() {
   };
 }
 
+const VERIFIED_DELIVERY_BUNDLE_IDENTITY: VerifiedBundleIdentity = {
+  packageSpec: "openclaw@2026.7.11",
+  version: "2026.7.11",
+  forkSha: "1".repeat(40),
+  upstreamSha: "2".repeat(40),
+  canonicalSha256: "3".repeat(64),
+  capabilities: [
+    "gateway-suspend-v1",
+    "telegram-durable-ack-v1",
+  ],
+  verified: true,
+};
+
 function createWorkflowDependencies(
   overrides: Partial<DrainChannelWorkflowDependencies> = {},
 ): DrainChannelWorkflowDependencies {
@@ -61,7 +79,6 @@ function createWorkflowDependencies(
     createSlackAdapter: () => ({}) as never,
     createTelegramAdapter: () => ({}) as never,
     createDiscordAdapter: () => ({}) as never,
-    createWhatsAppAdapter: () => ({}) as never,
     reconcileDiscordIntegration: async () => null,
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "running", sandboxId: "sbx-stale" }),
@@ -93,6 +110,7 @@ function createWorkflowDependencies(
     }),
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
       ok: true,
+      acceptance: "accepted",
       status: 200,
       attempts: 1,
       totalMs: 50,
@@ -113,6 +131,7 @@ function createWorkflowDependencies(
       error: null,
     }),
     buildExistingBootHandle: async () => undefined,
+    hydrateVerifiedBundleIdentity: async () => null,
     RetryableError: TestRetryableError as never,
     FatalError: TestFatalError as never,
     // Workflow DevKit metadata helpers. In a normal step these would
@@ -139,7 +158,8 @@ const WORKFLOW_TEST_ENV_KEYS = [
   "VERCEL_URL",
   "VERCEL_PROJECT_PRODUCTION_URL",
   "REDIS_URL",
-    "KV_URL",
+  "KV_URL",
+  "SESSION_SECRET",
 ] as const;
 
 let workflowTestEnvOriginals: Record<string, string | undefined> = {};
@@ -156,6 +176,7 @@ test.beforeEach(async () => {
   delete process.env.VERCEL_PROJECT_PRODUCTION_URL;
   delete process.env.REDIS_URL;
   delete process.env.KV_URL;
+  process.env.SESSION_SECRET = "test-channel-workflow-session-secret";
   _resetStoreForTesting();
   _resetLogBuffer();
 });
@@ -202,7 +223,131 @@ test("processChannelStep skips ensureSandboxReady when boot returns running", as
   assert.equal(forwardedSandboxId, "sbx-booted");
 });
 
-test("processChannelStep clears Telegram boot message after accepted forward", async () => {
+test("processChannelStep revalidates lifecycle after fast-path admission closes", async () => {
+  let ensureCalls = 0;
+  let forwardedSandboxId: string | null = null;
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-quiescing" }),
+      bootMessageSent: true,
+    }),
+    ensureSandboxReady: async () => {
+      ensureCalls += 1;
+      return asMeta({
+        status: "running",
+        sandboxId: "sbx-resumed",
+        channels: {
+          telegram: null,
+          slack: null,
+          discord: null,
+          whatsapp: null,
+        },
+      });
+    },
+    forwardToNativeHandlerWithRetry: async (
+      _channel: unknown,
+      _payload: unknown,
+      meta: SingleMeta,
+    ): Promise<RetryingForwardResult> => {
+      forwardedSandboxId = meta.sandboxId ?? null;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 50,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 2 },
+    "test",
+    "req-admission-closed",
+    null,
+    {
+      dependencies,
+      workflowHandoff: { revalidateSandboxBeforeForward: true },
+    },
+  );
+
+  assert.equal(ensureCalls, 1);
+  assert.equal(forwardedSandboxId, "sbx-resumed");
+});
+
+test("processChannelStep re-enters lifecycle when workflow admission closes", async () => {
+  let ensureCalls = 0;
+  let ensureReason: string | null = null;
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-closing",
+        bundleIdentity: VERIFIED_DELIVERY_BUNDLE_IDENTITY,
+      }),
+      bootMessageSent: false,
+    }),
+    hydrateVerifiedBundleIdentity: async () =>
+      VERIFIED_DELIVERY_BUNDLE_IDENTITY,
+    ensureSandboxReady: async (options) => {
+      ensureCalls += 1;
+      ensureReason = options.reason;
+      return asMeta({ status: "running", sandboxId: "sbx-resumed" });
+    },
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
+      ok: false,
+      acceptance: "rejected",
+      status: 503,
+      attempts: 1,
+      totalMs: 5,
+      transport: "public",
+      retries: [{ attempt: 1, reason: "gateway-unavailable", status: 503 }],
+      attemptsDetail: [
+        {
+          attempt: 1,
+          startedAtMs: Date.now(),
+          elapsedMs: 5,
+          durationMs: 5,
+          status: 503,
+          ok: false,
+          bodyLength: 19,
+          bodyHead: "gateway unavailable",
+          headers: null,
+          transport: "public",
+          classification: "gateway-unavailable",
+          acceptance: "rejected",
+          error: null,
+          detail: null,
+          processSnapshot: null,
+          logTail: null,
+        },
+      ],
+    }),
+  });
+
+  await assert.rejects(
+    processChannelStep(
+      "slack",
+      { event_id: "Ev-closing", event: {} },
+      "test",
+      "req-workflow-admission-closed",
+      null,
+      { dependencies },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof TestRetryableError);
+      return true;
+    },
+  );
+
+  assert.equal(ensureCalls, 1);
+  assert.equal(ensureReason, "channel:slack:gateway-admission-closed");
+});
+
+test("processChannelStep clears Telegram boot message after durable acceptance", async () => {
   let updateCalls = 0;
   let clearCalls = 0;
 
@@ -222,6 +367,7 @@ test("processChannelStep clears Telegram boot message after accepted forward", a
     }),
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
       ok: true,
+      acceptance: "accepted",
       status: 200,
       attempts: 1,
       totalMs: 50,
@@ -234,26 +380,112 @@ test("processChannelStep clears Telegram boot message after accepted forward", a
     dependencies,
   });
 
-  assert.equal(updateCalls, 0, "accepted Telegram forward should not update the boot placeholder");
-  assert.equal(clearCalls, 1, "accepted Telegram forward should delete the boot placeholder");
+  assert.equal(updateCalls, 0);
+  assert.equal(clearCalls, 1);
 
   const logs = getServerLogs();
-  const clearedLog = logs.find(
+  const cleanupLog = logs.find(
     (entry) => entry.message === "channels.telegram_boot_message_cleared_after_accept",
   );
-  assert.ok(clearedLog, "placeholder cleanup should be logged");
-  assert.ok(
-    !logs.some((entry) => entry.message === "channels.telegram_boot_message_retained_after_accept"),
-    "accepted Telegram forward should not log placeholder retention",
+  assert.ok(cleanupLog, "placeholder cleanup should be logged");
+  assert.equal(cleanupLog?.data?.deliveryId, "telegram:1");
+  assert.equal(cleanupLog?.data?.requestId, "req-clear");
+  assert.equal(cleanupLog?.data?.bootMessageId, 17);
+  assert.equal(cleanupLog?.data?.forwardStatus, 200);
+  assert.equal(cleanupLog?.data?.forwardAttempts, 1);
+  assert.equal(cleanupLog?.data?.forwardTransport, "local");
+  assert.equal(cleanupLog?.data?.clearOnAccept, true);
+  assert.equal(cleanupLog?.data?.placeholderAction, "cleared");
+});
+
+test("processChannelStep closes unknown Telegram acceptance without redrive", async () => {
+  const updates: string[] = [];
+  let clearCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle: async () => ({
+      async update(text: string) {
+        updates.push(text);
+      },
+      async clear() {
+        clearCalls += 1;
+      },
+    }),
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-telegram-unknown",
+        portUrls: { "8787": "https://telegram.example.test" },
+      }),
+      bootMessageSent: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
+      ok: false,
+      acceptance: "unknown",
+      status: 502,
+      attempts: 1,
+      totalMs: 50,
+      transport: "public",
+      retries: [],
+      attemptsDetail: [
+        {
+          attempt: 1,
+          startedAtMs: Date.now(),
+          elapsedMs: 50,
+          durationMs: 50,
+          status: 502,
+          ok: false,
+          bodyLength: 0,
+          bodyHead: "",
+          headers: null,
+          transport: "public",
+          classification: "acceptance-unknown",
+          acceptance: "unknown",
+        },
+      ],
+    }),
+  });
+
+  await recordChannelDlqFailure({
+    channel: "telegram",
+    deliveryId: "telegram:404",
+    phase: "workflow-step-failed",
+    terminal: true,
+    retryable: false,
+    deliveryOutcome: "not-accepted",
+    requestId: "req-previous-failure",
+    receivedAtMs: null,
+    error: new Error("previous definite rejection"),
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 404, message: { text: "uncertain" } },
+    "test",
+    "req-unknown",
+    17,
+    { dependencies },
   );
-  assert.equal(clearedLog?.data?.deliveryId, "telegram:1");
-  assert.equal(clearedLog?.data?.requestId, "req-clear");
-  assert.equal(clearedLog?.data?.bootMessageId, 17);
-  assert.equal(clearedLog?.data?.forwardStatus, 200);
-  assert.equal(clearedLog?.data?.forwardAttempts, 1);
-  assert.equal(clearedLog?.data?.forwardTransport, "local");
-  assert.equal(clearedLog?.data?.clearOnAccept, true);
-  assert.equal(clearedLog?.data?.placeholderAction, "cleared");
+
+  assert.equal(clearCalls, 0);
+  assert.deepEqual(updates, [
+    "🦞 Delivery could not be confirmed. Check for a reply before retrying.",
+  ]);
+  const meta = await getInitializedMeta();
+  assert.equal(
+    meta.channelDiagnostics?.telegram?.lastDeliveryState?.state,
+    "visibility-unknown",
+  );
+  assert.equal(
+    meta.channelDiagnostics?.telegram?.lastDeliveryState?.terminal,
+    true,
+  );
+  const blockedFailure = await getChannelDlqRecord(
+    "telegram",
+    "telegram:404",
+  );
+  assert.equal(blockedFailure?.errorMessage, "native_delivery_outcome_unknown");
+  assert.equal(blockedFailure?.deliveryOutcome, "unknown");
+  assert.equal(blockedFailure?.recoveryState, "blocked");
 });
 
 test("processChannelStep falls back to ensureSandboxReady when boot returns non-running", async () => {
@@ -376,6 +608,148 @@ test("processChannelStep preserves existing Telegram config over workflow handof
   assert.equal(forwardedWebhookSecret, existingConfig.webhookSecret);
 });
 
+test("processChannelStep fails closed when post-wake bundle identity cannot be verified", async () => {
+  let capturedAdmission: boolean | undefined;
+  let capturedGatewayAdmission: boolean | undefined;
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-unverified-bundle",
+        bundleIdentity: VERIFIED_DELIVERY_BUNDLE_IDENTITY,
+      }),
+      bootMessageSent: false,
+    }),
+    hydrateVerifiedBundleIdentity: async () => null,
+    forwardToNativeHandlerWithRetry: async (
+      ...args: Parameters<
+        DrainChannelWorkflowDependencies["forwardToNativeHandlerWithRetry"]
+      >
+    ): Promise<RetryingForwardResult> => {
+      capturedAdmission = args[9];
+      capturedGatewayAdmission = args[10];
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 50,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 3 },
+    "test",
+    "req-durable-ack-admitted",
+    null,
+    { dependencies },
+  );
+
+  assert.equal(capturedAdmission, false);
+  assert.equal(capturedGatewayAdmission, false);
+});
+
+test("processChannelStep admits capabilities verified after a cold wake", async () => {
+  let capturedTelegramAdmission: boolean | undefined;
+  let capturedGatewayAdmission: boolean | undefined;
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-cold-bundle",
+        bundleIdentity: VERIFIED_DELIVERY_BUNDLE_IDENTITY,
+      }),
+      bootMessageSent: false,
+    }),
+    hydrateVerifiedBundleIdentity: async (identity) =>
+      identity === VERIFIED_DELIVERY_BUNDLE_IDENTITY
+        ? VERIFIED_DELIVERY_BUNDLE_IDENTITY
+        : null,
+    forwardToNativeHandlerWithRetry: async (
+      ...args: Parameters<
+        DrainChannelWorkflowDependencies["forwardToNativeHandlerWithRetry"]
+      >
+    ): Promise<RetryingForwardResult> => {
+      capturedTelegramAdmission = args[9];
+      capturedGatewayAdmission = args[10];
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 50,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 4 },
+    "test",
+    "req-post-wake-capabilities",
+    null,
+    { dependencies },
+  );
+
+  assert.equal(capturedTelegramAdmission, true);
+  assert.equal(capturedGatewayAdmission, true);
+});
+
+test("processChannelStep uses the current verified post-wake capabilities", async () => {
+  let capturedTelegramAdmission: boolean | undefined;
+  let capturedGatewayAdmission: boolean | undefined;
+  const currentIdentity: VerifiedBundleIdentity = {
+    ...VERIFIED_DELIVERY_BUNDLE_IDENTITY,
+    capabilities: [],
+  };
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-current-bundle",
+        bundleIdentity: currentIdentity,
+      }),
+      bootMessageSent: false,
+    }),
+    hydrateVerifiedBundleIdentity: async () => currentIdentity,
+    forwardToNativeHandlerWithRetry: async (
+      ...args: Parameters<
+        DrainChannelWorkflowDependencies["forwardToNativeHandlerWithRetry"]
+      >
+    ): Promise<RetryingForwardResult> => {
+      capturedTelegramAdmission = args[9];
+      capturedGatewayAdmission = args[10];
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 50,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 5 },
+    "test",
+    "req-current-capabilities",
+    null,
+    { dependencies },
+  );
+
+  assert.equal(capturedTelegramAdmission, false);
+  assert.equal(capturedGatewayAdmission, false);
+});
+
 test("processChannelStep converts retrying forward fetch exception into RetryableError", async () => {
   const dependencies = createWorkflowDependencies({
     forwardToNativeHandlerWithRetry: async () => {
@@ -436,7 +810,7 @@ test("processChannelStep keeps native forward 404 fatal (Telegram retrying path)
   );
 });
 
-test("processChannelStep uses retrying forward for Telegram, Slack, Discord, and WhatsApp", async () => {
+test("processChannelStep uses retrying forward for Telegram, Slack, and Discord", async () => {
   let retryingCalled = false;
   let directCalled = false;
 
@@ -497,24 +871,6 @@ test("processChannelStep uses retrying forward for Telegram, Slack, Discord, and
   );
   assert.ok(retryingCalled, "Discord should use retrying forward");
   assert.ok(!directCalled, "Discord should not use direct forward");
-
-  retryingCalled = false;
-  directCalled = false;
-
-  const whatsappDeps = createWorkflowDependencies({
-    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
-      retryingCalled = true;
-      return { ok: true, status: 200, attempts: 1, totalMs: 50, transport: "public", retries: [] };
-    },
-    forwardToNativeHandler: async () => {
-      directCalled = true;
-      return { ok: true, status: 200, durationMs: 0, bodyLength: 0, bodyHead: "", headers: null };
-    },
-  });
-
-  await processChannelStep("whatsapp", { entry: [] }, "test", "req-wa", null, { dependencies: whatsappDeps });
-  assert.ok(retryingCalled, "WhatsApp should use retrying forward");
-  assert.ok(!directCalled, "WhatsApp should not use direct forward");
 });
 
 test("processChannelStep converts retrying forward 504 (exhausted) into RetryableError", async () => {
@@ -1202,7 +1558,7 @@ test("processChannelStep uses local Telegram native handler readiness before for
   assert.ok(forwardCalledAfterLocalProbe, "forward should only happen after local probe completes");
 });
 
-test("processChannelStep does NOT run Telegram-specific probe for Slack or WhatsApp", async () => {
+test("processChannelStep does NOT run Telegram-specific probe for Slack", async () => {
   let probeCallCount = 0;
 
   const dependencies = createWorkflowDependencies({
@@ -1221,9 +1577,6 @@ test("processChannelStep does NOT run Telegram-specific probe for Slack or Whats
 
   await processChannelStep("slack", { event: {} }, "test", "req-no-probe-slack", null, { dependencies });
   assert.equal(probeCallCount, 0, "Telegram probe should NOT run for Slack — Slack relies on retry-on-404");
-
-  await processChannelStep("whatsapp", { entry: [] }, "test", "req-no-probe-wa", null, { dependencies });
-  assert.equal(probeCallCount, 0, "Telegram probe should NOT run for WhatsApp");
 });
 
 test("processChannelStep skips public Telegram probe when local handler is not ready", async () => {
@@ -1529,7 +1882,7 @@ test("processChannelStep surfaces Slack retrying forward 200 (after 404 recovery
   assert.equal(capturedChannel, "slack");
 });
 
-test("processChannelStep clears Slack boot message after accepted forward", async () => {
+test("processChannelStep clears Slack boot message after native acceptance", async () => {
   let updateCalls = 0;
   let clearCalls = 0;
 
@@ -1566,8 +1919,8 @@ test("processChannelStep clears Slack boot message after accepted forward", asyn
     { dependencies },
   );
 
-  assert.equal(updateCalls, 0, "accepted Slack forward should not leave a final placeholder update");
-  assert.equal(clearCalls, 1, "accepted Slack forward should delete the wrapper wake message");
+  assert.equal(updateCalls, 0);
+  assert.equal(clearCalls, 1);
   const logs = getServerLogs();
   const cleanupLog = logs.find(
     (entry) => entry.message === "channels.slack_boot_message_cleared_after_accept",
@@ -1583,6 +1936,7 @@ test("processChannelStep keeps Slack 401 fatal (signature failure is unrecoverab
   const dependencies = createWorkflowDependencies({
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
       ok: false,
+      acceptance: "rejected",
       status: 401,
       attempts: 1,
       totalMs: 50,
@@ -1592,12 +1946,43 @@ test("processChannelStep keeps Slack 401 fatal (signature failure is unrecoverab
   });
 
   await assert.rejects(
-    processChannelStep("slack", { event: {} }, "test", "req-slack-401", null, { dependencies }),
+    processChannelStep(
+      "slack",
+      { event_id: "Ev-fatal", event: {} },
+      "test",
+      "req-slack-401",
+      null,
+      {
+        dependencies,
+        workflowHandoff: {
+          slackForwardHeaders: {
+            "x-slack-request-timestamp": "1710000000",
+            "x-slack-signature": "v0=original",
+          },
+          slackRawBody: JSON.stringify({ event_id: "Ev-fatal", event: {} }),
+        },
+      },
+    ),
     (error: unknown) => {
       assert.ok(error instanceof TestFatalError);
       return true;
     },
   );
+
+  const meta = await getInitializedMeta();
+  assert.equal(
+    meta.channelDiagnostics?.slack?.lastDeliveryState?.state,
+    "terminal-failed",
+  );
+  const record = await getChannelDlqRecord("slack", "slack:Ev-fatal");
+  assert.ok(record);
+  assert.equal(record.deliveryOutcome, "not-accepted");
+  assert.equal(record.recoveryState, "blocked");
+  const failureLog = getServerLogs().find(
+    (entry) => entry.message === "channels.workflow_terminal_failure_recorded",
+  );
+  assert.ok(failureLog);
+  assert.equal("replayToken" in (failureLog.data ?? {}), false);
 });
 
 test("processChannelStep passes slackForwardHeaders from handoff through to the retry wrapper", async () => {
@@ -1611,6 +1996,10 @@ test("processChannelStep passes slackForwardHeaders from handoff through to the 
       _forwardTelegramLocally: unknown,
       _preferLocal: unknown,
       extraForwardHeaders: Record<string, string> | null | undefined,
+      _rawBody: unknown,
+      _deliveryId: unknown,
+      _telegramDurableAcceptanceAdmitted: unknown,
+      _gatewayAdmissionRejectionAdmitted: boolean | undefined,
     ): Promise<RetryingForwardResult> => {
       capturedHeaders = extraForwardHeaders;
       return { ok: true, status: 200, attempts: 1, totalMs: 50, transport: "public", retries: [] };
@@ -1630,7 +2019,9 @@ test("processChannelStep passes slackForwardHeaders from handoff through to the 
     null,
     {
       dependencies,
-      workflowHandoff: { slackForwardHeaders } satisfies ChannelWorkflowHandoff,
+      workflowHandoff: {
+        slackForwardHeaders,
+      } satisfies ChannelWorkflowHandoff,
     },
   );
 
@@ -1749,65 +2140,59 @@ test("processChannelStep passes Discord raw body and signature headers to retryi
   assert.equal(capturedDeliveryId, "discord:interaction-handoff-1");
 });
 
-test("processChannelStep retains WhatsApp boot message after accepted forward", async () => {
+test("processChannelStep rejects hosted WhatsApp before delivery side effects", async () => {
   _resetLogBuffer();
-  let clearCalls = 0;
-  let updateCalls = 0;
+  let bootCalls = 0;
+  let handleCalls = 0;
+  let forwardCalls = 0;
+  let readinessCalls = 0;
 
   const dependencies = createWorkflowDependencies({
-    buildExistingBootHandle: async () => ({
-      async update() {
-        updateCalls += 1;
-      },
-      async clear() {
-        clearCalls += 1;
-      },
-    }),
-    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
-      ok: true,
-      status: 200,
-      attempts: 2,
-      totalMs: 150,
-      transport: "public",
-      retries: [{ attempt: 1, reason: "handler-not-ready", status: 404 }],
-    }),
+    runWithBootMessages: async () => {
+      bootCalls += 1;
+      throw new Error("must not wake");
+    },
+    buildExistingBootHandle: async () => {
+      handleCalls += 1;
+      return undefined;
+    },
+    forwardToNativeHandlerWithRetry: async () => {
+      forwardCalls += 1;
+      throw new Error("must not forward");
+    },
+    ensureSandboxReady: async () => {
+      readinessCalls += 1;
+      throw new Error("must not reconcile");
+    },
   });
 
-  await processChannelStep(
-    "whatsapp",
-    {
-      entry: [
-        {
-          changes: [
-            {
-              value: {
-                messages: [{ id: "wamid.workflow-clear-1" }],
-              },
-            },
-          ],
-        },
-      ],
+  await assert.rejects(
+    processChannelStep(
+      "whatsapp",
+      { entry: [] },
+      "test",
+      "req-wa-rejected",
+      "wamid.boot",
+      { dependencies },
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof TestFatalError);
+      assert.equal(error.message, "hosted_whatsapp_transport_unavailable");
+      return true;
     },
-    "test",
-    "req-wa-clear",
-    "wamid.boot-clear-1",
-    { dependencies },
   );
 
-  assert.equal(clearCalls, 0);
-  assert.equal(updateCalls, 0);
-  const retainedLog = getServerLogs().find(
-    (entry) => entry.message === "channels.whatsapp_boot_message_retained_after_accept",
+  assert.equal(bootCalls, 0);
+  assert.equal(handleCalls, 0);
+  assert.equal(forwardCalls, 0);
+  assert.equal(readinessCalls, 0);
+  const rejectionLog = getServerLogs().find(
+    (entry) => entry.message === "channels.whatsapp_workflow_rejected",
   );
-  assert.ok(retainedLog, "WhatsApp boot retention should be logged after native accept");
-  assert.equal(retainedLog.data?.deliveryId, "whatsapp:wamid.workflow-clear-1");
-  assert.equal(retainedLog.data?.forwardAttempts, 2);
-  assert.equal(retainedLog.data?.placeholderAction, "retained");
-  assert.equal(retainedLog.data?.clearOnAccept, false);
-  assert.equal(retainedLog.data?.reason, "whatsapp_delete_not_supported");
+  assert.equal(rejectionLog?.data?.reason, "hosted-transport-unavailable");
 });
 
-test("processChannelStep emits Discord and WhatsApp wake summaries", async () => {
+test("processChannelStep emits a Discord wake summary", async () => {
   _resetLogBuffer();
   const dependencies = createWorkflowDependencies({
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
@@ -1828,28 +2213,8 @@ test("processChannelStep emits Discord and WhatsApp wake summaries", async () =>
     null,
     { dependencies, receivedAtMs: Date.now() - 20 },
   );
-  await processChannelStep(
-    "whatsapp",
-    {
-      entry: [
-        {
-          changes: [
-            { value: { messages: [{ id: "wamid.summary-1" }] } },
-          ],
-        },
-      ],
-    },
-    "test",
-    "req-whatsapp-summary",
-    null,
-    { dependencies, receivedAtMs: Date.now() - 20 },
-  );
-
   const logs = getServerLogs();
   const discordSummary = logs.find((entry) => entry.message === "channels.discord_wake_summary");
-  const whatsappSummary = logs.find((entry) => entry.message === "channels.whatsapp_wake_summary");
   assert.ok(discordSummary, "Discord wake summary should be emitted");
-  assert.ok(whatsappSummary, "WhatsApp wake summary should be emitted");
   assert.equal(discordSummary.data?.retryingForwardAttempts, 2);
-  assert.equal(whatsappSummary.data?.retryingForwardRetries, 1);
 });

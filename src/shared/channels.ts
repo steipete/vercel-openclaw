@@ -2,13 +2,29 @@ import type { ChannelDeliverySnapshot } from "@/shared/channel-delivery";
 
 export const CHANNEL_NAMES = ["slack", "telegram", "discord", "whatsapp"] as const;
 
+export const HOSTED_DELIVERY_CHANNEL_NAMES = [
+  "slack",
+  "telegram",
+  "discord",
+] as const;
+
+export const HOSTED_DELIVERY_CHANNELS_LABEL =
+  HOSTED_DELIVERY_CHANNEL_NAMES.map(
+    (channel) => channel[0].toUpperCase() + channel.slice(1),
+  ).join(", ");
+
 export type ChannelName = (typeof CHANNEL_NAMES)[number];
+export type HostedDeliveryChannelName =
+  (typeof HOSTED_DELIVERY_CHANNEL_NAMES)[number];
 
 export function isChannelName(value: string): value is ChannelName {
   return (CHANNEL_NAMES as readonly string[]).includes(value);
 }
 
-export type ChannelMode = "webhook-proxied" | "gateway-native";
+export type ChannelMode =
+  | "webhook-proxied"
+  | "gateway-native"
+  | "unsupported";
 
 export type SlackLiveConfigSyncState = {
   outcome: "skipped" | "applied" | "degraded" | "failed";
@@ -27,6 +43,7 @@ export type SlackChannelConfig = {
   botId?: string;
   lastError?: string;
   liveConfigSync?: SlackLiveConfigSyncState;
+  smokeOwnerId?: string;
 };
 
 export type TelegramChannelConfig = {
@@ -41,6 +58,7 @@ export type TelegramChannelConfig = {
   commandsRegisteredAt?: number;
   commandSyncError?: string;
   lastError?: string;
+  smokeOwnerId?: string;
 };
 
 export type DiscordChannelConfig = {
@@ -56,6 +74,7 @@ export type DiscordChannelConfig = {
   commandRegistered?: boolean;
   commandId?: string;
   commandRegisteredAt?: number;
+  smokeOwnerId?: string;
 };
 
 export type WhatsAppLinkState =

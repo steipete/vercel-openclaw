@@ -24,7 +24,6 @@ import { getSlackInstallConfig } from "@/server/channels/slack/install-config";
 import { buildDeploymentContract } from "@/server/deployment-contract";
 import { logDebug } from "@/server/log";
 import { getInitializedMeta, mutateMeta } from "@/server/store/store";
-import { GATEWAY_CHAT_PATH } from "@/shared/gateway-paths";
 
 export type {
   PublicSlackState,
@@ -261,16 +260,18 @@ function toPublicWhatsAppState(
   connectability: ChannelConnectability,
 ): PublicWhatsAppState {
   return {
-    configured: config?.enabled === true,
+    // Any persisted legacy config stays visible solely so operators can
+    // remove it, regardless of its former enabled flag.
+    configured: config !== null,
     mode: connectability.mode,
-    webhookUrl: config ? connectability.webhookUrl : null,
-    status: config?.lastKnownLinkState ?? "unconfigured",
+    webhookUrl: null,
+    status: config ? "disconnected" : "unconfigured",
     configuredAt: config?.configuredAt ?? null,
-    displayName: config?.displayName ?? null,
-    linkedPhone: config?.linkedPhone ?? null,
+    displayName: null,
+    linkedPhone: null,
     lastError: config?.lastError ?? null,
     requiresRunningSandbox: false,
-    loginVia: GATEWAY_CHAT_PATH,
+    loginVia: null,
     connectability,
   };
 }

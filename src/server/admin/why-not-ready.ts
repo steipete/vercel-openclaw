@@ -40,6 +40,7 @@ export type ObservabilityGap = {
 };
 
 export type ChannelReport = {
+  hostedDeliverySupported: boolean;
   ready: boolean;
   blockers: Blocker[];
   observabilityGaps: ObservabilityGap[];
@@ -345,6 +346,7 @@ function buildChannelReport(
         : recentlyAccepted);
 
   return {
+    hostedDeliverySupported: true,
     ready,
     blockers,
     observabilityGaps,
@@ -352,6 +354,24 @@ function buildChannelReport(
       liveConfigSync,
       lastForward,
       userVisibleReply: lastForward?.userVisibleReply ?? null,
+      sandboxId: meta.sandboxId,
+      portUrls: meta.portUrls,
+    },
+  };
+}
+
+function buildUnsupportedWhatsAppReport(meta: SingleMeta): ChannelReport {
+  return {
+    // Unsupported hosted transport is not a readiness blocker. Legacy config
+    // remains cleanup-only and must not produce configure/fix guidance.
+    hostedDeliverySupported: false,
+    ready: true,
+    blockers: [],
+    observabilityGaps: [],
+    readinessSnapshot: {
+      liveConfigSync: null,
+      lastForward: null,
+      userVisibleReply: null,
       sandboxId: meta.sandboxId,
       portUrls: meta.portUrls,
     },
@@ -377,7 +397,7 @@ export async function buildWhyNotReady(
     slack: buildChannelReport("slack", meta, now),
     telegram: buildChannelReport("telegram", meta, now),
     discord: buildChannelReport("discord", meta, now),
-    whatsapp: buildChannelReport("whatsapp", meta, now),
+    whatsapp: buildUnsupportedWhatsAppReport(meta),
   };
 
   return {

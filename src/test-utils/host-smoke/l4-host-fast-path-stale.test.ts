@@ -10,8 +10,8 @@
  *
  * Two scenarios cover the two failure modes the route distinguishes:
  *
- *   - Gateway-error fallback: forward returns 502.
- *   - Network-error fallback: forward throws (TimeoutError or fetch reject).
+ *   - Definite route-unavailable fallback: forward returns a marked 502.
+ *   - Pre-admission network fallback: forward rejects with ECONNREFUSED.
  *   - Empty platform 200 fallback: gateway probe lacks the OpenClaw marker,
  *     so the route must not forward to the sandbox catch-all.
  *
@@ -66,12 +66,14 @@ function fastPathForwardAttempts(h: ScenarioHarness): number {
     ).length;
 }
 
-test("L4-host fast-path stale: 502 from forward triggers fallback to workflow", async () => {
+test("L4-host fast-path stale: not-listening 502 triggers workflow", async () => {
   await withHarness(async (h) => {
     await configureRunningSandboxWithSlack(h);
 
     h.fakeFetch.onGet(SANDBOX_URL_3000, () => gatewayReadyResponse());
-    h.fakeFetch.onPost(/\/slack\/events$/, () => new Response("bad gateway", { status: 502 }));
+    h.fakeFetch.onPost(/\/slack\/events$/, () =>
+      new Response("sandbox is not listening", { status: 502 }),
+    );
     // Boot message + any other Slack outbound during fallback.
     h.fakeFetch.onPost(/slack\.com\/api\//, () => slackOkResponse());
 
@@ -102,13 +104,16 @@ test("L4-host fast-path stale: 502 from forward triggers fallback to workflow", 
   });
 });
 
-test("L4-host fast-path stale: network error from forward triggers fallback to workflow", async () => {
+test("L4-host fast-path stale: pre-admission network error triggers workflow", async () => {
   await withHarness(async (h) => {
     await configureRunningSandboxWithSlack(h);
 
     h.fakeFetch.onGet(SANDBOX_URL_3000, () => gatewayReadyResponse());
     h.fakeFetch.onPost(/\/slack\/events$/, () => {
-      throw new Error("ECONNREFUSED simulated for stale sandbox");
+      throw Object.assign(
+        new Error("ECONNREFUSED simulated for stale sandbox"),
+        { code: "ECONNREFUSED" },
+      );
     });
     h.fakeFetch.onPost(/slack\.com\/api\//, () => slackOkResponse());
 
@@ -130,7 +135,7 @@ test("L4-host fast-path stale: network error from forward triggers fallback to w
       assert.equal(
         startMock.mock.callCount(),
         1,
-        "network-error fast-path must fall through to durable workflow",
+        "definite pre-admission failure must fall through to durable workflow",
       );
       resetAfterCallbacks();
     } finally {

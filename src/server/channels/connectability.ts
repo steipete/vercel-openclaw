@@ -13,20 +13,20 @@ import { probeDeploymentProtection } from "@/server/deployment-protection-probe"
 import { logDebug } from "@/server/log";
 import { getProtectionBypassSecret } from "@/server/public-url";
 import { buildChannelDisplayWebhookUrl } from "@/server/channels/webhook-urls";
+import { HOSTED_WHATSAPP_UNAVAILABLE_MESSAGE } from "@/server/channels/whatsapp/hosted-support";
 
 const ALL_CHANNELS: ChannelName[] = ["slack", "telegram", "discord", "whatsapp"];
 
 type ChannelDefinition = {
   label: string;
   mode: ChannelMode;
-  requiresPublicWebhook: boolean;
 };
 
 const CHANNEL_DEFINITIONS: Record<ChannelName, ChannelDefinition> = {
-  slack: { label: "Slack", mode: "webhook-proxied", requiresPublicWebhook: true },
-  telegram: { label: "Telegram", mode: "webhook-proxied", requiresPublicWebhook: true },
-  discord: { label: "Discord", mode: "webhook-proxied", requiresPublicWebhook: true },
-  whatsapp: { label: "WhatsApp", mode: "webhook-proxied", requiresPublicWebhook: true },
+  slack: { label: "Slack", mode: "webhook-proxied" },
+  telegram: { label: "Telegram", mode: "webhook-proxied" },
+  discord: { label: "Discord", mode: "webhook-proxied" },
+  whatsapp: { label: "WhatsApp", mode: "unsupported" },
 };
 
 const CHANNEL_LABELS: Record<ChannelName, string> = Object.fromEntries(
@@ -177,6 +177,27 @@ export async function buildChannelPrerequisite(
 ): Promise<ChannelConnectability> {
   const def = CHANNEL_DEFINITIONS[channel];
   const label = def.label;
+  if (def.mode === "unsupported") {
+    const issues: ChannelConnectabilityIssue[] = [
+      {
+        id: "hosted-transport-unavailable",
+        status: "fail",
+        message: HOSTED_WHATSAPP_UNAVAILABLE_MESSAGE,
+        remediation:
+          "Use local OpenClaw linked-device WhatsApp support until the hosted transport contract is implemented end to end.",
+        env: [],
+      },
+    ];
+    logDebug("channel_prerequisite.built", {
+      channel,
+      mode: def.mode,
+      status: "fail",
+      issueCount: issues.length,
+      issueIds: issues.map((issue) => issue.id),
+      excludedContractIds: [],
+    });
+    return buildResult(channel, null, issues);
+  }
   const contract = shared.contract ?? await buildDeploymentContract({ request });
   const deploymentProtectionDetected = await resolveDeploymentProtectionDetected(
     request,
@@ -285,11 +306,11 @@ export async function buildChannelConnectabilityMap(
       const def = CHANNEL_DEFINITIONS[channel];
       // Gateway-native channels have no webhook URL to override or resolve.
       const webhookOverride =
-        def.mode === "gateway-native"
-          ? undefined
-          : options.webhookUrlOverrides?.[channel] ??
+        def.mode === "webhook-proxied"
+          ? options.webhookUrlOverrides?.[channel] ??
             buildChannelDisplayWebhookUrl(channel, request) ??
-            undefined;
+            undefined
+          : undefined;
 
       return buildChannelPrerequisite(
         channel,

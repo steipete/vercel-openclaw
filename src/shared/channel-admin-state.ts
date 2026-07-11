@@ -86,7 +86,7 @@ export type PublicWhatsAppState = {
   linkedPhone: string | null;
   lastError: string | null;
   requiresRunningSandbox: boolean;
-  loginVia: string;
+  loginVia: string | null;
   connectability: ChannelConnectability;
 };
 

@@ -8,6 +8,12 @@
 - `POST /api/admin/launch-verify` returns `LaunchVerificationPayload & { channelReadiness: ChannelReadiness }`. Send `Accept: application/x-ndjson` to stream phase events (`LaunchVerificationStreamEvent`) for automation.
 - When streaming with `Accept: application/x-ndjson`, the terminal `result` event carries the same extended payload including `channelReadiness`.
 - `GET /api/admin/watchdog` returns the cached `WatchdogReport`; `POST /api/admin/watchdog` runs a fresh check. Each report contains `WatchdogCheck` entries.
+- `GET /api/admin/channels/dlq` lists bounded channel-delivery failures with delivery outcome and recovery state. Replay payloads are not persisted.
+- `POST /api/admin/channels/dlq` returns HTTP 405. Automated redrive remains disabled until workflow start or the native handler provides an exact idempotency contract.
+
+### Channel DLQ recovery contract
+
+Delivery failures are inspection-only. The wrapper does not persist replay payloads; `visibility-unknown` may already have been accepted, so recovery remains blocked rather than risking a duplicate.
 
 `channelReadiness.ready` is only true after destructive launch verification passes the full `preflight` → `queuePing` → `ensureRunning` → `chatCompletions` → `wakeFromSleep` → `restorePrepared` path for the current deployment.
 
@@ -206,7 +212,7 @@ See [Sandbox Lifecycle and Restore](lifecycle-and-restore.md) for a plain-Englis
 
 ### Example blocked channel connect response
 
-All channel credential-save routes (`PUT /api/channels/slack`, `PUT /api/channels/telegram`, `PUT /api/channels/discord`, `PUT /api/channels/whatsapp`) return HTTP 409 with the same envelope when deployment prerequisites are still failing.
+Supported channel credential-save routes (`PUT /api/channels/slack`, `PUT /api/channels/telegram`, `PUT /api/channels/discord`) return HTTP 409 with the same envelope when deployment prerequisites are still failing. `PUT /api/channels/whatsapp` always returns `CHANNEL_CONNECT_BLOCKED` while hosted WhatsApp transport remains unsupported.
 
 Sample request outcome: `PUT /api/channels/telegram` while the deployment cannot resolve a public webhook origin.
 

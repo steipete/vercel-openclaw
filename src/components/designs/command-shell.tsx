@@ -186,7 +186,9 @@ function channelErrorFor(
     case "Discord":
       return channels.discord.endpointError ?? null;
     case "WhatsApp":
-      return channels.whatsapp.lastError ?? null;
+      return channels.whatsapp.mode === "unsupported"
+        ? null
+        : channels.whatsapp.lastError ?? null;
     default:
       return null;
   }
@@ -216,12 +218,41 @@ function channelIdentityFor(
     }
     case "WhatsApp": {
       const w = channels.whatsapp;
-      if (!w.configured) return null;
+      if (w.mode === "unsupported" || !w.configured) return null;
       return w.linkedPhone ?? w.displayName ?? null;
     }
     default:
       return null;
   }
+}
+
+type ChannelOverviewRow = {
+  name: string;
+  state: string;
+  tone: "success" | "warning" | "danger" | "muted";
+};
+
+export function buildWhatsAppOverviewRow(
+  whatsapp: PublicChannelState["whatsapp"],
+): ChannelOverviewRow {
+  // Legacy credentials remain visible for cleanup, but unsupported transport
+  // must never become a green configured/connected signal.
+  if (whatsapp.mode === "unsupported") {
+    return {
+      name: "WhatsApp",
+      state: "unavailable",
+      tone: "muted",
+    };
+  }
+  return {
+    name: "WhatsApp",
+    state: whatsapp.configured ? whatsapp.status : "not configured",
+    tone: whatsapp.lastError
+      ? "warning"
+      : whatsapp.configured
+        ? "success"
+        : "muted",
+  };
 }
 
 export function CommandShell({ initialStatus, initialView = "status" }: Props) {
@@ -679,28 +710,19 @@ export function CommandShell({ initialStatus, initialView = "status" }: Props) {
     );
   }
 
-  const channelRows: Array<{
-    name: string;
-    configured: boolean;
-    state: string;
-    tone: "success" | "warning" | "danger" | "muted";
-    webhook: string | null;
-  }> = channels
+  const channelRows: ChannelOverviewRow[] = channels
     ? [
         {
           name: "Slack",
-          configured: channels.slack.configured,
           state: channels.slack.configured ? "connected" : "not configured",
           tone: channels.slack.lastError
             ? "warning"
             : channels.slack.configured
               ? "success"
               : "muted",
-          webhook: channels.slack.webhookUrl,
         },
         {
           name: "Telegram",
-          configured: channels.telegram.configured,
           state: channels.telegram.status,
           tone:
             channels.telegram.status === "connected"
@@ -710,11 +732,9 @@ export function CommandShell({ initialStatus, initialView = "status" }: Props) {
                 : channels.telegram.configured
                   ? "warning"
                   : "muted",
-          webhook: channels.telegram.webhookUrl,
         },
         {
           name: "Discord",
-          configured: channels.discord.configured,
           state: channels.discord.configured
             ? channels.discord.commandRegistered
               ? "connected"
@@ -725,21 +745,8 @@ export function CommandShell({ initialStatus, initialView = "status" }: Props) {
             : channels.discord.configured
               ? "success"
               : "muted",
-          webhook: channels.discord.webhookUrl,
         },
-        {
-          name: "WhatsApp",
-          configured: channels.whatsapp.configured,
-          state: channels.whatsapp.configured
-            ? channels.whatsapp.status
-            : "not configured",
-          tone: channels.whatsapp.lastError
-            ? "warning"
-            : channels.whatsapp.configured
-              ? "success"
-              : "muted",
-          webhook: channels.whatsapp.webhookUrl,
-        },
+        buildWhatsAppOverviewRow(channels.whatsapp),
       ]
     : [];
 

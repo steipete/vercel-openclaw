@@ -91,7 +91,7 @@ Be careful with shell expansion. `VAR=value vclaw create --slack-config-token "$
 
 After a successful create, users should treat [Hosted Feature Support](hosted-feature-support.md) as the source of truth for what the deployment supports. The dashboard exposes the same matrix in `/api/status`, `/api/channels/summary`, and `/api/admin/launch-verify` as `featureSupport`, so `vclaw` completion output and future smoke checks can link to or read the same contract. Bundle-backed create is complete only when launch verification returns a non-null `bundleIdentity` with `verified: true` matching the requested package, source SHA, canonical digest, and required capabilities.
 
-Slack and Telegram are the primary hosted channels. Discord and WhatsApp are experimental until real platform delivery and user-visible replies are verified end to end. Companion apps, voice, canvas, arbitrary channel adapters, and arbitrary plugin/skill/MCP installation require local/upstream OpenClaw unless the hosted matrix says otherwise.
+Slack and Telegram are the primary hosted channels. Discord remains experimental. Hosted WhatsApp setup is disabled because the former Meta Cloud API webhook path does not match OpenClaw's linked-device transport; use local/upstream OpenClaw for WhatsApp. Companion apps, voice, canvas, arbitrary channel adapters, and arbitrary plugin/skill/MCP installation require local/upstream OpenClaw unless the hosted matrix says otherwise.
 
 ## Bundle Resolution
 

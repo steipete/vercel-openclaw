@@ -155,3 +155,35 @@ test("webhook planner: handled-no-workflow sends no notice and starts no workflo
     reason: "handled-no-workflow",
   });
 });
+
+test("webhook planner: indeterminate fast path never starts a blind redrive", () => {
+  const plan = planWebhookAfterFastPath({
+    channel: "telegram",
+    effectiveStatus: "running",
+    canSendUserNotice: true,
+    policy: { noticeOnWorkflowStart: true },
+    fastPath: {
+      kind: "fallback-to-workflow",
+      reason: "fast-path-timeout",
+      classification: "fetch-exception",
+      status: null,
+      transport: "public",
+      sandboxUrl: "https://sbx.example",
+      sandboxId: "sbx",
+      bodyHead: "response timed out",
+      durationMs: 600_000,
+      shouldReconcile: false,
+      indeterminateDelivery: true,
+    },
+  });
+
+  assert.equal(plan.routeOutcome, "ack-noop");
+  assert.deepEqual(plan.workflow, {
+    kind: "do-not-start",
+    reason: "delivery-acceptance-unknown",
+  });
+  assert.deepEqual(plan.userNotice, {
+    kind: "do-not-send",
+    reason: "handled-no-workflow",
+  });
+});

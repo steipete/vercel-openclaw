@@ -16,7 +16,6 @@ flowchart LR
   Slack[Slack] --> Dashboard
   Telegram[Telegram] --> Dashboard
   Discord[Discord] --> Dashboard
-  WhatsApp[WhatsApp] --> Dashboard
   Dashboard --> OpenClaw
 ```
 

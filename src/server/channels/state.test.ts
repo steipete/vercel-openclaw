@@ -86,7 +86,7 @@ test("each channel includes a connectability field", async () => {
 
     assert.ok(state.whatsapp.connectability, "whatsapp missing connectability");
     assert.equal(state.whatsapp.connectability.channel, "whatsapp");
-    assert.equal(state.whatsapp.connectability.mode, "webhook-proxied");
+    assert.equal(state.whatsapp.connectability.mode, "unsupported");
   });
 });
 
@@ -589,16 +589,16 @@ function makeWhatsAppConfig(overrides: Partial<WhatsAppChannelConfig> = {}): Wha
   };
 }
 
-test("[state] unconfigured whatsapp returns webhook-proxied defaults", async () => {
+test("[state] unconfigured whatsapp returns unsupported hosted defaults", async () => {
   await withHarness(async (h) => {
     const meta = await h.getMeta();
     const state = await getPublicChannelState(makeRequest(), meta);
 
     assert.equal(state.whatsapp.configured, false);
-    assert.equal(state.whatsapp.mode, "webhook-proxied");
+    assert.equal(state.whatsapp.mode, "unsupported");
     assert.equal(state.whatsapp.status, "unconfigured");
     assert.equal(state.whatsapp.requiresRunningSandbox, false);
-    assert.equal(state.whatsapp.loginVia, "/gateway/chat?session=main");
+    assert.equal(state.whatsapp.loginVia, null);
     assert.equal(state.whatsapp.webhookUrl, null);
     assert.equal(state.whatsapp.configuredAt, null);
     assert.equal(state.whatsapp.displayName, null);
@@ -607,7 +607,7 @@ test("[state] unconfigured whatsapp returns webhook-proxied defaults", async () 
   });
 });
 
-test("[state] configured whatsapp returns correct public shape", async () => {
+test("[state] legacy whatsapp config is exposed only for cleanup", async () => {
   await withHarness(async (h) => {
     await h.mutateMeta((meta) => {
       meta.channels.whatsapp = makeWhatsAppConfig({
@@ -621,17 +621,14 @@ test("[state] configured whatsapp returns correct public shape", async () => {
     const state = await getPublicChannelState(makeRequest(), meta);
 
     assert.equal(state.whatsapp.configured, true);
-    assert.equal(state.whatsapp.mode, "webhook-proxied");
-    assert.equal(state.whatsapp.status, "linked");
+    assert.equal(state.whatsapp.mode, "unsupported");
+    assert.equal(state.whatsapp.status, "disconnected");
     assert.equal(state.whatsapp.configuredAt, 4000);
-    assert.equal(state.whatsapp.displayName, "Test Account");
-    assert.equal(state.whatsapp.linkedPhone, "+1234567890");
+    assert.equal(state.whatsapp.displayName, null);
+    assert.equal(state.whatsapp.linkedPhone, null);
     assert.equal(state.whatsapp.requiresRunningSandbox, false);
-    assert.equal(state.whatsapp.loginVia, "/gateway/chat?session=main");
-    assert.equal(
-      state.whatsapp.webhookUrl,
-      "https://app.example.com/api/channels/whatsapp/webhook",
-    );
+    assert.equal(state.whatsapp.loginVia, null);
+    assert.equal(state.whatsapp.webhookUrl, null);
   });
 });
 
@@ -646,12 +643,12 @@ test("[state] whatsapp with error shows lastError", async () => {
     const meta = await h.getMeta();
     const state = await getPublicChannelState(makeRequest(), meta);
 
-    assert.equal(state.whatsapp.status, "error");
+    assert.equal(state.whatsapp.status, "disconnected");
     assert.equal(state.whatsapp.lastError, "connection timeout");
   });
 });
 
-test("[state] whatsapp public state includes webhook URL when configured", async () => {
+test("[state] whatsapp public state never includes retired webhook URL", async () => {
   await withHarness(async (h) => {
     await h.mutateMeta((meta) => {
       meta.channels.whatsapp = makeWhatsAppConfig({ lastKnownLinkState: "linked" });
@@ -659,14 +656,8 @@ test("[state] whatsapp public state includes webhook URL when configured", async
     const meta = await h.getMeta();
     const state = await getPublicChannelState(makeRequest(), meta);
 
-    assert.equal(
-      state.whatsapp.webhookUrl,
-      "https://app.example.com/api/channels/whatsapp/webhook",
-    );
-    assert.equal(
-      state.whatsapp.connectability.webhookUrl,
-      "https://app.example.com/api/channels/whatsapp/webhook",
-    );
+    assert.equal(state.whatsapp.webhookUrl, null);
+    assert.equal(state.whatsapp.connectability.webhookUrl, null);
   });
 });
 
@@ -685,7 +676,7 @@ test("[state] setWhatsAppChannelConfig -> persists and clears whatsapp config", 
   });
 });
 
-test("[state] whatsapp enabled:false returns configured:false", async () => {
+test("[state] whatsapp enabled:false remains visible for cleanup", async () => {
   await withHarness(async (h) => {
     await h.mutateMeta((meta) => {
       meta.channels.whatsapp = makeWhatsAppConfig({ enabled: false });
@@ -693,7 +684,9 @@ test("[state] whatsapp enabled:false returns configured:false", async () => {
     const meta = await h.getMeta();
     const state = await getPublicChannelState(makeRequest(), meta);
 
-    assert.equal(state.whatsapp.configured, false, "enabled:false should mean configured:false");
+    assert.equal(state.whatsapp.configured, true);
+    assert.equal(state.whatsapp.status, "disconnected");
+    assert.equal(state.whatsapp.webhookUrl, null);
   });
 });
 

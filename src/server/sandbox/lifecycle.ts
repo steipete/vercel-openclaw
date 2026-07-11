@@ -45,7 +45,6 @@ import {
   OPENCLAW_OPERATOR_SCOPES,
   OPENCLAW_STATE_DIR,
   OPENCLAW_TELEGRAM_WEBHOOK_PORT,
-  toWhatsAppGatewayConfig,
   type GatewayConfigHashInput,
 } from "@/server/openclaw/config";
 import {
@@ -1285,7 +1284,6 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
     slackCredentials: slackConfig
       ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
       : undefined,
-    whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
     bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
 
@@ -1428,7 +1426,6 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
           signingSecret: meta.channels.slack.signingSecret,
         }
       : undefined,
-    whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
     bundleCapabilities: meta.bundleIdentity?.capabilities,
   };
   const expectedHash = computeGatewayConfigHash(configHashInput);
@@ -1464,7 +1461,6 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
     slackCredentials: slackConfig
       ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
       : undefined,
-    whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
     bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
 
@@ -1778,7 +1774,6 @@ export async function prepareRestoreTarget(input: {
       slackCredentials: slackConfig
         ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
         : undefined,
-      whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
     });
     actions.push({ id: "sync-static-assets", status: "completed", message: "runtime assets fresh" });
   } catch (err) {
@@ -1881,7 +1876,6 @@ export async function prepareRestoreTarget(input: {
           signingSecret: meta.channels.slack.signingSecret,
         }
       : undefined,
-    whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
     bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
   const desiredAssetSha256 = buildRestoreAssetManifest().sha256;
@@ -3444,7 +3438,6 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         telegramBotToken: latest.channels.telegram?.botToken,
         telegramWebhookSecret: latest.channels.telegram?.webhookSecret,
         slackCredentials: validatedSlackCreds ?? undefined,
-        whatsappConfig: toWhatsAppGatewayConfig(latest.channels.whatsapp),
         bundleCapabilities: latest.bundleIdentity?.capabilities,
       });
       const assetSyncMs = Date.now() - assetSyncStart;
@@ -3629,7 +3622,6 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       telegramBotToken: latest.channels.telegram?.botToken,
       telegramWebhookSecret: latest.channels.telegram?.webhookSecret,
       slackCredentials: slackCfg ?? undefined,
-      whatsappConfig: toWhatsAppGatewayConfig(latest.channels.whatsapp),
       progress,
     });
 
@@ -3762,7 +3754,6 @@ async function syncRestoreAssetsIfNeeded(
     telegramBotToken?: string;
     telegramWebhookSecret?: string;
     slackCredentials?: { botToken: string; signingSecret: string };
-    whatsappConfig?: import("@/server/openclaw/config").WhatsAppGatewayConfig;
     bundleCapabilities?: readonly string[];
   },
 ): Promise<{ skippedStaticAssetSync: boolean; assetSha256: string }> {
@@ -3785,7 +3776,6 @@ async function syncRestoreAssetsIfNeeded(
     telegramBotToken: options.telegramBotToken,
     telegramWebhookSecret: options.telegramWebhookSecret,
     slackCredentials: options.slackCredentials,
-    whatsappConfig: options.whatsappConfig,
     bundleCapabilities: options.bundleCapabilities,
   });
 

@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  computeGatewayConfigHash,
-  toWhatsAppGatewayConfig,
-} from "@/server/openclaw/config";
+import { computeGatewayConfigHash } from "@/server/openclaw/config";
 import { buildRestoreAssetManifest } from "@/server/openclaw/restore-assets";
 import {
   buildRestoreDecision,
@@ -13,37 +10,6 @@ import {
 } from "@/server/sandbox/restore-attestation";
 import type { RestoreTargetAttestation } from "@/shared/launch-verification";
 import { createDefaultMeta } from "@/shared/types";
-
-test("buildRestoreTargetAttestation includes whatsapp config in desiredDynamicConfigHash", () => {
-  const base = createDefaultMeta(Date.now(), "gw-token");
-  const whatsapp = {
-    enabled: true,
-    configuredAt: Date.now(),
-    pluginSpec: "@openclaw/whatsapp",
-    dmPolicy: "allowlist" as const,
-    allowFrom: ["15551234567"],
-    groupPolicy: "allowlist" as const,
-    groupAllowFrom: ["15557654321"],
-    groups: ["team-chat"],
-  };
-
-  const meta = {
-    ...base,
-    channels: {
-      ...base.channels,
-      whatsapp,
-    },
-  };
-
-  const attestation = buildRestoreTargetAttestation(meta);
-  const withWhatsapp = computeGatewayConfigHash({
-    whatsappConfig: toWhatsAppGatewayConfig(whatsapp),
-  });
-  const withoutWhatsapp = computeGatewayConfigHash({});
-
-  assert.equal(attestation.desiredDynamicConfigHash, withWhatsapp);
-  assert.notEqual(attestation.desiredDynamicConfigHash, withoutWhatsapp);
-});
 
 test("buildRestoreTargetAttestation separates runtime-fresh from snapshot-stale", () => {
   const base = createDefaultMeta(Date.now(), "gw-token");

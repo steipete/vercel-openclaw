@@ -276,6 +276,7 @@ export async function POST(request: Request): Promise<Response> {
       phase: "workflow-start-failed",
       terminal: false,
       retryable: true,
+      deliveryOutcome: "not-accepted",
       requestId: requestId ?? null,
       receivedAtMs,
       error,

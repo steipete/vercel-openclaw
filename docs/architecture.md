@@ -11,7 +11,7 @@ It handles:
 - proxying the OpenClaw UI at `/gateway`
 - injecting the gateway token into proxied HTML so WebSocket connections and auth work through the app
 - learning and enforcing egress firewall rules
-- receiving Slack, Telegram, WhatsApp (experimental), and Discord (experimental) webhooks and delivering them to OpenClaw
+- receiving Slack, Telegram, and Discord (experimental) webhooks and delivering them to OpenClaw; hosted WhatsApp fails closed because its former Meta webhook transport is incompatible with OpenClaw's linked-device runtime
 - exposing a hosted feature support matrix in `/api/status`, `/api/channels/summary`, and the admin UI
 
 It does not handle:
@@ -49,7 +49,7 @@ The network policy also handles **credential brokering**: AI Gateway tokens are 
 - **Sandbox lifecycle** — create, resume, stop, health checks (Sandbox v2 persistent auto-save)
 - **Proxy** — reverse proxy to the sandbox, HTML injection, waiting page
 - **Firewall** — domain learning from shell commands, policy enforcement
-- **Channels** — Slack, Telegram, WhatsApp (experimental), and Discord (experimental) webhook ingestion, boot-message flow, durable delivery via Workflow DevKit
+- **Channels** — Slack, Telegram, and Discord (experimental) webhook ingestion, boot-message flow, durable delivery via Workflow DevKit; explicit hosted WhatsApp unsupported state
 - **Deployment readiness** — preflight config checks, launch verification runtime checks, watchdog cron
 - **Hosted feature support** — static support matrix that keeps hosted claims distinct from upstream-only OpenClaw capabilities
 
@@ -58,4 +58,4 @@ The network policy also handles **credential brokering**: AI Gateway tokens are 
 - [Sandbox Lifecycle and Restore](lifecycle-and-restore.md) — how the sandbox moves through states and how persistent resume works
 - [Preflight and Launch Verification](preflight-and-launch-verification.md) — how the app proves it is correctly deployed and operational
 - [Hosted Feature Support](getting-started/hosted-feature-support.md) — which OpenClaw capabilities are supported, experimental, bundled-only, or upstream-only in the hosted path
-- [Channels and Webhooks](channels-and-webhooks.md) — Channel setup (Slack, Telegram, WhatsApp, Discord), readiness, and webhook behavior
+- [Channels and Webhooks](channels-and-webhooks.md) — supported channel setup, hosted WhatsApp limitations, readiness, and webhook behavior

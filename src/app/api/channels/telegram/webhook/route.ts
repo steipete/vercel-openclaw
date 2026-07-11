@@ -1,4 +1,3 @@
-import { after } from "next/server";
 import * as workflowApi from "workflow/api";
 
 import {
@@ -10,11 +9,20 @@ import { recordChannelDlqFailure } from "@/server/channels/dlq";
 import { refreshChannelFastPathGatewayToken } from "@/server/channels/fast-path-token";
 import { recordChannelLastForward } from "@/server/channels/last-forward";
 import {
+  isAdmittedTelegramDurableAcceptance,
+  isDefiniteNativePreAdmissionError,
+  OPENCLAW_DELIVERY_ACCEPTED_HEADER,
+  OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+  OPENCLAW_TELEGRAM_DURABLE_ACK_CAPABILITY,
+} from "@/server/channels/native-response-contract";
+import {
   classifyFastPathException,
   classifyFastPathHttpResult,
+  classifyFastPathPreDispatchException,
   type FastPathClassifierPolicy,
 } from "@/server/channels/core/fast-path-classifier";
 import {
+  FastPathHandledNoWorkflowReason,
   FastPathOutcomeKind,
   FastPathSkipReason,
   type FastPathOutcome,
@@ -32,6 +40,7 @@ import { deleteMessage, sendMessage } from "@/server/channels/telegram/bot-api";
 import { extractRequestId, logError, logInfo, logWarn } from "@/server/log";
 import { createOperationContext, withOperationContext } from "@/server/observability/operation-context";
 import { OPENCLAW_TELEGRAM_WEBHOOK_PORT } from "@/server/openclaw/config";
+import { hydrateVerifiedBundleIdentity } from "@/server/openclaw/bundle-identity";
 import { getSandboxDomain, markSandboxPortUrlStale, reconcileStaleRunningStatus } from "@/server/sandbox/lifecycle";
 
 // The fast path awaits the native handler's full turn (including long
@@ -44,7 +53,7 @@ import { getInitializedMeta, getStore } from "@/server/store/store";
 const TELEGRAM_FAST_PATH_POLICY: FastPathClassifierPolicy = {
   channel: "telegram",
   nativeResponsePolicy: "non-ok-starts-workflow",
-  classifySuspiciousEmpty200: true,
+  requireExplicitAcceptance: true,
   stalePortOnSandboxNotListening: OPENCLAW_TELEGRAM_WEBHOOK_PORT,
 };
 
@@ -67,6 +76,7 @@ type DiagnosticHeaders = {
   xPoweredBy?: string | null;
   via?: string | null;
   cacheControl?: string | null;
+  openclawDeliveryAccepted?: string | null;
 };
 
 type TelegramFastPathForwardResult = {
@@ -85,6 +95,7 @@ function pickDiagnosticHeaders(headers: Headers): DiagnosticHeaders {
     xPoweredBy: headers.get("x-powered-by"),
     via: headers.get("via"),
     cacheControl: headers.get("cache-control"),
+    openclawDeliveryAccepted: headers.get("x-openclaw-delivery-accepted"),
   };
 }
 
@@ -94,6 +105,8 @@ async function forwardTelegramFastPath(input: {
   headers: Record<string, string>;
   sandboxUrl: string;
   sandboxId: string | null;
+  durableAcceptanceAdmitted: boolean;
+  gatewayAdmissionRejectionAdmitted: boolean;
 }): Promise<TelegramFastPathForwardResult> {
   const startedAt = Date.now();
   const response = await fetch(input.url, {
@@ -115,6 +128,13 @@ async function forwardTelegramFastPath(input: {
       transport: "public",
       sandboxUrl: input.sandboxUrl,
       sandboxId: input.sandboxId,
+      explicitlyAccepted:
+        isAdmittedTelegramDurableAcceptance(
+          input.durableAcceptanceAdmitted,
+          response.headers.get(OPENCLAW_DELIVERY_ACCEPTED_HEADER),
+        ),
+      gatewayAdmissionRejectionAdmitted:
+        input.gatewayAdmissionRejectionAdmitted,
     }),
     url: input.url,
     body,
@@ -214,6 +234,43 @@ export async function POST(request: Request): Promise<Response> {
       bodyHead: rawBody.slice(0, 100),
     });
     return Response.json({ ok: true });
+  }
+
+  let verifiedBundleIdentity: Awaited<
+    ReturnType<typeof hydrateVerifiedBundleIdentity>
+  > = null;
+  try {
+    verifiedBundleIdentity = await hydrateVerifiedBundleIdentity(
+      meta.bundleIdentity,
+    );
+  } catch {
+    // Admission failure must not turn a valid platform webhook into a retry
+    // storm. The delivery remains acceptance-unknown unless the exact bundle
+    // identity and capability are both available.
+  }
+  const telegramDurableAcceptanceAdmitted =
+    verifiedBundleIdentity?.capabilities.includes(
+      OPENCLAW_TELEGRAM_DURABLE_ACK_CAPABILITY,
+    ) === true;
+  const gatewayAdmissionRejectionAdmitted =
+    verifiedBundleIdentity?.capabilities.includes(
+      OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+    ) === true;
+  if (!telegramDurableAcceptanceAdmitted) {
+    logWarn("telegram.delivery.bundle_capability_missing", {
+      capabilityId: OPENCLAW_TELEGRAM_DURABLE_ACK_CAPABILITY,
+      bundleIdentityMissing: meta.bundleIdentity === null,
+      bundleIdentityVerified: verifiedBundleIdentity !== null,
+      requestId,
+    });
+  }
+  if (!gatewayAdmissionRejectionAdmitted) {
+    logWarn("telegram.delivery.bundle_capability_missing", {
+      capabilityId: OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+      bundleIdentityMissing: meta.bundleIdentity === null,
+      bundleIdentityVerified: verifiedBundleIdentity !== null,
+      requestId,
+    });
   }
 
   // Return 200 only after the update is handled or successfully handed off.
@@ -323,6 +380,11 @@ export async function POST(request: Request): Promise<Response> {
     if (effectiveMeta.status === "running" && effectiveMeta.sandboxId) {
       let portUrlStaleMarked = false;
       let fastPathSandboxWebhookUrl: string | null = null;
+      let fastPathAttemptCount = 0;
+      let fastPathDispatchState:
+        | "not-started"
+        | "started"
+        | "response-received" = "not-started";
       const fastPathStartedAt = Date.now();
       const fastPathUpdateIdForRecord = extractUpdateId(payload);
       const fastPathDeliveryIdForRecord = fastPathUpdateIdForRecord
@@ -353,13 +415,19 @@ export async function POST(request: Request): Promise<Response> {
         if (fastPathUpdateId) {
           fastPathHeaders["x-openclaw-delivery-id"] = `telegram:${fastPathUpdateId}`;
         }
+        fastPathAttemptCount = 1;
+        fastPathDispatchState = "started";
         const firstForward = await forwardTelegramFastPath({
           url: forwardUrl,
           payload,
           headers: fastPathHeaders,
           sandboxUrl: sandboxWebhookUrl,
           sandboxId: effectiveMeta.sandboxId ?? null,
+          durableAcceptanceAdmitted:
+            telegramDurableAcceptanceAdmitted,
+          gatewayAdmissionRejectionAdmitted,
         });
+        fastPathDispatchState = "response-received";
         let forwardBody = firstForward.body;
         let forwardHeaders = firstForward.headers;
         let forwardDurationMs = firstForward.forwardDurationMs;
@@ -419,6 +487,42 @@ export async function POST(request: Request): Promise<Response> {
           }));
           return Response.json({ ok: true });
         }
+        if (
+          fastPathOutcome.kind === FastPathOutcomeKind.HandledNoWorkflow &&
+          fastPathOutcome.reason ===
+            FastPathHandledNoWorkflowReason.DeliveryAcceptanceUnknown
+        ) {
+          await recordChannelLastForward(
+            "telegram",
+            {
+              ok: false,
+              status: fastPathOutcome.status,
+              classification: fastPathOutcome.classification,
+              attempts: 1,
+              totalMs: fastPathDurationMs,
+              transport: fastPathOutcome.transport,
+              sandboxUrl: fastPathOutcome.sandboxUrl,
+              sandboxId: fastPathOutcome.sandboxId,
+              finalReasonHead: fastPathOutcome.bodyHead,
+              startedAt: fastPathStartedAt,
+              completedAt: Date.now(),
+              deliveryId: fastPathDeliveryIdForRecord,
+            },
+            { closedOutcome: "unknown" },
+          );
+          logWarn(
+            "channels.telegram_fast_path_acceptance_unknown",
+            withOperationContext(op, {
+              sandboxId: effectiveMeta.sandboxId,
+              forwardUrl,
+              status: fastPathOutcome.status,
+              durationMs: fastPathDurationMs,
+              responseHeaders: forwardHeaders,
+              action: "ack_without_blind_redrive",
+            }),
+          );
+          return Response.json({ ok: true });
+        }
         if (fastPathOutcome.kind !== FastPathOutcomeKind.FallbackToWorkflow) {
           const unexpectedStatus = "status" in fastPathOutcome ? fastPathOutcome.status : null;
           logWarn("channels.telegram_fast_path_unexpected_outcome", withOperationContext(op, {
@@ -449,7 +553,9 @@ export async function POST(request: Request): Promise<Response> {
         // errors (502/503/504, sandbox unreachable) from suspicious-empty-200
         // and other non-OK results for log triage.
         const telegramFallbackReason =
-          fastPathOutcome.reason === "suspicious-empty-200"
+          fastPathOutcome.classification === "gateway-unavailable"
+            ? "gateway_admission_closed"
+            : fastPathOutcome.reason === "suspicious-empty-200"
             ? "suspicious_empty_200"
             : fastPathOutcome.reason === "sandbox-not-listening" ||
                 fastPathOutcome.reason === "proxy-error"
@@ -522,15 +628,27 @@ export async function POST(request: Request): Promise<Response> {
                 attempt: 2,
                 receivedToRepairAttemptMs: Date.now() - receivedAtMs,
               }));
+              fastPathSandboxWebhookUrl = repairSandboxUrl;
+              fastPathAttemptCount = 2;
+              fastPathDispatchState = "started";
               const repairForward = await forwardTelegramFastPath({
                 url: repairForwardUrl,
                 payload,
                 headers: fastPathHeaders,
                 sandboxUrl: repairSandboxUrl,
                 sandboxId: effectiveMeta.sandboxId ?? null,
+                durableAcceptanceAdmitted:
+                  telegramDurableAcceptanceAdmitted,
+                gatewayAdmissionRejectionAdmitted,
               });
+              fastPathDispatchState = "response-received";
               const repairTotalMs = Date.now() - repairStartedAt;
               const repairOutcome = repairForward.outcome;
+              fastPathOutcome = repairOutcome;
+              forwardBody = repairForward.body;
+              forwardHeaders = repairForward.headers;
+              forwardDurationMs = repairForward.forwardDurationMs;
+              fastPathDurationMs = Date.now() - fastPathStartedAt;
               const repairStatus = "status" in repairOutcome ? repairOutcome.status : null;
               const repairClassification = "classification" in repairOutcome
                 ? repairOutcome.classification
@@ -582,6 +700,43 @@ export async function POST(request: Request): Promise<Response> {
                 }));
                 return Response.json({ ok: true });
               }
+              if (
+                repairOutcome.kind === FastPathOutcomeKind.HandledNoWorkflow &&
+                repairOutcome.reason ===
+                  FastPathHandledNoWorkflowReason.DeliveryAcceptanceUnknown
+              ) {
+                await recordChannelLastForward(
+                  "telegram",
+                  {
+                    ok: false,
+                    status: repairOutcome.status,
+                    classification: repairOutcome.classification,
+                    attempts: 2,
+                    totalMs: Date.now() - fastPathStartedAt,
+                    transport: repairOutcome.transport,
+                    sandboxUrl: repairOutcome.sandboxUrl,
+                    sandboxId: repairOutcome.sandboxId,
+                    finalReasonHead: repairOutcome.bodyHead,
+                    startedAt: fastPathStartedAt,
+                    completedAt: Date.now(),
+                    deliveryId: fastPathDeliveryIdForRecord,
+                  },
+                  { closedOutcome: "unknown" },
+                );
+                logWarn(
+                  "channels.telegram_fast_path_acceptance_unknown",
+                  withOperationContext(op, {
+                    sandboxId: effectiveMeta.sandboxId,
+                    forwardUrl: repairForwardUrl,
+                    status: repairOutcome.status,
+                    durationMs: Date.now() - fastPathStartedAt,
+                    responseHeaders: repairForward.headers,
+                    repairedStalePort: true,
+                    action: "ack_without_blind_redrive",
+                  }),
+                );
+                return Response.json({ ok: true });
+              }
               if (repairOutcome.kind === FastPathOutcomeKind.FallbackToWorkflow) {
                 await recordChannelLastForward("telegram", {
                   ok: false,
@@ -598,17 +753,15 @@ export async function POST(request: Request): Promise<Response> {
                   deliveryId: fastPathDeliveryIdForRecord,
                 });
               }
-              fastPathOutcome = repairOutcome;
-              forwardBody = repairForward.body;
-              forwardHeaders = repairForward.headers;
-              forwardDurationMs = repairForward.forwardDurationMs;
-              fastPathDurationMs = Date.now() - fastPathStartedAt;
             }
           } catch (err) {
             logWarn("channels.telegram_fast_path_port_url_refresh_failed", withOperationContext(op, {
               error: err instanceof Error ? err.message : String(err),
               sandboxId: effectiveMeta.sandboxId,
             }));
+            if (fastPathDispatchState === "started") {
+              throw err;
+            }
           }
         }
         if (fastPathOutcome.kind === FastPathOutcomeKind.FallbackToWorkflow && fastPathOutcome.shouldReconcile) {
@@ -622,60 +775,89 @@ export async function POST(request: Request): Promise<Response> {
           }));
         }
       } catch (error) {
-        // Network-level failure or AbortSignal timeout — sandbox may or
-        // may not have received the payload. Reconcile stale status and
-        // fall through to the workflow wake path so the message is not
-        // lost. TimeoutError indicates the TCP connection wedged for
-        // longer than the fast-path budget.
         const isAbort =
           error instanceof Error && error.name === "TimeoutError";
         const errorMessage =
           error instanceof Error ? error.message : String(error);
-        fastPathOutcome = classifyFastPathException({
-          policy: TELEGRAM_FAST_PATH_POLICY,
-          error,
-          durationMs: Date.now() - fastPathStartedAt,
-          transport: "public",
-          sandboxUrl: fastPathSandboxWebhookUrl,
-          sandboxId: effectiveMeta.sandboxId ?? null,
-        });
-        logWarn("channels.telegram_fast_path_failed", withOperationContext(op, {
+        const definiteTransportRejection =
+          fastPathDispatchState === "started" &&
+          isDefiniteNativePreAdmissionError(error);
+        if (
+          fastPathDispatchState === "started" &&
+          !definiteTransportRejection
+        ) {
+          // Network-level failure or timeout can happen after request bytes
+          // leave this process. Close visibility as unknown without redrive.
+          fastPathOutcome = classifyFastPathException({
+            policy: TELEGRAM_FAST_PATH_POLICY,
+            error,
+            durationMs: Date.now() - fastPathStartedAt,
+            transport: "public",
+            sandboxUrl: fastPathSandboxWebhookUrl,
+            sandboxId: effectiveMeta.sandboxId ?? null,
+          });
+          logWarn("channels.telegram_fast_path_failed", withOperationContext(op, {
+            error: errorMessage,
+            errorName: error instanceof Error ? error.name : undefined,
+            sandboxId: effectiveMeta.sandboxId,
+            action: "ack_without_blind_redrive",
+            reason: fastPathOutcome.reason,
+            fastPathKind: fastPathOutcome.kind,
+            classification: fastPathOutcome.classification,
+            indeterminateDelivery: true,
+            fastPathTimeoutMs: isAbort
+              ? TELEGRAM_FAST_PATH_FORWARD_TIMEOUT_MS
+              : null,
+          }));
+          await recordChannelLastForward(
+            "telegram",
+            {
+              ok: false,
+              status: fastPathOutcome.status,
+              classification: fastPathOutcome.classification,
+              attempts: Math.max(1, fastPathAttemptCount),
+              totalMs: fastPathOutcome.durationMs,
+              transport: fastPathOutcome.transport,
+              sandboxUrl: fastPathOutcome.sandboxUrl,
+              sandboxId: fastPathOutcome.sandboxId,
+              finalReasonHead: fastPathOutcome.bodyHead,
+              startedAt: fastPathStartedAt,
+              completedAt: Date.now(),
+              deliveryId: fastPathDeliveryIdForRecord,
+            },
+            { closedOutcome: "unknown" },
+          );
+          return Response.json({ ok: true });
+        }
+
+        if (
+          fastPathDispatchState === "not-started" ||
+          definiteTransportRejection
+        ) {
+          fastPathOutcome = classifyFastPathPreDispatchException({
+            policy: TELEGRAM_FAST_PATH_POLICY,
+            error,
+            durationMs: Date.now() - fastPathStartedAt,
+            transport: null,
+            sandboxUrl: fastPathSandboxWebhookUrl,
+            sandboxId: effectiveMeta.sandboxId ?? null,
+          });
+        }
+        logWarn("channels.telegram_fast_path_setup_failed", withOperationContext(op, {
           error: errorMessage,
           errorName: error instanceof Error ? error.name : undefined,
           sandboxId: effectiveMeta.sandboxId,
-          action: "reconcile_and_wake",
-          reason: fastPathOutcome.reason,
-          fastPathKind: fastPathOutcome.kind,
-          classification: fastPathOutcome.classification,
-          indeterminateDelivery: fastPathOutcome.indeterminateDelivery === true,
-          fastPathTimeoutMs: isAbort
-            ? TELEGRAM_FAST_PATH_FORWARD_TIMEOUT_MS
-            : null,
+          action: "start_drain_channel_workflow",
+          dispatchState: fastPathDispatchState,
+          reason:
+            fastPathOutcome && "reason" in fastPathOutcome
+              ? fastPathOutcome.reason
+              : null,
+          classification:
+            fastPathOutcome && "classification" in fastPathOutcome
+              ? fastPathOutcome.classification
+              : null,
         }));
-        await recordChannelLastForward("telegram", {
-          ok: false,
-          status: fastPathOutcome.status,
-          classification: fastPathOutcome.classification,
-          attempts: 1,
-          totalMs: fastPathOutcome.durationMs,
-          transport: fastPathOutcome.transport,
-          sandboxUrl: fastPathOutcome.sandboxUrl,
-          sandboxId: fastPathOutcome.sandboxId,
-          finalReasonHead: fastPathOutcome.bodyHead,
-          startedAt: fastPathStartedAt,
-          completedAt: Date.now(),
-          deliveryId: fastPathDeliveryIdForRecord,
-        });
-        const staleMeta = effectiveMeta;
-        effectiveMeta = await reconcileStaleRunningStatus();
-        logInfo("channels.telegram_fast_path_reconciled", withOperationContext(op, {
-          previousStatus: staleMeta.status,
-          previousSandboxId: staleMeta.sandboxId,
-          reconciledStatus: effectiveMeta.status,
-          reconciledSandboxId: effectiveMeta.sandboxId,
-        }));
-        // suppress unused-var lint for sandbox URL when fetch never returned
-        void fastPathSandboxWebhookUrl;
       }
     } else {
       fastPathOutcome = {
@@ -821,7 +1003,13 @@ export async function POST(request: Request): Promise<Response> {
           requestId: requestId ?? null,
           bootMessageId,
           receivedAtMs,
-          workflowHandoff: { fallbackTelegramConfig: config },
+          workflowHandoff: {
+            fallbackTelegramConfig: config,
+            revalidateSandboxBeforeForward:
+              routePlan.fastPath?.kind ===
+                FastPathOutcomeKind.FallbackToWorkflow &&
+              routePlan.fastPath.reason === "gateway-admission-closed",
+          },
         },
       ]);
       logInfo("channels.telegram_workflow_started", withOperationContext(op, {
@@ -897,6 +1085,7 @@ export async function POST(request: Request): Promise<Response> {
         phase: "workflow-start-failed",
         terminal: false,
         retryable: true,
+        deliveryOutcome: "not-accepted",
         requestId: requestId ?? null,
         receivedAtMs,
         error,

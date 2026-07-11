@@ -58,7 +58,7 @@ The dashboard authenticates before proxying HTML, manages the sandbox lifecycle,
 
 ```mermaid
 flowchart LR
-  Platform[Slack/Telegram/Discord/WhatsApp] --> Webhook[Dashboard webhook route]
+  Platform[Slack/Telegram/Discord] --> Webhook[Dashboard webhook route]
   Webhook --> FastPath{Sandbox running?}
   FastPath -->|yes| Native[Native OpenClaw handler]
   FastPath -->|no| Workflow[Vercel Workflow wake path]
@@ -77,6 +77,6 @@ For stuck delivery, start from live evidence: `GET /api/admin/why-not-ready`, `G
 
 - A deployed dashboard URL does not prove the sandbox can boot or complete chat.
 - Preflight passing does not prove channel-ready delivery.
-- Destructive launch verification proves runtime channel readiness, not external platform delivery. A real Slack, Telegram, Discord, or WhatsApp test message is still required after channel setup.
+- Destructive launch verification proves runtime channel readiness, not external platform delivery. A real Slack, Telegram, or Discord test message is still required after channel setup.
 - `lastForward.ok:true` proves native acceptance, not necessarily a human-visible reply.
 - Passing CI does not prove a protected deployment can receive external webhooks.

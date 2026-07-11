@@ -1,5 +1,6 @@
 import { getAuthMode } from "@/server/env";
 import { getProtectionBypassSecret } from "@/server/public-url";
+import { HOSTED_DELIVERY_CHANNELS_LABEL } from "@/shared/channels";
 
 export type WebhookBypassRequirementReason =
   | "admin-secret"
@@ -25,8 +26,7 @@ export function getWebhookBypassRequirement(opts?: {
   // to webhook URLs.
   //
   // sign-in-with-vercel implies Deployment Protection is likely active,
-  // so the bypass is recommended (warn) to let Slack/Telegram/Discord/
-  // WhatsApp webhooks through.
+  // so the bypass is recommended (warn) for hosted channel webhooks.
   //
   // When the runtime self-probe detects protection is actually active
   // (regardless of auth mode), the bypass is also recommended. This
@@ -60,7 +60,7 @@ export function getWebhookBypassStatusMessage(
   }
 
   if (input.protectionDetected) {
-    return "Deployment Protection is active but bypass is not configured. Channel webhooks (Slack, Telegram, WhatsApp, Discord) will be blocked.";
+    return `Deployment Protection is active but bypass is not configured. Channel webhooks (${HOSTED_DELIVERY_CHANNELS_LABEL}) will be blocked.`;
   }
 
   return "Protection bypass is not configured. That is fine only when Deployment Protection is disabled; otherwise third-party webhooks may never reach the app.";

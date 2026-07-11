@@ -2,33 +2,35 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import type { RequestJson, RunAction, StatusPayload } from "@/components/admin-types";
+import type { RunAction, StatusPayload } from "@/components/admin-types";
 import {
   DEFAULT_STATUS_LIFECYCLE,
   DEFAULT_STATUS_RESTORE_TARGET,
 } from "@/components/status-payload-defaults";
 import type { ChannelConnectability } from "@/shared/channel-connectability";
 
-import {
-  getWhatsAppWebhookUrl,
-  WhatsAppPanel,
-} from "./whatsapp-panel";
+import { WhatsAppPanel } from "./whatsapp-panel";
 
-function makeConnectability(
-  status: ChannelConnectability["status"] = "warn",
-): ChannelConnectability {
+function makeConnectability(): ChannelConnectability {
   return {
     channel: "whatsapp",
-    mode: "webhook-proxied",
-    canConnect: true,
-    status,
-    webhookUrl: "https://openclaw.example/api/channels/whatsapp/webhook",
-    issues: [],
+    mode: "unsupported",
+    canConnect: false,
+    status: "fail",
+    webhookUrl: null,
+    issues: [
+      {
+        id: "hosted-transport-unavailable",
+        status: "fail",
+        message: "Hosted WhatsApp is unavailable.",
+        remediation: "Use local OpenClaw.",
+        env: [],
+      },
+    ],
   };
 }
 
 const RUN_ACTION: RunAction = async () => true;
-const REQUEST_JSON: RequestJson = async () => ({ ok: true, data: null, meta: { requestId: "test", action: "test", label: "test", status: 200, refreshed: false } });
 
 function makeStatus(
   whatsappOverrides: Partial<StatusPayload["channels"]["whatsapp"]> = {},
@@ -75,7 +77,7 @@ function makeStatus(
         lastError: null,
         connectability: {
           channel: "slack",
-          mode: "webhook-proxied",
+          mode: "unsupported",
           canConnect: true,
           status: "pass",
           webhookUrl: "",
@@ -103,7 +105,7 @@ function makeStatus(
         commandSyncError: null,
         connectability: {
           channel: "telegram",
-          mode: "webhook-proxied",
+          mode: "unsupported",
           canConnect: true,
           status: "pass",
           webhookUrl: null,
@@ -132,7 +134,7 @@ function makeStatus(
         isPublicUrl: false,
         connectability: {
           channel: "discord",
-          mode: "webhook-proxied",
+          mode: "unsupported",
           canConnect: true,
           status: "pass",
           webhookUrl: "",
@@ -141,7 +143,7 @@ function makeStatus(
       },
       whatsapp: {
         configured: false,
-        mode: "webhook-proxied",
+        mode: "unsupported",
         webhookUrl: null,
         status: "unconfigured",
         configuredAt: null,
@@ -168,68 +170,21 @@ function renderPanel(status: StatusPayload): string {
       status={status}
       busy={false}
       runAction={RUN_ACTION}
-      requestJson={REQUEST_JSON}
     />,
   );
 }
 
-test("getWhatsAppWebhookUrl builds the verification endpoint from an origin", () => {
-  assert.equal(
-    getWhatsAppWebhookUrl("https://openclaw.example"),
-    "https://openclaw.example/api/channels/whatsapp/webhook",
-  );
-  assert.equal(getWhatsAppWebhookUrl(null), null);
-});
-
-test("WhatsAppPanel renders the business credential setup flow", () => {
+test("WhatsAppPanel renders the hosted transport as unavailable", () => {
   const html = renderPanel(makeStatus());
 
-  assert.ok(html.includes("Connect WhatsApp"));
-  assert.ok(html.includes("Phone Number ID"));
-  assert.ok(html.includes("Access Token"));
-  assert.ok(html.includes("Verify Token"));
-  assert.ok(html.includes("App Secret"));
-  assert.ok(html.includes("Business Account ID"));
-  assert.ok(
-    html.includes(
-      "Resolve the deployment blockers above before saving WhatsApp credentials.",
-    ) === false,
-  );
+  assert.ok(html.includes("WhatsApp (unavailable)"));
+  assert.ok(html.includes("Hosted transport unavailable"));
+  assert.ok(html.includes("Meta Cloud API webhooks do not match"));
+  assert.equal(html.includes("Connect WhatsApp"), false);
+  assert.equal(html.includes("Phone Number ID"), false);
 });
 
-/* ── Type contract: failure stubs satisfy RunAction and RequestJson ── */
-
-const RUN_ACTION_FAILURE: RunAction = async () => false;
-const REQUEST_JSON_FAILURE: RequestJson = async () => ({
-  ok: false,
-  error: "HTTP 500",
-  meta: { requestId: "test", action: "test", label: "test", status: 500, code: "http-error" as const, retryable: true },
-});
-
-test("WhatsAppPanel accepts failure-shaped RunAction and RequestJson stubs", () => {
-  const html = renderToStaticMarkup(
-    <WhatsAppPanel
-      status={makeStatus({
-        configured: true,
-        webhookUrl: "https://openclaw.example/api/channels/whatsapp/webhook",
-        status: "linked",
-        displayName: "Support",
-        connectability: {
-          ...makeConnectability(),
-          status: "pass",
-        },
-      })}
-      busy={false}
-      runAction={RUN_ACTION_FAILURE}
-      requestJson={REQUEST_JSON_FAILURE}
-    />,
-  );
-
-  assert.ok(html.includes("Linked"), "renders linked state with failure stubs");
-  assert.ok(html.includes("Disconnect"), "disconnect button present with failure stubs");
-});
-
-test("WhatsAppPanel renders linked details for configured accounts", () => {
+test("WhatsAppPanel exposes only cleanup for legacy linked credentials", () => {
   const html = renderPanel(
     makeStatus({
       configured: true,
@@ -237,40 +192,16 @@ test("WhatsAppPanel renders linked details for configured accounts", () => {
       status: "linked",
       displayName: "Support Inbox",
       linkedPhone: "+1 555 010 1000",
-      connectability: {
-        ...makeConnectability(),
-        issues: [],
-        status: "pass",
-      },
+      lastError: "stale Meta delivery error",
+      connectability: makeConnectability(),
     }),
   );
 
-  assert.ok(html.includes("Linked · Support Inbox · +1 555 010 1000"));
-  assert.ok(html.includes("Business account"));
-  assert.ok(html.includes("Webhook URL"));
-  assert.ok(html.includes("linked"));
-  assert.ok(html.includes("https://openclaw.example/api/channels/whatsapp/webhook"));
-  assert.ok(html.includes("Update credentials"));
-  assert.ok(html.includes("Disconnect"));
-});
-
-test("WhatsAppPanel does not show non-linked sessions as connected", () => {
-  const html = renderPanel(
-    makeStatus({
-      configured: true,
-      webhookUrl: "https://openclaw.example/api/channels/whatsapp/webhook",
-      status: "needs-login",
-      displayName: "Support Inbox",
-      lastError: "scan QR to continue",
-      connectability: {
-        ...makeConnectability(),
-        issues: [],
-        status: "pass",
-      },
-    }),
-  );
-
-  assert.ok(html.includes("needs login · Support Inbox"));
-  assert.ok(html.includes("needs login"));
-  assert.equal(html.includes("Connected · Support Inbox"), false);
+  assert.ok(html.includes("Legacy Meta credentials are still saved"));
+  assert.ok(html.includes("Remove saved credentials"));
+  assert.equal(html.includes("Business account"), false);
+  assert.equal(html.includes("Webhook URL"), false);
+  assert.equal(html.includes("Update credentials"), false);
+  assert.equal(html.includes("Linked ·"), false);
+  assert.equal(html.includes("stale Meta delivery error"), false);
 });

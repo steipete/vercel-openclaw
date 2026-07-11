@@ -2,7 +2,7 @@
 
 ## What this doc covers
 
-This guide explains how to connect Slack, Telegram, WhatsApp (experimental), and Discord (experimental) to your OpenClaw deployment. It covers what needs to be true before you connect a channel, how readiness is determined, how each platform behaves differently, and what to do when things go wrong.
+This guide explains how to connect Slack, Telegram, and Discord (experimental) to your OpenClaw deployment. Hosted WhatsApp is disabled because the wrapper's former Meta webhook design does not match OpenClaw's linked-device transport.
 
 Channels are a first-class part of the product. They depend on durable state (Redis), a working sandbox lifecycle, and a verified deployment. This guide walks through the full path from "deployment exists" to "channel is safely connected and working."
 
@@ -69,7 +69,7 @@ Channel save and channel readiness are separate. A channel can be connectable be
 | Slack | supported | Credential storage, OAuth/manual setup, `/api/channels/slack/webhook`, wake forwarding, `lastForward`, readiness summary. | Route ready, native `/slack/events` accepted, and user-visible reply observation. |
 | Telegram | supported | Bot token storage, webhook secret, `/api/channels/telegram/webhook`, port 8787 native forwarding, wake forwarding, `lastForward`, readiness summary. | Webhook registered, native listener ready, native forward accepted, and user-visible reply observation. |
 | Discord | experimental | Token/public-key storage, interactions endpoint setup, `/ask` registration, `/api/channels/discord/webhook`, workflow forwarding, readiness summary. | Endpoint configured, command registered, native accepted, and final reply visibility verified through the real platform. |
-| WhatsApp | experimental | Meta credential storage, verification route, `/api/channels/whatsapp/webhook`, link-state projection, native forwarding, readiness summary. | Meta webhook verified, session linked, native accepted, and real user-visible reply observed. |
+| WhatsApp | not supported | Setup and webhook routes fail closed; legacy credentials are not projected into the sandbox. | Use local/upstream OpenClaw linked-device WhatsApp support. |
 | Other upstream channels | upstream-only | None in this wrapper. | Add credential storage, platform verification, webhook/native route, wake forwarding, `lastForward`, readiness summary, and real reply proof before claiming hosted support. |
 
 ## Slack
@@ -127,32 +127,15 @@ When a Telegram update arrives at the webhook:
 
 1. The route validates the webhook secret header.
 2. If the sandbox is running, the raw update is forwarded to OpenClaw's native Telegram handler on port 8787 inside the sandbox (the fast path). This preserves full native Telegram features — slash commands, media, inline keyboards, etc.
-3. If the sandbox is stopped, the route sends a boot message to the user, then starts a durable Workflow that resumes the sandbox, forwards the raw update to the native Telegram handler, and lets that handler own the reply behavior.
+3. OpenClaw confirms durable native acceptance with `x-openclaw-delivery-accepted: durable`. The wrapper trusts that marker only when the installed, manifest-verified bundle identity declares `telegram-durable-ack-v1`. A missing identity, missing capability, or unmarked `2xx` is recorded as `visibility-unknown` and is not blindly replayed.
+4. If the sandbox is stopped, the route sends a boot message to the user, then starts a durable Workflow that resumes the sandbox, forwards the raw update to the native Telegram handler, and lets that handler own the reply behavior.
+5. A suspension-admission `503` with OpenClaw code `gateway_unavailable` is treated as a pre-admission rejection only when the verified bundle declares `gateway-suspend-v1`; otherwise the outcome remains unknown and is not replayed.
 
 ## WhatsApp
 
-### Connecting WhatsApp
+Hosted WhatsApp setup and webhook delivery are disabled. The old wrapper accepted Meta Cloud API credentials and forwarded Meta payloads to `/whatsapp-webhook`, but OpenClaw's bundled WhatsApp channel owns a Baileys linked-device session instead. Those are different transports and cannot be joined by forwarding the raw Meta payload. Existing legacy credentials may be removed from the admin panel; new saves return `CHANNEL_CONNECT_BLOCKED`, and the webhook route returns `410 HOSTED_WHATSAPP_TRANSPORT_UNAVAILABLE`.
 
-Configure WhatsApp Business credentials from the admin panel. The app stores the phone number ID, access token, verify token, app secret, and optional business account ID, then exposes `/api/channels/whatsapp/webhook` for Meta verification and message delivery.
-
-WhatsApp operator state keeps setup and delivery evidence separate:
-
-- `linkState` is the gateway-side WhatsApp session state, such as `linked`, `needs-login`, or `error`.
-- `lastForward` is the latest native `/whatsapp-webhook` forward result.
-- `lastDeliveryState` is the delivery state-machine projection for the latest known WhatsApp event.
-- `userVisibleReply` is independent evidence that a platform-visible reply was observed.
-
-A linked WhatsApp session means credentials and session state look usable. It is not proof that the latest message reached the native handler or that a user saw a reply. After connecting WhatsApp, send a real WhatsApp message and inspect `/api/channels/summary` plus `channels.whatsapp_*`, `channels.forward_attempt`, and `channels.forward_outcome` logs before treating delivery as proven.
-
-### How WhatsApp messages flow
-
-When Meta calls the webhook:
-
-1. The route handles GET verification separately from POST message delivery.
-2. POST delivery validates `x-hub-signature-256` against the raw body and skips non-message callbacks without starting delivery.
-3. If the sandbox is running, the validated raw payload is forwarded to OpenClaw's native `/whatsapp-webhook` handler on port 3000.
-4. If the sandbox is stopped, the route may send a boot message, then starts the shared Workflow wake path with the original raw body and forward headers.
-5. The native WhatsApp adapter owns final message processing and reply behavior.
+Use local/upstream OpenClaw for linked-device WhatsApp until a single hosted transport, credential model, lifecycle owner, and real end-to-end proof exist.
 
 ## Discord
 
@@ -191,7 +174,7 @@ After endpoint and command setup, invite the bot, run `/ask` in Discord, return 
 
 ## Protected deployments
 
-All channels (Slack, Telegram, WhatsApp, Discord) use bypass-capable delivery URLs on protected deployments when `VERCEL_AUTOMATION_BYPASS_SECRET` is configured. The app auto-detects active Deployment Protection at runtime and hard-blocks channel connections when protection is on but bypass is not configured.
+Supported webhook channels (Slack, Telegram, and Discord) use bypass-capable delivery URLs on protected deployments when `VERCEL_AUTOMATION_BYPASS_SECRET` is configured. The app auto-detects active Deployment Protection at runtime and hard-blocks channel connections when protection is on but bypass is not configured.
 
 Admin-visible URLs — in the admin panel, preflight payload, status responses, and docs examples — must stay display-safe and never expose the bypass secret. The app enforces this by using `buildPublicDisplayUrl()` for all operator-visible surfaces and reserving `buildPublicUrl()` for outbound delivery only.
 
@@ -202,21 +185,22 @@ When the sandbox is running and a channel message arrives, Slack and Telegram ta
 - **Slack** forwards the validated payload directly to `/slack/events` on the gateway (port 3000).
 - **Telegram** forwards the raw update directly to the native Telegram handler (port 8787).
 
+The wrapper treats `gateway_unavailable` as a definite pre-admission rejection only when the verified bundle declares `gateway-suspend-v1`; an unverified response remains delivery-unknown and is not replayed.
+
 No Workflow is started. No boot message is sent. The response comes back as quickly as the gateway can process it.
 
 ## What happens when the sandbox is stopped
 
 When the sandbox is stopped and a channel message arrives, the webhook route starts a shared durable delivery path powered by Vercel Workflow:
 
-1. Slack, Telegram, and WhatsApp may send a short boot message so the user gets immediate feedback.
+1. Slack and Telegram may send a short boot message so the user gets immediate feedback.
 2. The Workflow resumes or creates the sandbox and waits for the relevant handler to become reachable.
 3. The original webhook payload is forwarded to OpenClaw's native channel handler:
    - Slack: `/slack/events` on port 3000.
    - Telegram: `/telegram-webhook` on port 8787.
-   - WhatsApp: `/whatsapp-webhook` on port 3000.
    - Discord: `/discord-webhook` on port 3000.
 4. The native handler owns channel-specific processing and reply behavior.
-5. Boot messages are updated or cleared after the native handler accepts the payload.
+5. Native acceptance does not prove a visible reply. The wake placeholder is cleared after native acceptance, while reply visibility remains a separate summary signal. Terminal failure or uncertain acceptance updates the notice instead.
 
 The Workflow-based path is a native-forward wake path, not a generic `POST /v1/chat/completions` fallback.
 
@@ -234,7 +218,7 @@ This means config looks good, but the current deployment has not yet proven the 
 
 ### Channel webhooks fail on a protected deployment
 
-Channel webhooks are hitting Vercel's Deployment Protection. Enable Protection Bypass for Automation in your Vercel project settings and set `VERCEL_AUTOMATION_BYPASS_SECRET`. All channels (Slack, Telegram, WhatsApp, Discord) include the bypass parameter in their delivery URLs when configured. The app detects active protection at runtime — if the admin panel shows a "Deployment Protection is blocking webhook delivery" banner, follow the instructions there.
+Channel webhooks are hitting Vercel's Deployment Protection. Enable Protection Bypass for Automation in your Vercel project settings and set `VERCEL_AUTOMATION_BYPASS_SECRET`. Supported hosted channels (Slack, Telegram, Discord) include the bypass parameter in their delivery URLs when configured. The app detects active protection at runtime — if the admin panel shows a "Deployment Protection is blocking webhook delivery" banner, follow the instructions there.
 
 ### Launch verification phases look mostly healthy but overall result is false
 

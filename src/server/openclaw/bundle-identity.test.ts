@@ -5,10 +5,8 @@ import test from "node:test";
 import {
   _resetBundleIdentityForTesting,
   admitConfiguredOpenClawBundle,
-  getVerifiedBundleIdentity,
-  hasVerifiedBundleCapability,
+  bundleIdentityFromAdmission,
   hydrateVerifiedBundleIdentity,
-  markVerifiedBundleIdentity,
   REQUIRED_OPENCLAW_BUNDLE_ASSETS,
 } from "@/server/openclaw/bundle-identity";
 
@@ -441,11 +439,9 @@ test("hydrates only the persisted identity admitted by current configuration", a
     const fetchImpl = fixtureFetch();
     const admission = await admitConfiguredOpenClawBundle(fetchImpl);
     assert.ok(admission);
-    assert.equal(getVerifiedBundleIdentity(), null);
-    assert.equal(hasVerifiedBundleCapability("gateway-suspend-v1"), false);
-
-    markVerifiedBundleIdentity(admission);
-    assert.equal(hasVerifiedBundleCapability("gateway-suspend-v1"), true);
+    const copiedIdentity = bundleIdentityFromAdmission(admission);
+    assert.deepEqual(copiedIdentity, admission.identity);
+    assert.notEqual(copiedIdentity, admission.identity);
     assert.deepEqual(
       await hydrateVerifiedBundleIdentity(admission.identity, fetchImpl),
       admission.identity,

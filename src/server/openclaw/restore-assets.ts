@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 
 import { getConfiguredBundleFingerprint } from "@/server/openclaw/bundle-identity";
 
-import type { WhatsAppGatewayConfig } from "@/server/openclaw/config";
 import {
   OPENCLAW_AI_GATEWAY_API_KEY_PATH,
   OPENCLAW_GATEWAY_TOKEN_PATH,
@@ -143,7 +142,6 @@ export function buildDynamicRestoreFiles(options: {
   telegramBotToken?: string;
   telegramWebhookSecret?: string;
   slackCredentials?: { botToken: string; signingSecret: string };
-  whatsappConfig?: WhatsAppGatewayConfig;
   bundleCapabilities?: readonly string[];
 }): { path: string; content: Buffer }[] {
   const files: { path: string; content: Buffer }[] = [
@@ -156,7 +154,6 @@ export function buildDynamicRestoreFiles(options: {
           options.telegramBotToken,
           options.slackCredentials,
           options.telegramWebhookSecret,
-          options.whatsappConfig,
           options.bundleCapabilities,
         ),
       ),
@@ -226,7 +223,6 @@ export type BootstrapFilesOptions = {
   telegramBotToken?: string;
   telegramWebhookSecret?: string;
   slackCredentials?: { botToken: string; signingSecret: string };
-  whatsappConfig?: WhatsAppGatewayConfig;
   bundleCapabilities?: readonly string[];
 };
 
@@ -252,7 +248,6 @@ export function buildBootstrapFiles(
       telegramBotToken: options.telegramBotToken,
       telegramWebhookSecret: options.telegramWebhookSecret,
       slackCredentials: options.slackCredentials,
-      whatsappConfig: options.whatsappConfig,
       bundleCapabilities: options.bundleCapabilities,
     }),
     {

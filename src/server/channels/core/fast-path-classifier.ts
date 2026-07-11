@@ -7,6 +7,7 @@ import {
   type FastPathOutcome,
   type FastPathTransport,
 } from "@/server/channels/core/outcomes";
+import { isAdmittedGatewayAdmissionUnavailableResponse } from "@/server/channels/native-response-contract";
 
 export type NativeResponsePolicy =
   | "non-ok-starts-workflow"
@@ -16,6 +17,7 @@ export type FastPathClassifierPolicy = {
   channel: ChannelName;
   nativeResponsePolicy: NativeResponsePolicy;
   classifySuspiciousEmpty200?: boolean;
+  requireExplicitAcceptance?: boolean;
   stalePortOnSandboxNotListening?: number | null;
 };
 
@@ -29,6 +31,8 @@ export type ClassifyFastPathHttpResultInput = {
   transport: FastPathTransport;
   sandboxUrl: string | null;
   sandboxId: string | null;
+  explicitlyAccepted?: boolean;
+  gatewayAdmissionRejectionAdmitted?: boolean;
 };
 
 export type ClassifyFastPathExceptionInput = {
@@ -51,6 +55,24 @@ export function classifyFastPathHttpResult(
     input.status === 200 &&
     input.durationMs < SUSPICIOUS_EMPTY_200_MS &&
     input.bodyLength === 0;
+
+  if (
+    input.ok &&
+    input.policy.requireExplicitAcceptance === true &&
+    input.explicitlyAccepted !== true
+  ) {
+    return {
+      kind: FastPathOutcomeKind.HandledNoWorkflow,
+      reason: FastPathHandledNoWorkflowReason.DeliveryAcceptanceUnknown,
+      classification: ForwardClassification.AcceptanceUnknown,
+      status: input.status,
+      transport: input.transport,
+      sandboxUrl: input.sandboxUrl,
+      sandboxId: input.sandboxId,
+      bodyHead,
+      durationMs: input.durationMs,
+    };
+  }
 
   if (input.ok && !suspiciousEmpty200) {
     return {
@@ -80,16 +102,44 @@ export function classifyFastPathHttpResult(
     };
   }
 
+  const gatewayAdmissionClosed = isAdmittedGatewayAdmissionUnavailableResponse(
+    input.gatewayAdmissionRejectionAdmitted === true,
+    input.status,
+    bodyHead,
+  );
   const sandboxNotListening = /sandbox is not listening/i.test(bodyHead);
   const gatewayError = input.status === 502 || input.status === 503 || input.status === 504;
-  const handlerNotReady = input.status === 404;
-  const classification = sandboxNotListening
+  const handlerNotReady =
+    input.status === 404 ||
+    (input.policy.channel === "telegram" && input.status === 401);
+  const classification = gatewayAdmissionClosed
+    ? ForwardClassification.GatewayUnavailable
+    : sandboxNotListening
     ? ForwardClassification.SandboxNotListening
     : gatewayError
       ? ForwardClassification.ProxyError
       : handlerNotReady
         ? ForwardClassification.HandlerNotReady
-        : ForwardClassification.HandlerError;
+              : ForwardClassification.HandlerError;
+
+  if (
+    input.policy.requireExplicitAcceptance === true &&
+    !gatewayAdmissionClosed &&
+    !sandboxNotListening &&
+    !handlerNotReady
+  ) {
+    return {
+      kind: FastPathOutcomeKind.HandledNoWorkflow,
+      reason: FastPathHandledNoWorkflowReason.DeliveryAcceptanceUnknown,
+      classification: ForwardClassification.AcceptanceUnknown,
+      status: input.status,
+      transport: input.transport,
+      sandboxUrl: input.sandboxUrl,
+      sandboxId: input.sandboxId,
+      bodyHead,
+      durationMs: input.durationMs,
+    };
+  }
 
   if (
     input.policy.nativeResponsePolicy === "gateway-errors-start-workflow-non-gateway-handled" &&
@@ -112,7 +162,9 @@ export function classifyFastPathHttpResult(
 
   return {
     kind: FastPathOutcomeKind.FallbackToWorkflow,
-    reason: sandboxNotListening
+    reason: gatewayAdmissionClosed
+      ? FastPathFallbackReason.GatewayAdmissionClosed
+      : sandboxNotListening
       ? FastPathFallbackReason.SandboxNotListening
       : gatewayError
         ? FastPathFallbackReason.ProxyError
@@ -126,7 +178,8 @@ export function classifyFastPathHttpResult(
     sandboxId: input.sandboxId,
     bodyHead,
     durationMs: input.durationMs,
-    shouldReconcile: gatewayError || sandboxNotListening,
+    shouldReconcile:
+      !gatewayAdmissionClosed && (gatewayError || sandboxNotListening),
     stalePort: sandboxNotListening
       ? input.policy.stalePortOnSandboxNotListening ?? null
       : null,
@@ -155,7 +208,30 @@ export function classifyFastPathException(
     bodyHead: errorMessage,
     errorMessage,
     durationMs: input.durationMs,
-    shouldReconcile: true,
-    indeterminateDelivery: isAbort,
+    shouldReconcile: false,
+    // Fetch can fail after request bytes leave the process. Never treat a
+    // transport exception as proof that the native handler rejected work.
+    indeterminateDelivery: true,
+  };
+}
+
+export function classifyFastPathPreDispatchException(
+  input: ClassifyFastPathExceptionInput,
+): Extract<FastPathOutcome, { kind: "fallback-to-workflow" }> {
+  const errorMessage =
+    input.error instanceof Error ? input.error.message : String(input.error);
+
+  return {
+    kind: FastPathOutcomeKind.FallbackToWorkflow,
+    reason: FastPathFallbackReason.RouteRepairFailed,
+    classification: ForwardClassification.GatewayUnavailable,
+    status: null,
+    transport: input.transport ?? null,
+    sandboxUrl: input.sandboxUrl ?? null,
+    sandboxId: input.sandboxId,
+    bodyHead: errorMessage,
+    errorMessage,
+    durationMs: input.durationMs,
+    shouldReconcile: false,
   };
 }

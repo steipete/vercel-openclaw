@@ -1,10 +1,9 @@
 import { logError, logInfo, logWarn } from "@/server/log";
 import { getOpenclawPackageSpec, isVercelDeployment } from "@/server/env";
 import { isPinnedPackageSpec } from "@/server/deployment-contract";
-import type { WhatsAppGatewayConfig } from "@/server/openclaw/config";
 import {
   admitConfiguredOpenClawBundle,
-  markVerifiedBundleIdentity,
+  bundleIdentityFromAdmission,
   type VerifiedBundleAdmission,
   type VerifiedBundleIdentity,
 } from "@/server/openclaw/bundle-identity";
@@ -379,7 +378,6 @@ export async function setupOpenClaw(
     telegramBotToken?: string;
     slackCredentials?: { botToken: string; signingSecret: string };
     telegramWebhookSecret?: string;
-    whatsappConfig?: WhatsAppGatewayConfig;
     progress?: SetupProgressWriter;
   },
 ): Promise<{
@@ -572,42 +570,6 @@ export async function setupOpenClaw(
     logInfo("openclaw.setup.npm_cache_cleared", { sandboxId: sandbox.sandboxId });
   }
 
-  // Install WhatsApp plugin when enabled.  Idempotent — `openclaw plugins
-  // install` is a no-op when the plugin is already present.
-  // Skipped in bundle mode — the bundle includes all bundled plugins.
-  if (options.whatsappConfig?.enabled && !bundleUrl) {
-    const pluginSpec = options.whatsappConfig.pluginSpec?.trim() || "@openclaw/whatsapp";
-    progress?.setPhase("installing-plugin", `Installing ${pluginSpec}`);
-    logInfo("openclaw.setup.whatsapp_plugin_install", {
-      sandboxId: sandbox.sandboxId,
-      pluginSpec,
-    });
-    const pluginResult = await sandbox.runCommand({
-      cmd: OPENCLAW_BIN,
-      args: [
-        "plugins",
-        "install",
-        pluginSpec,
-      ],
-      stdout: progress?.makeWritable("stdout"),
-      stderr: progress?.makeWritable("stderr"),
-    });
-    if (pluginResult.exitCode === 0) {
-      logInfo("openclaw.setup.whatsapp_plugin_installed", {
-        sandboxId: sandbox.sandboxId,
-        pluginSpec,
-      });
-    } else {
-      const stderr = (await pluginResult.output("stderr")).trim();
-      logWarn("openclaw.setup.whatsapp_plugin_install_failed", {
-        sandboxId: sandbox.sandboxId,
-        pluginSpec,
-        exitCode: pluginResult.exitCode,
-        stderr: stderr.slice(-500),
-      });
-    }
-  }
-
   progress?.setPhase("writing-config", "Writing gateway config");
   progress?.appendLine("system", "Writing OpenClaw config and startup files");
 
@@ -619,7 +581,6 @@ export async function setupOpenClaw(
       telegramBotToken: options.telegramBotToken,
       telegramWebhookSecret: options.telegramWebhookSecret,
       slackCredentials: options.slackCredentials,
-      whatsappConfig: options.whatsappConfig,
       bundleCapabilities: bundleAdmission?.identity.capabilities,
     }),
     {
@@ -680,7 +641,7 @@ export async function setupOpenClaw(
       stderr: progress?.makeWritable("stderr"),
     });
     await assertCommandSuccess("persist verified bundle identity", receiptResult);
-    bundleIdentity = markVerifiedBundleIdentity(bundleAdmission);
+    bundleIdentity = bundleIdentityFromAdmission(bundleAdmission);
   }
 
   // Install patches only apply to the npm-installed package tree.

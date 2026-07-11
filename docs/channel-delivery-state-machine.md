@@ -20,10 +20,15 @@ stateDiagram-v2
     fast-path-forwarding --> workflow-planned: fast-path-fallback
     dedup-checked --> workflow-planned: workflow-planned
     workflow-planned --> workflow-start-failed: workflow-start-failed
+    workflow-planned --> terminal-failed: terminal-failed
     workflow-planned --> wake-running: wake-started
+    wake-running --> terminal-failed: terminal-failed
     wake-running --> native-forwarding: native-forward-started
     native-forwarding --> visibility-unknown: native-forward-accepted
     native-forwarding --> native-forward-failed: native-forward-failed
+    native-forwarding --> visibility-unknown: visibility-unknown
+    native-forwarding --> terminal-failed: terminal-failed
+    native-forward-failed --> visibility-unknown: visibility-unknown
     native-forward-failed --> terminal-failed: terminal-failed
     visibility-unknown --> reply-observation-pending: reply-observation-started
     reply-observation-pending --> reply-observed: reply-observed

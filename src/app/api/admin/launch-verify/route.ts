@@ -58,6 +58,7 @@ import {
   type RestorePreparedPhaseResolutionCode,
 } from "@/shared/launch-verification";
 import { getHostedFeatureSupportMatrix } from "@/shared/hosted-feature-support";
+import { HOSTED_DELIVERY_CHANNEL_NAMES } from "@/shared/channels";
 
 const ENSURE_POLL_MS = 2_000;
 const ENSURE_TIMEOUT_MS = 120_000;
@@ -216,9 +217,9 @@ function buildLaunchVerificationDiagnostics(
   blocking: LaunchVerifyBlockingResult,
 ): LaunchVerificationDiagnostics {
   const failingChannelIds = preflight
-    ? (Object.values(preflight.channels ?? {})
-        .filter((channel) => channel.status === "fail")
-        .map((channel) => channel.channel) as Array<"slack" | "telegram" | "discord">)
+    ? HOSTED_DELIVERY_CHANNEL_NAMES.filter(
+        (channel) => preflight.channels[channel].status === "fail",
+      )
     : [];
 
   return {

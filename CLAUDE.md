@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`vercel-openclaw` is a single-instance Next.js 16 app that manages exactly one persistent Vercel Sandbox running OpenClaw: auth, on-demand create/resume, proxy at `/gateway`, HTML injection for WebSocket rewrite and gateway-token handoff, firewall learning, and channel webhooks (Slack, Telegram, Discord, WhatsApp).
+`vercel-openclaw` is a single-instance Next.js 16 app that manages exactly one persistent Vercel Sandbox running OpenClaw: auth, on-demand create/resume, proxy at `/gateway`, HTML injection for WebSocket rewrite and gateway-token handoff, firewall learning, and hosted channel webhooks (Slack, Telegram, Discord). Hosted WhatsApp is cleanup-only and fails closed.
 
 For operator docs, start with `docs/getting-started/README.md`. It is the main handoff for the three-repo system (`vclaw`, `vercel-openclaw`, and the OpenClaw fork), `vclaw create`, operational paths, release, and reliability contracts. Then use `README.md`, `CONTRIBUTING.md`, and the deep docs under `docs/` (`architecture.md`, `channels-and-webhooks.md`, `lifecycle-and-restore.md`, `preflight-and-launch-verification.md`, `deployment-protection.md`, `environment-variables.md`, `api-reference.md`).
 
@@ -90,7 +90,7 @@ These are the things Claude will otherwise get wrong:
 
 ## Debugging channel delivery
 
-When a channel (Slack/Telegram/Discord/WhatsApp) is "stuck" — message sent, bot doesn't reply — start here. **Always read the structured surfaces before guessing**: vague error strings have repeatedly masked different bugs.
+When a hosted channel (Slack/Telegram/Discord) is "stuck" — message sent, bot doesn't reply — start here. **Always read the structured surfaces before guessing**: vague error strings have repeatedly masked different bugs.
 
 ### Discipline first, code second
 
@@ -304,7 +304,7 @@ When debugging, search `/api/admin/logs` for the requestId and follow the chain.
 
 ### Channel parity rules — every fast path MUST
 
-These invariants hold across slack/telegram/discord/whatsapp webhook routes (`src/app/api/channels/<ch>/webhook/route.ts`). When adding a new channel or touching an existing fast path:
+These invariants hold across Slack, Telegram, and Discord webhook routes (`src/app/api/channels/<ch>/webhook/route.ts`). When adding a new channel or touching an existing fast path:
 
 1. Call `recordChannelLastForward(<channel>, {...})` in **every** fast-path branch (success, gateway-error, non-ok, network/timeout) — both the success and failure cases. Otherwise `lastForward` stays null and `/api/channels/summary` can't surface readiness.
 2. Use the unified classification rules in failure branches: body matches `/^This sandbox is not listening/` → `sandbox-not-listening`; status ≥ 502 → `proxy-error`; status === 404 → `handler-not-ready`; other non-2xx → `handler-error`; network/timeout → `fetch-exception`.

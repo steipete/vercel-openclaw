@@ -1,4 +1,4 @@
-import type { ChannelLastForward, WhatsAppLinkState } from "@/shared/channels";
+import type { ChannelLastForward } from "@/shared/channels";
 import type { ChannelDeliverySnapshot } from "@/shared/channel-delivery";
 import {
   type ChannelUserVisibleReplySummary,
@@ -165,50 +165,26 @@ function buildSlackSummaryEntry(
 }
 
 function buildWhatsAppSummaryEntry(
-  config:
-    | {
-        enabled: boolean;
-        lastKnownLinkState?: WhatsAppLinkState;
-        lastError?: string;
-      }
-    | null
-    | undefined,
-  lastForward: ChannelLastForward | null | undefined,
-  lastDeliveryState: ChannelDeliverySnapshot | null | undefined,
-  now: number,
+  config: object | null | undefined,
 ): WhatsAppSummaryEntry {
-  const configured = config?.enabled === true;
-  const lastForwardSummary = projectChannelLastForward(lastForward, now);
-  const lastDeliverySummary = projectChannelDeliveryState(
-    lastDeliveryState,
-    lastForward,
-    "whatsapp",
-    now,
-  );
-
   const entry: WhatsAppSummaryEntry = {
-    connected: configured,
-    configured,
-    linkState: config?.lastKnownLinkState ?? "unconfigured",
-    lastError: config?.lastError ?? null,
-    lastForward: lastForwardSummary,
-    lastDeliveryState: lastDeliverySummary,
-    userVisibleReply:
-      lastForwardSummary?.userVisibleReply ??
-      projectReplyFromDelivery(lastDeliverySummary?.reply, now),
+    connected: false,
+    configured: false,
+    legacyConfigPresent: config != null,
+    linkState: "unconfigured",
+    lastError: null,
+    lastForward: null,
+    lastDeliveryState: null,
+    userVisibleReply: null,
     connectionSemantics: WHATSAPP_CONNECTION_SEMANTICS,
     detailRoute: WHATSAPP_SUMMARY_DETAIL_ROUTE,
-    deliveryMode: "webhook-proxied",
+    deliveryMode: "unsupported",
     requiresRunningSandbox: false,
   };
 
-  const hasProjectionGap =
-    (entry.configured && entry.linkState !== "linked") ||
-    (!entry.configured && entry.linkState !== "unconfigured") ||
-    entry.lastError !== null;
-
-  if (hasProjectionGap) {
+  if (entry.legacyConfigPresent) {
     logInfo("channels.whatsapp_summary_projected", {
+      legacyConfigPresent: true,
       configured: entry.configured,
       connected: entry.connected,
       linkState: entry.linkState,
@@ -348,9 +324,6 @@ export async function GET(request: Request): Promise<Response> {
       ),
       whatsapp: buildWhatsAppSummaryEntry(
         meta.channels.whatsapp,
-        diag.whatsapp?.lastForward ?? null,
-        diag.whatsapp?.lastDeliveryState ?? null,
-        now,
       ),
     };
 

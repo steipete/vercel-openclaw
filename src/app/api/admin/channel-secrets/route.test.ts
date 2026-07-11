@@ -11,7 +11,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { _resetStoreForTesting } from "@/server/store/store";
+import {
+  _resetStoreForTesting,
+  getInitializedMeta,
+  mutateMeta,
+} from "@/server/store/store";
 import {
   callRoute,
   buildPutRequest,
@@ -41,11 +45,23 @@ const ENV_KEYS = [
   "SESSION_SECRET",
   "ADMIN_SECRET",
   "REDIS_URL",
-    "KV_URL",
+  "KV_URL",
   "AI_GATEWAY_API_KEY",
   "VERCEL_OIDC_TOKEN",
   "NEXT_PUBLIC_BASE_DOMAIN",
+  "NEXT_PUBLIC_APP_URL",
+  "VERCEL_AUTOMATION_BYPASS_SECRET",
 ];
+
+let smokeOwnerSequence = 0;
+
+function smokeSetupBody(channels?: string[]): string {
+  smokeOwnerSequence += 1;
+  return JSON.stringify({
+    ownerId: `test-smoke-owner-${smokeOwnerSequence}`,
+    ...(channels ? { channels } : {}),
+  });
+}
 
 function withAdminAuthEnv(fn: () => Promise<void>): Promise<void> {
   const originals: Record<string, string | undefined> = {};
@@ -63,6 +79,8 @@ function withAdminAuthEnv(fn: () => Promise<void>): Promise<void> {
   delete process.env.KV_URL;
   delete process.env.AI_GATEWAY_API_KEY;
   delete process.env.VERCEL_OIDC_TOKEN;
+  delete process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  delete process.env.NEXT_PUBLIC_APP_URL;
 
   _resetStoreForTesting();
 
@@ -147,7 +165,10 @@ test("channel-secrets: POST with wrong bearer returns 401", async () => {
 test("channel-secrets: authenticated PUT response does not contain raw secrets", async () => {
   await withAdminAuthEnv(async () => {
     const route = getAdminChannelSecretsRoute();
-    const request = buildAuthPutRequest("/api/admin/channel-secrets", "{}");
+    const request = buildAuthPutRequest(
+      "/api/admin/channel-secrets",
+      smokeSetupBody(),
+    );
     const result = await callRoute(route.PUT!, request);
 
     assert.equal(result.status, 200, `Expected 200, got ${result.status}`);
@@ -174,6 +195,173 @@ test("channel-secrets: authenticated PUT response does not contain raw secrets",
       !result.text.includes("botToken"),
       "Response should not expose botToken field",
     );
+    assert.deepEqual(
+      (result.json as { channels?: unknown }).channels,
+      ["slack", "telegram", "discord"],
+    );
+  });
+});
+
+test("channel-secrets: authenticated PUT requires a client owner id", async () => {
+  await withAdminAuthEnv(async () => {
+    const route = getAdminChannelSecretsRoute();
+    const result = await callRoute(
+      route.PUT!,
+      buildAuthPutRequest("/api/admin/channel-secrets", "{}"),
+    );
+
+    assert.equal(result.status, 400);
+    assert.equal(
+      (result.json as { error?: unknown }).error,
+      "OWNER_ID_REQUIRED",
+    );
+  });
+});
+
+test("channel-secrets: repeated owner setup recovers cleanup authority", async () => {
+  await withAdminAuthEnv(async () => {
+    const route = getAdminChannelSecretsRoute();
+    const ownerId = "test-smoke-owner-idempotent";
+    const body = JSON.stringify({ ownerId, channels: ["discord"] });
+    const first = await callRoute(
+      route.PUT!,
+      buildAuthPutRequest("/api/admin/channel-secrets", body),
+    );
+    const second = await callRoute(
+      route.PUT!,
+      buildAuthPutRequest("/api/admin/channel-secrets", body),
+    );
+
+    assert.equal(first.status, 200);
+    assert.deepEqual(
+      (first.json as { createdChannels?: unknown }).createdChannels,
+      ["discord"],
+    );
+    assert.equal(second.status, 200);
+    assert.deepEqual(
+      (second.json as { createdChannels?: unknown }).createdChannels,
+      [],
+    );
+    assert.deepEqual(
+      (second.json as { recoveredChannels?: unknown }).recoveredChannels,
+      ["discord"],
+    );
+    const cleanupToken = (second.json as { cleanupToken?: unknown })
+      .cleanupToken;
+    assert.equal(typeof cleanupToken, "string");
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => Response.json({ type: 1 });
+    try {
+      const dispatch = await callRoute(
+        route.POST!,
+        buildAuthPostRequest(
+          "/api/admin/channel-secrets",
+          JSON.stringify({
+            channel: "discord",
+            body: JSON.stringify({ id: "discord-smoke-id", type: 1 }),
+          }),
+        ),
+      );
+      assert.equal(dispatch.status, 200);
+      assert.equal(
+        (dispatch.json as { webhookAccepted?: unknown }).webhookAccepted,
+        true,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    const cleanup = await callRoute(
+      route.DELETE!,
+      buildAuthDeleteRequest(
+        "/api/admin/channel-secrets",
+        JSON.stringify({ cleanupToken }),
+      ),
+    );
+    assert.equal(cleanup.status, 200);
+    assert.equal((await getInitializedMeta()).channels.discord, null);
+  });
+});
+
+test("channel-secrets: setup adopts ownerless legacy smoke configs", async () => {
+  await withAdminAuthEnv(async () => {
+    await mutateMeta((meta) => {
+      meta.channels.slack = {
+        signingSecret: "legacy-smoke-signing-secret",
+        botToken: "xoxb-smoke-test-token",
+        configuredAt: 1,
+        botId: "B_SMOKE",
+      };
+      meta.channels.telegram = {
+        botToken: "000000000:smoke-test-bot-token",
+        webhookSecret: "legacy-smoke-webhook-secret",
+        webhookUrl: "https://example.test/api/channels/telegram/webhook",
+        botUsername: "smoke_test_bot",
+        configuredAt: 2,
+      };
+      meta.channels.discord = {
+        publicKey: "legacy-smoke-public-key",
+        applicationId: "discord-smoke-app",
+        botToken: "discord-smoke-bot-token",
+        configuredAt: 3,
+      };
+    });
+
+    const route = getAdminChannelSecretsRoute();
+    const setup = await callRoute(
+      route.PUT!,
+      buildAuthPutRequest(
+        "/api/admin/channel-secrets",
+        JSON.stringify({
+          ownerId: "test-smoke-owner-legacy-adoption",
+          channels: ["slack", "telegram", "discord"],
+        }),
+      ),
+    );
+
+    assert.equal(setup.status, 200);
+    assert.deepEqual(
+      (setup.json as { createdChannels?: unknown }).createdChannels,
+      [],
+    );
+    assert.deepEqual(
+      (setup.json as { recoveredChannels?: unknown }).recoveredChannels,
+      ["slack", "telegram", "discord"],
+    );
+    const adopted = await getInitializedMeta();
+    assert.equal(
+      adopted.channels.slack?.smokeOwnerId,
+      "test-smoke-owner-legacy-adoption",
+    );
+    assert.equal(
+      adopted.channels.telegram?.smokeOwnerId,
+      "test-smoke-owner-legacy-adoption",
+    );
+    assert.equal(
+      adopted.channels.discord?.smokeOwnerId,
+      "test-smoke-owner-legacy-adoption",
+    );
+    assert.notEqual(
+      adopted.channels.discord?.publicKey,
+      "legacy-smoke-public-key",
+    );
+
+    const cleanupToken = (setup.json as { cleanupToken?: unknown })
+      .cleanupToken;
+    assert.equal(typeof cleanupToken, "string");
+    const cleanup = await callRoute(
+      route.DELETE!,
+      buildAuthDeleteRequest(
+        "/api/admin/channel-secrets",
+        JSON.stringify({ cleanupToken }),
+      ),
+    );
+    assert.equal(cleanup.status, 200);
+    assert.deepEqual(
+      (cleanup.json as { removedChannels?: unknown }).removedChannels,
+      ["slack", "telegram", "discord"],
+    );
   });
 });
 
@@ -186,7 +374,10 @@ test("channel-secrets: authenticated POST response does not contain raw secrets"
     const route = getAdminChannelSecretsRoute();
 
     // First configure test channels
-    const putRequest = buildAuthPutRequest("/api/admin/channel-secrets", "{}");
+    const putRequest = buildAuthPutRequest(
+      "/api/admin/channel-secrets",
+      smokeSetupBody(),
+    );
     await callRoute(route.PUT!, putRequest);
 
     // Now send a smoke webhook — the response should not contain secrets
@@ -211,15 +402,151 @@ test("channel-secrets: authenticated POST response does not contain raw secrets"
 // 5. Authenticated DELETE works and returns clean response
 // ===========================================================================
 
-test("channel-secrets: authenticated DELETE succeeds", async () => {
+test("channel-secrets: authenticated DELETE removes only owned smoke configs", async () => {
   await withAdminAuthEnv(async () => {
     const route = getAdminChannelSecretsRoute();
-    const request = buildAuthDeleteRequest("/api/admin/channel-secrets", "{}");
+    const setup = await callRoute(
+      route.PUT!,
+      buildAuthPutRequest(
+        "/api/admin/channel-secrets",
+        smokeSetupBody(["slack"]),
+      ),
+    );
+    const cleanupToken = (setup.json as { cleanupToken?: unknown }).cleanupToken;
+    assert.equal(typeof cleanupToken, "string");
+    const request = buildAuthDeleteRequest(
+      "/api/admin/channel-secrets",
+      JSON.stringify({ cleanupToken }),
+    );
     const result = await callRoute(route.DELETE!, request);
 
     assert.equal(result.status, 200, `Expected 200, got ${result.status}`);
-    const body = result.json as { removed: boolean };
+    const body = result.json as { removed: boolean; removedChannels?: unknown };
     assert.equal(body.removed, true);
+    assert.deepEqual(body.removedChannels, ["slack"]);
+    assert.equal((await getInitializedMeta()).channels.slack, null);
+  });
+});
+
+test("channel-secrets: setup and cleanup preserve sibling real config", async () => {
+  await withAdminAuthEnv(async () => {
+    const realTelegram = {
+      botToken: "real-telegram-token",
+      webhookSecret: "real-telegram-secret",
+      webhookUrl: "https://example.test/api/channels/telegram/webhook",
+      botUsername: "real_bot",
+      configuredAt: 123,
+    };
+    const legacyWhatsApp = {
+      enabled: true,
+      configuredAt: 456,
+      phoneNumberId: "legacy-phone-id",
+      accessToken: "legacy-access-token",
+      verifyToken: "legacy-verify-token",
+      appSecret: "legacy-app-secret",
+    };
+    await mutateMeta((meta) => {
+      meta.channels.telegram = realTelegram;
+      meta.channels.whatsapp = legacyWhatsApp;
+    });
+    const route = getAdminChannelSecretsRoute();
+    const setup = await callRoute(
+      route.PUT!,
+      buildAuthPutRequest(
+        "/api/admin/channel-secrets",
+        smokeSetupBody(["slack", "telegram"]),
+      ),
+    );
+    assert.deepEqual(
+      (setup.json as { createdChannels?: unknown }).createdChannels,
+      ["slack"],
+    );
+    assert.deepEqual(
+      (setup.json as { preservedChannels?: unknown }).preservedChannels,
+      ["telegram"],
+    );
+    assert.deepEqual((await getInitializedMeta()).channels.telegram, realTelegram);
+    assert.deepEqual(
+      (await getInitializedMeta()).channels.whatsapp,
+      legacyWhatsApp,
+    );
+
+    const cleanupToken = (setup.json as { cleanupToken?: unknown }).cleanupToken;
+    await callRoute(
+      route.DELETE!,
+      buildAuthDeleteRequest(
+        "/api/admin/channel-secrets",
+        JSON.stringify({ cleanupToken }),
+      ),
+    );
+    const afterCleanup = await getInitializedMeta();
+    assert.equal(afterCleanup.channels.slack, null);
+    assert.deepEqual(afterCleanup.channels.telegram, realTelegram);
+    assert.deepEqual(afterCleanup.channels.whatsapp, legacyWhatsApp);
+  });
+});
+
+test("channel-secrets: stale cleanup token preserves replacement config", async () => {
+  await withAdminAuthEnv(async () => {
+    const route = getAdminChannelSecretsRoute();
+    const setup = await callRoute(
+      route.PUT!,
+      buildAuthPutRequest(
+        "/api/admin/channel-secrets",
+        JSON.stringify({
+          ownerId: "test-smoke-owner-original",
+          channels: ["slack"],
+        }),
+      ),
+    );
+    const cleanupToken = (setup.json as { cleanupToken?: unknown })
+      .cleanupToken;
+    await mutateMeta((meta) => {
+      meta.channels.slack = {
+        signingSecret: "replacement-signing-secret",
+        botToken: "replacement-bot-token",
+        configuredAt: Date.now(),
+        botId: "B_SMOKE",
+        smokeOwnerId: "test-smoke-owner-replacement",
+      };
+    });
+
+    const cleanup = await callRoute(
+      route.DELETE!,
+      buildAuthDeleteRequest(
+        "/api/admin/channel-secrets",
+        JSON.stringify({ cleanupToken }),
+      ),
+    );
+
+    assert.equal(cleanup.status, 200);
+    assert.deepEqual(
+      (cleanup.json as { preservedChannels?: unknown }).preservedChannels,
+      ["slack"],
+    );
+    assert.equal(
+      (await getInitializedMeta()).channels.slack?.smokeOwnerId,
+      "test-smoke-owner-replacement",
+    );
+  });
+});
+
+test("channel-secrets: PUT rejects unsupported hosted whatsapp setup", async () => {
+  await withAdminAuthEnv(async () => {
+    const route = getAdminChannelSecretsRoute();
+    const result = await callRoute(
+      route.PUT!,
+      buildAuthPutRequest(
+        "/api/admin/channel-secrets",
+        smokeSetupBody(["whatsapp"]),
+      ),
+    );
+
+    assert.equal(result.status, 400);
+    assert.equal(
+      (result.json as { error?: unknown }).error,
+      "UNSUPPORTED_CHANNEL",
+    );
   });
 });
 
@@ -241,55 +568,23 @@ test("channel-secrets: POST rejects non-object JSON", async () => {
   });
 });
 
-test("channel-secrets: POST dispatches whatsapp webhook with signed body", async () => {
+test("channel-secrets: POST rejects unsupported hosted whatsapp dispatch", async () => {
   await withAdminAuthEnv(async () => {
     const route = getAdminChannelSecretsRoute();
+    const request = buildAuthPostRequest(
+      "/api/admin/channel-secrets",
+      JSON.stringify({
+        channel: "whatsapp",
+        body: '{"object":"whatsapp_business_account"}',
+      }),
+    );
+    const result = await callRoute(route.POST!, request);
 
-    const putRequest = buildAuthPutRequest("/api/admin/channel-secrets", "{}");
-    await callRoute(route.PUT!, putRequest);
-
-    let capturedUrl = "";
-    let capturedSignature = "";
-    let capturedBody = "";
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-      capturedUrl =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url;
-      capturedSignature = new Headers(init?.headers).get("x-hub-signature-256") ?? "";
-      capturedBody = String(init?.body ?? "");
-      return Response.json({ ok: true });
-    };
-
-    try {
-      const request = buildAuthPostRequest(
-        "/api/admin/channel-secrets",
-        JSON.stringify({ channel: "whatsapp", body: '{"object":"whatsapp_business_account"}' }),
-      );
-      const result = await callRoute(route.POST!, request);
-      assert.equal(result.status, 200);
-      const body = result.json as {
-        configured: boolean;
-        sent: boolean;
-        status: number;
-        channel: string;
-      };
-      assert.equal(body.configured, true);
-      assert.equal(body.sent, true);
-      assert.equal(body.channel, "whatsapp");
-      assert.equal(body.status, 200);
-      assert.ok(
-        capturedUrl.startsWith("http://localhost:3000/api/channels/whatsapp/webhook"),
-        `Expected WhatsApp webhook URL, got: ${capturedUrl}`,
-      );
-      assert.ok(capturedSignature.startsWith("sha256="), "Expected WhatsApp HMAC signature");
-      assert.equal(capturedBody, '{"object":"whatsapp_business_account"}');
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+    assert.equal(result.status, 400);
+    assert.equal(
+      (result.json as { error?: unknown }).error,
+      "UNSUPPORTED_CHANNEL",
+    );
   });
 });
 
@@ -348,8 +643,11 @@ test("channel-secrets: POST dispatches telegram webhook via canonical public URL
     const route = getAdminChannelSecretsRoute();
 
     // Configure test channels
-    const putRequest = buildAuthPutRequest("/api/admin/channel-secrets", "{}");
-    await callRoute(route.PUT!, putRequest);
+    const putRequest = buildAuthPutRequest(
+      "/api/admin/channel-secrets",
+      smokeSetupBody(),
+    );
+    const setup = await callRoute(route.PUT!, putRequest);
 
     // Intercept fetch to capture the dispatch URL
     let capturedUrl = "";
@@ -369,7 +667,7 @@ test("channel-secrets: POST dispatches telegram webhook via canonical public URL
         "/api/admin/channel-secrets",
         JSON.stringify({
           channel: "telegram",
-          body: '{"ok":true}',
+          body: '{"update_id":4242}',
         }),
       );
       const result = await callRoute(route.POST!, postRequest);
@@ -385,13 +683,23 @@ test("channel-secrets: POST dispatches telegram webhook via canonical public URL
         capturedUrl.includes("x-vercel-protection-bypass=bypass-secret"),
         `Expected bypass param, got: ${capturedUrl}`,
       );
+      assert.equal(
+        (result.json as { deliveryId?: unknown }).deliveryId,
+        "telegram:4242",
+      );
     } finally {
       globalThis.fetch = originalFetch;
 
       // Clean up
       await callRoute(
         route.DELETE!,
-        buildAuthDeleteRequest("/api/admin/channel-secrets", "{}"),
+        buildAuthDeleteRequest(
+          "/api/admin/channel-secrets",
+          JSON.stringify({
+            cleanupToken: (setup.json as { cleanupToken?: unknown })
+              .cleanupToken,
+          }),
+        ),
       );
     }
   });

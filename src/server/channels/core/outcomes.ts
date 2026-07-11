@@ -2,6 +2,8 @@ import type { ChannelName } from "@/shared/channels";
 
 export const ForwardClassification = {
   Accepted: "accepted",
+  AcceptanceUnknown: "acceptance-unknown",
+  GatewayUnavailable: "gateway-unavailable",
   SandboxNotListening: "sandbox-not-listening",
   ProxyError: "proxy-error",
   HandlerNotReady: "handler-not-ready",
@@ -46,6 +48,7 @@ export const FastPathFallbackReason = {
   FastPathTimeout: "fast-path-timeout",
   RouteRepairFailed: "route-repair-failed",
   GatewayHealthReconcile: "gateway-health-reconcile",
+  GatewayAdmissionClosed: "gateway-admission-closed",
 } as const;
 
 export type FastPathFallbackReason =
@@ -55,6 +58,7 @@ export const FastPathHandledNoWorkflowReason = {
   HandlerResponseReceived: "handler-response-received",
   NonGatewayHandlerResponse: "non-gateway-handler-response",
   PlatformNoop: "platform-noop",
+  DeliveryAcceptanceUnknown: "delivery-acceptance-unknown",
 } as const;
 
 export type FastPathHandledNoWorkflowReason =

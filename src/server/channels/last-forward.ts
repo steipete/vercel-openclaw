@@ -9,6 +9,8 @@ import {
 import {
   applyUserVisibleReplyToChannelDelivery,
   channelDeliveryFromLastForward,
+  closeChannelDeliverySnapshot,
+  type ChannelDeliveryClosedOutcome,
 } from "@/shared/channel-delivery";
 import { logInfo, logWarn } from "@/server/log";
 import { mutateMeta } from "@/server/store/store";
@@ -27,6 +29,7 @@ import { mutateMeta } from "@/server/store/store";
 export async function recordChannelLastForward(
   channel: ChannelName,
   forward: ChannelLastForwardInput,
+  options: { closedOutcome?: ChannelDeliveryClosedOutcome } = {},
 ): Promise<void> {
   const normalizedForward = normalizeChannelLastForward(forward);
   if (!normalizedForward) {
@@ -37,20 +40,58 @@ export async function recordChannelLastForward(
     return;
   }
 
-  const lastDeliveryState = channelDeliveryFromLastForward({
+  const projectedDeliveryState = channelDeliveryFromLastForward({
     channel,
     lastForward: normalizedForward,
   });
+  const lastDeliveryState = options.closedOutcome
+    ? closeChannelDeliverySnapshot({
+        current: projectedDeliveryState,
+        channel,
+        deliveryId: normalizedForward.deliveryId,
+        outcome: options.closedOutcome,
+        reason:
+          options.closedOutcome === "unknown"
+            ? "native-delivery-outcome-unknown"
+            : `terminal_${normalizedForward.classification}`,
+        now: normalizedForward.completedAt,
+      })
+    : projectedDeliveryState;
 
+  let preservedStrongerEvidence = false;
   try {
     await mutateMeta((next) => {
       if (!next.channelDiagnostics) next.channelDiagnostics = {};
+      const currentEntry = next.channelDiagnostics[channel];
+      const currentDelivery = currentEntry?.lastDeliveryState;
+      const sameDelivery =
+        currentDelivery?.deliveryId === normalizedForward.deliveryId;
+      const preserveObserved =
+        sameDelivery && currentDelivery?.state === "reply-observed";
+      const preserveUnknown =
+        sameDelivery &&
+        currentDelivery?.state === "visibility-unknown" &&
+        !normalizedForward.ok;
+      if (preserveObserved || preserveUnknown) {
+        // A later retry can prove acceptance/reply, but rejection cannot undo
+        // earlier evidence that this exact delivery may have reached the user.
+        preservedStrongerEvidence = true;
+        return;
+      }
       next.channelDiagnostics[channel] = {
-        ...next.channelDiagnostics[channel],
+        ...currentEntry,
         lastForward: normalizedForward,
         lastDeliveryState,
       };
     });
+    if (preservedStrongerEvidence) {
+      logInfo("channels.forward_outcome_weaker_evidence_ignored", {
+        channel,
+        deliveryId: normalizedForward.deliveryId,
+        classification: normalizedForward.classification,
+      });
+      return;
+    }
     logInfo("channels.forward_outcome", {
       channel,
       ok: normalizedForward.ok,
@@ -63,12 +104,50 @@ export async function recordChannelLastForward(
       deliveryId: normalizedForward.deliveryId,
       userVisibleReplyStatus: normalizedForward.userVisibleReply.status,
       userVisibleReplySource: normalizedForward.userVisibleReply.source,
+      closedOutcome: options.closedOutcome ?? null,
     });
   } catch (err) {
     logWarn("channels.last_forward_persist_failed", {
       channel,
       error: err instanceof Error ? err.message : String(err),
       deliveryId: normalizedForward.deliveryId,
+    });
+  }
+}
+
+export async function recordChannelDeliveryClosedOutcome(input: {
+  channel: ChannelName;
+  deliveryId: string | null;
+  outcome: ChannelDeliveryClosedOutcome;
+  reason: string;
+}): Promise<void> {
+  try {
+    await mutateMeta((next) => {
+      const currentEntry = next.channelDiagnostics?.[input.channel];
+      if (!next.channelDiagnostics) next.channelDiagnostics = {};
+      next.channelDiagnostics[input.channel] = {
+        ...currentEntry,
+        lastDeliveryState: closeChannelDeliverySnapshot({
+          current: currentEntry?.lastDeliveryState,
+          channel: input.channel,
+          deliveryId: input.deliveryId,
+          outcome: input.outcome,
+          reason: input.reason,
+        }),
+      };
+    });
+    logInfo("channels.delivery_closed", {
+      channel: input.channel,
+      deliveryId: input.deliveryId,
+      outcome: input.outcome,
+      reason: input.reason,
+    });
+  } catch (error) {
+    logWarn("channels.delivery_close_persist_failed", {
+      channel: input.channel,
+      deliveryId: input.deliveryId,
+      outcome: input.outcome,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
 }

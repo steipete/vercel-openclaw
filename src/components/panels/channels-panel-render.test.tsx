@@ -16,11 +16,25 @@ function makeConnectability(
 ): ChannelConnectability {
   return {
     channel,
-    mode: "webhook-proxied",
-    canConnect: true,
-    status: "pass",
-    webhookUrl: `https://openclaw.example/api/channels/${channel}/webhook`,
-    issues: [],
+    mode: channel === "whatsapp" ? "unsupported" : "webhook-proxied",
+    canConnect: channel !== "whatsapp",
+    status: channel === "whatsapp" ? "fail" : "pass",
+    webhookUrl:
+      channel === "whatsapp"
+        ? null
+        : `https://openclaw.example/api/channels/${channel}/webhook`,
+    issues:
+      channel === "whatsapp"
+        ? [
+            {
+              id: "hosted-transport-unavailable",
+              status: "fail",
+              message: "Hosted WhatsApp is unavailable.",
+              remediation: "Use local OpenClaw.",
+              env: [],
+            },
+          ]
+        : [],
   };
 }
 
@@ -115,7 +129,7 @@ function makeStatus(): StatusPayload {
       },
       whatsapp: {
         configured: false,
-        mode: "webhook-proxied",
+        mode: "unsupported",
         webhookUrl: null,
         status: "unconfigured",
         configuredAt: null,
@@ -191,21 +205,20 @@ test("ChannelsPanel exposes preflight state as data attributes", () => {
   assert.ok(html.includes('data-preflight-ok="unknown"'), "preflight ok defaults to unknown before fetch");
 });
 
-test("ChannelsPanel consistent action labels across all unconfigured channel cards", () => {
+test("ChannelsPanel only offers connect actions for hosted delivery channels", () => {
   const html = renderChannelsPanel();
 
-  // All four cards show "Connect <Channel>" in the title
   assert.ok(html.includes("Connect Slack"), "Slack shows connect title");
   assert.ok(html.includes("Connect Telegram"), "Telegram shows connect title");
   assert.ok(html.includes("Connect Discord"), "Discord shows connect title");
-  assert.ok(html.includes("Connect WhatsApp"), "WhatsApp shows connect title");
+  assert.ok(html.includes("WhatsApp (unavailable)"), "WhatsApp shows unavailable title");
+  assert.ok(!html.includes("Connect WhatsApp"), "WhatsApp does not offer hosted setup");
 
-  // All four cards render a primary "Connect" button (not just a title containing "Connect")
   const connectButtons = html.match(/>Connect<\/button>/g) ?? [];
   assert.equal(
     connectButtons.length,
-    4,
-    `expected exactly 4 Connect buttons, found ${connectButtons.length}`,
+    3,
+    `expected exactly 3 Connect buttons, found ${connectButtons.length}`,
   );
 
   // Legacy "Save Credentials" label must not appear anywhere

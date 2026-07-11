@@ -5,12 +5,13 @@
  * a structured PhaseResult. No external dependencies — plain fetch().
  */
 
+import { randomUUID } from "node:crypto";
+
 import { authHeaders, getAuthSource as _getAuthSource } from "./remote-auth.js";
 import {
   buildSlackSmokePayload,
   buildDiscordSmokePayload,
   buildTelegramSmokePayload,
-  buildWhatsAppSmokePayload,
 } from "./remote-crypto.js";
 
 // ---------------------------------------------------------------------------
@@ -557,24 +558,77 @@ export async function sshEcho(baseUrl: string, opts?: PhaseOptions): Promise<Pha
 // Test channel configuration
 // ---------------------------------------------------------------------------
 
+const SMOKE_CONFIG_RETRY_WINDOW_MS = 6_000;
+const SMOKE_CONFIG_RETRY_MAX_DELAY_MS = 1_000;
+
 /**
  * Configure test channels with generated credentials (bypasses platform API
- * validation). Returns true if configuration succeeded.
+ * validation). Returns an opaque cleanup token for only the configs created.
  */
 async function configureTestChannels(
   baseUrl: string,
   requestTimeoutMs: number,
-): Promise<boolean> {
-  try {
-    const hdrs = { ...authHeaders({ mutation: true }), "Content-Type": "application/json" };
-    const res = await fetchWithTimeout(
-      url(baseUrl, "/api/admin/channel-secrets"),
-      { method: "PUT", headers: hdrs },
-      requestTimeoutMs,
-    );
-    return res.ok;
-  } catch {
-    return false;
+  channels: SmokeChannel[],
+): Promise<{ cleanupToken: string | null; createdChannels: SmokeChannel[] } | null> {
+  const ownerId = randomUUID();
+  let retryDeadline: number | null = null;
+  let delayMs = 100;
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
+    try {
+      const hdrs = { ...authHeaders({ mutation: true }), "Content-Type": "application/json" };
+      const res = await fetchWithTimeout(
+        url(baseUrl, "/api/admin/channel-secrets"),
+        {
+          method: "PUT",
+          headers: hdrs,
+          body: JSON.stringify({ channels, ownerId }),
+        },
+        requestTimeoutMs,
+      );
+      if (!res.ok) {
+        if (res.status !== 409 && res.status < 500) return null;
+      } else {
+        const body = (await res.json()) as {
+          cleanupToken?: unknown;
+          createdChannels?: unknown;
+          recoveredChannels?: unknown;
+          preservedChannels?: unknown;
+        };
+        const ownershipShapeValid =
+          Array.isArray(body.createdChannels) &&
+          Array.isArray(body.recoveredChannels) &&
+          Array.isArray(body.preservedChannels);
+        const createdChannels = Array.isArray(body.createdChannels)
+          ? body.createdChannels.filter(isSmokeChannel)
+          : [];
+        const recoveredChannels = Array.isArray(body.recoveredChannels)
+          ? body.recoveredChannels.filter(isSmokeChannel)
+          : [];
+        const cleanupToken =
+          typeof body.cleanupToken === "string" ? body.cleanupToken : null;
+        if (
+          ownershipShapeValid &&
+          cleanupToken !== null ||
+          (ownershipShapeValid &&
+            createdChannels.length === 0 &&
+            recoveredChannels.length === 0)
+        ) {
+          return {
+            cleanupToken,
+            createdChannels,
+          };
+        }
+      }
+    } catch {
+      // The request may have committed before its response was lost. Retry
+      // with the same owner until the server lock can expire or be released.
+    }
+    retryDeadline ??= Date.now() + SMOKE_CONFIG_RETRY_WINDOW_MS;
+    if (attempts >= 3 && Date.now() >= retryDeadline) return null;
+    await sleep(delayMs);
+    delayMs = Math.min(delayMs * 2, SMOKE_CONFIG_RETRY_MAX_DELAY_MS);
   }
 }
 
@@ -584,16 +638,33 @@ async function configureTestChannels(
 async function removeTestChannels(
   baseUrl: string,
   requestTimeoutMs: number,
-): Promise<void> {
-  try {
-    const hdrs = { ...authHeaders({ mutation: true }), "Content-Type": "application/json" };
-    await fetchWithTimeout(
-      url(baseUrl, "/api/admin/channel-secrets"),
-      { method: "DELETE", headers: hdrs },
-      requestTimeoutMs,
-    );
-  } catch {
-    // Best-effort cleanup
+  cleanupToken: string,
+): Promise<boolean> {
+  let retryDeadline: number | null = null;
+  let delayMs = 100;
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
+    try {
+      const hdrs = { ...authHeaders({ mutation: true }), "Content-Type": "application/json" };
+      const response = await fetchWithTimeout(
+        url(baseUrl, "/api/admin/channel-secrets"),
+        {
+          method: "DELETE",
+          headers: hdrs,
+          body: JSON.stringify({ cleanupToken }),
+        },
+        requestTimeoutMs,
+      );
+      if (response.ok) return true;
+      if (response.status !== 409 && response.status < 500) return false;
+    } catch {
+      // DELETE is idempotent for an owner token; retry ambiguous responses.
+    }
+    retryDeadline ??= Date.now() + SMOKE_CONFIG_RETRY_WINDOW_MS;
+    if (attempts >= 3 && Date.now() >= retryDeadline) return false;
+    await sleep(delayMs);
+    delayMs = Math.min(delayMs * 2, SMOKE_CONFIG_RETRY_MAX_DELAY_MS);
   }
 }
 
@@ -606,14 +677,39 @@ async function removeTestChannels(
  * The server constructs the signed request and POSTs it to the local webhook
  * endpoint — raw secrets never leave the server.
  *
- * Returns { configured, sent, status } or null if the endpoint is unreachable.
+ * Returns admission status and an exact delivery ID, or null if the endpoint
+ * is unreachable.
  */
+type SmokeChannel = "slack" | "telegram" | "discord";
+
+function isSmokeChannel(value: unknown): value is SmokeChannel {
+  return value === "slack" || value === "telegram" || value === "discord";
+}
+
+type SmokeDispatchResult = {
+  configured: boolean;
+  sent: boolean;
+  webhookAccepted?: boolean;
+  status?: number;
+  deliveryId?: string | null;
+};
+
+type SmokeDispatchMap = Record<SmokeChannel, SmokeDispatchResult | null>;
+
+function attemptedSmokeDispatches(
+  dispatches: SmokeDispatchMap,
+): Array<[SmokeChannel, SmokeDispatchResult | null]> {
+  return (Object.entries(dispatches) as Array<
+    [SmokeChannel, SmokeDispatchResult | null]
+  >).filter(([, result]) => result === null || result.configured === true);
+}
+
 async function sendSmokeWebhook(
   baseUrl: string,
-  channel: "slack" | "telegram" | "discord" | "whatsapp",
+  channel: SmokeChannel,
   payloadBody: string,
   requestTimeoutMs: number,
-): Promise<{ configured: boolean; sent: boolean; status?: number } | null> {
+): Promise<SmokeDispatchResult | null> {
   try {
     const hdrs = { ...authHeaders({ mutation: true }), "Content-Type": "application/json" };
     const res = await fetchWithTimeout(
@@ -626,16 +722,36 @@ async function sendSmokeWebhook(
       requestTimeoutMs,
     );
     if (!res.ok) return null;
-    return (await res.json()) as { configured: boolean; sent: boolean; status?: number };
+    return (await res.json()) as SmokeDispatchResult;
   } catch {
     return null;
   }
 }
 
+type RemoteChannelDeliveryState = {
+  deliveryId?: string | null;
+  state?: string;
+  terminal?: boolean;
+  native?: {
+    ok?: boolean;
+    classification?: string | null;
+  } | null;
+  reply?: { status?: string } | null;
+};
+
+type RemoteChannelSummary = Record<
+  string,
+  {
+    connected: boolean;
+    lastError: string | null;
+    lastDeliveryState?: RemoteChannelDeliveryState | null;
+  } | null
+>;
+
 async function fetchChannelSummary(
   baseUrl: string,
   requestTimeoutMs: number,
-): Promise<Record<string, { connected: boolean; lastError: string | null }> | null> {
+): Promise<RemoteChannelSummary | null> {
   try {
     const hdrs = authHeaders();
     const res = await fetchWithTimeout(
@@ -644,164 +760,290 @@ async function fetchChannelSummary(
       requestTimeoutMs,
     );
     if (!res.ok) return null;
-    return (await res.json()) as Record<string, { connected: boolean; lastError: string | null }>;
+    return (await res.json()) as RemoteChannelSummary;
   } catch {
     return null;
   }
 }
 
-type WakeChannel = "slack" | "telegram" | "whatsapp";
+type WakeChannel = "slack" | "telegram";
 
 function selectWakeChannel(
   summary: Record<string, { connected?: boolean } | null> | null,
 ): WakeChannel | null {
   if (!summary) return null;
-  for (const channel of ["slack", "telegram", "whatsapp"] as const) {
+  for (const channel of ["slack", "telegram"] as const) {
     if (summary[channel]?.connected === true) return channel;
   }
   return null;
 }
 
+type NativeAcceptanceProbe = {
+  accepted: boolean;
+  deliveryId: string;
+  state: string | null;
+  nativeClassification: string | null;
+  replyObserved: boolean;
+  timedOut: boolean;
+  durationMs: number;
+};
+
+async function pollNativeAcceptance(input: {
+  baseUrl: string;
+  channel: SmokeChannel;
+  deliveryId: string;
+  timeoutMs: number;
+  requestTimeoutMs: number;
+}): Promise<NativeAcceptanceProbe> {
+  const startedAt = Date.now();
+  const deadline = startedAt + input.timeoutMs;
+  let lastState: RemoteChannelDeliveryState | null = null;
+
+  while (Date.now() < deadline) {
+    const summary = await fetchChannelSummary(
+      input.baseUrl,
+      input.requestTimeoutMs,
+    );
+    const candidate = summary?.[input.channel]?.lastDeliveryState ?? null;
+    if (candidate?.deliveryId === input.deliveryId) {
+      lastState = candidate;
+      const accepted =
+        candidate.native?.ok === true &&
+        candidate.native.classification === "accepted";
+      if (accepted || candidate.terminal === true) {
+        return {
+          accepted,
+          deliveryId: input.deliveryId,
+          state: candidate.state ?? null,
+          nativeClassification: candidate.native?.classification ?? null,
+          replyObserved: candidate.reply?.status === "observed",
+          timedOut: false,
+          durationMs: Date.now() - startedAt,
+        };
+      }
+    }
+    await sleep(1_000);
+  }
+
+  return {
+    accepted: false,
+    deliveryId: input.deliveryId,
+    state: lastState?.state ?? null,
+    nativeClassification: lastState?.native?.classification ?? null,
+    replyObserved: lastState?.reply?.status === "observed",
+    timedOut: true,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 // ---------------------------------------------------------------------------
-// Channel round-trip phase (tests webhook → queue → drain → completions)
+// Channel native-acceptance phase. Reply visibility requires a real observer.
 // ---------------------------------------------------------------------------
 
 export async function channelRoundTrip(baseUrl: string, opts?: PhaseOptions & { pollTimeoutMs?: number }): Promise<PhaseResult> {
   const phase = "channelRoundTrip";
   const endpoint = "/api/admin/channel-secrets";
   const reqTimeout = opts?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const pollTimeoutMs = opts?.pollTimeoutMs ?? 120_000;
 
-  let configuredByUs = false;
+  let cleanupToken: string | null = null;
 
-  try {
-    // 1. Try sending smoke webhooks (signed + delivered server-side)
-    const slackPayload = buildSlackSmokePayload().body;
-    const telegramPayload = buildTelegramSmokePayload();
-    const discordPayload = buildDiscordSmokePayload();
-    const whatsappPayload = buildWhatsAppSmokePayload();
+  const result = await (async (): Promise<PhaseResult> => {
+    try {
+    const dispatch = async (): Promise<SmokeDispatchMap> => {
+      const [slack, telegram, discord] = await Promise.all([
+        sendSmokeWebhook(
+          baseUrl,
+          "slack",
+          buildSlackSmokePayload().body,
+          reqTimeout,
+        ),
+        sendSmokeWebhook(
+          baseUrl,
+          "telegram",
+          buildTelegramSmokePayload(),
+          reqTimeout,
+        ),
+        sendSmokeWebhook(
+          baseUrl,
+          "discord",
+          buildDiscordSmokePayload(),
+          reqTimeout,
+        ),
+      ]);
+      return { slack, telegram, discord };
+    };
 
-    let slackResult = await sendSmokeWebhook(baseUrl, "slack", slackPayload, reqTimeout);
-    let telegramResult = await sendSmokeWebhook(baseUrl, "telegram", telegramPayload, reqTimeout);
-    let discordResult = await sendSmokeWebhook(baseUrl, "discord", discordPayload, reqTimeout);
-    let whatsappResult = await sendSmokeWebhook(baseUrl, "whatsapp", whatsappPayload, reqTimeout);
-
-    if (!slackResult && !telegramResult && !discordResult && !whatsappResult) {
-      log(phase, "skipped", { reason: "smoke-webhook-endpoint-unavailable" });
+    let dispatches = await dispatch();
+    if (Object.values(dispatches).every((result) => result === null)) {
+      const summary = await fetchChannelSummary(baseUrl, reqTimeout);
+      const noConfiguredChannels = summary !== null &&
+        (["slack", "telegram", "discord"] as const).every(
+          (channel) => summary[channel]?.connected === false,
+        );
+      if (noConfiguredChannels) {
+        log(phase, "skipped", { reason: "no-configured-channels" });
+        return {
+          phase, passed: true, durationMs: 0, endpoint,
+          detail: { skipped: true, reason: "No channels are configured" },
+        };
+      }
+      log(phase, "send-failed", { reason: "smoke-webhook-endpoint-unavailable" });
       return {
-        phase, passed: true, durationMs: 0, endpoint,
-        detail: { skipped: true, reason: "Could not reach smoke webhook endpoint" },
+        phase, passed: false, durationMs: 0, endpoint,
+        error: "Could not reach the smoke webhook endpoint for any channel",
+        errorCode: "WEBHOOK_SEND_FAILED",
+        detail: { dispatches },
       };
     }
 
-    let hasSlack = slackResult?.configured === true && slackResult.sent === true;
-    let hasTelegram = telegramResult?.configured === true && telegramResult.sent === true;
-    let hasDiscord = discordResult?.configured === true && discordResult.sent === true;
-    let hasWhatsApp = whatsappResult?.configured === true && whatsappResult.sent === true;
+    let attemptedDispatches = attemptedSmokeDispatches(dispatches);
 
-    if (!hasSlack && !hasTelegram && !hasDiscord && !hasWhatsApp) {
-      // Channels not configured — auto-configure test channels and retry
-      const noneConfigured =
-        slackResult?.configured === false &&
-        telegramResult?.configured === false &&
-        discordResult?.configured === false &&
-        whatsappResult?.configured === false;
+    if (attemptedDispatches.length === 0) {
+      const noneConfigured = Object.values(dispatches).every(
+        (result) => result?.configured === false,
+      );
       if (noneConfigured) {
         log(phase, "auto-configuring", { reason: "no-channels-configured" });
-        const configured = await configureTestChannels(baseUrl, reqTimeout);
-        if (!configured) {
-          log(phase, "skipped", { reason: "auto-configure-failed" });
+        const setup = await configureTestChannels(
+          baseUrl,
+          reqTimeout,
+          ["slack", "telegram", "discord"],
+        );
+        if (!setup) {
+          log(phase, "failed", { reason: "auto-configure-failed" });
           return {
-            phase, passed: true, durationMs: 0, endpoint,
-            detail: { skipped: true, reason: "No channels configured and auto-configure failed" },
+            phase,
+            passed: false,
+            durationMs: 0,
+            endpoint,
+            error: "Smoke channel setup failed or its result was ambiguous",
+            errorCode: "TEST_CHANNEL_SETUP_FAILED",
+            hint: "Retry with the same owner ID or remove any owned synthetic channel config before continuing",
           };
         }
-        configuredByUs = true;
-
-        // Retry with fresh payloads
-        const retrySlackPayload = buildSlackSmokePayload().body;
-        const retryTelegramPayload = buildTelegramSmokePayload();
-        const retryDiscordPayload = buildDiscordSmokePayload();
-        const retryWhatsAppPayload = buildWhatsAppSmokePayload();
-        slackResult = await sendSmokeWebhook(baseUrl, "slack", retrySlackPayload, reqTimeout);
-        telegramResult = await sendSmokeWebhook(baseUrl, "telegram", retryTelegramPayload, reqTimeout);
-        discordResult = await sendSmokeWebhook(baseUrl, "discord", retryDiscordPayload, reqTimeout);
-        whatsappResult = await sendSmokeWebhook(baseUrl, "whatsapp", retryWhatsAppPayload, reqTimeout);
-        hasSlack = slackResult?.configured === true && slackResult.sent === true;
-        hasTelegram = telegramResult?.configured === true && telegramResult.sent === true;
-        hasDiscord = discordResult?.configured === true && discordResult.sent === true;
-        hasWhatsApp = whatsappResult?.configured === true && whatsappResult.sent === true;
+        cleanupToken = setup.cleanupToken;
+        dispatches = await dispatch();
+        attemptedDispatches = attemptedSmokeDispatches(dispatches);
       }
 
-      if (!hasSlack && !hasTelegram && !hasDiscord && !hasWhatsApp) {
-        log(phase, "send-failed", {
-          slack: slackResult,
-          telegram: telegramResult,
-          discord: discordResult,
-          whatsapp: whatsappResult,
-        });
+      if (attemptedDispatches.length === 0) {
+        log(phase, "send-failed", dispatches);
         return {
           phase, passed: false, durationMs: 0, endpoint,
           error: "Failed to send smoke webhooks",
           errorCode: "WEBHOOK_SEND_FAILED",
-          detail: { slack: slackResult, telegram: telegramResult, discord: discordResult, whatsapp: whatsappResult },
+          detail: dispatches,
         };
       }
     }
 
-    // 2. Channel delivery uses Workflow DevKit — no queue depth to poll.
-    // Consider channels delivered once the webhook was accepted.
-    const results: Record<string, { sent: boolean; durationMs: number; error?: string }> = {};
     const t0 = performance.now();
-
-    if (hasSlack) {
-      results.slack = { sent: true, durationMs: 0 };
-    }
-    if (hasTelegram) {
-      results.telegram = { sent: true, durationMs: 0 };
-    }
-    if (hasDiscord) {
-      results.discord = { sent: true, durationMs: 0 };
-    }
-    if (hasWhatsApp) {
-      results.whatsapp = { sent: true, durationMs: 0 };
-    }
-
+    const channelResults = await Promise.all(
+      attemptedDispatches.map(async ([channel, dispatchResult]) => {
+        if (!dispatchResult) {
+          return {
+            channel,
+            deliveryId: null,
+            webhookAccepted: false,
+            nativeAccepted: false,
+            nativeClassification: null,
+            deliveryState: null,
+            replyObserved: false,
+            timedOut: false,
+            durationMs: 0,
+            error: "Smoke dispatch endpoint did not return a successful response.",
+          };
+        }
+        if (dispatchResult.webhookAccepted !== true) {
+          return {
+            channel,
+            deliveryId: dispatchResult.deliveryId ?? null,
+            webhookAccepted: false,
+            nativeAccepted: false,
+            nativeClassification: null,
+            deliveryState: null,
+            replyObserved: false,
+            timedOut: false,
+            durationMs: 0,
+            error: `Host webhook rejected the smoke delivery (HTTP ${dispatchResult.status ?? "unknown"}).`,
+          };
+        }
+        const deliveryId = dispatchResult.deliveryId ?? null;
+        if (!deliveryId) {
+          return {
+            channel,
+            deliveryId,
+            webhookAccepted: true,
+            nativeAccepted: false,
+            nativeClassification: null,
+            deliveryState: null,
+            replyObserved: false,
+            timedOut: false,
+            durationMs: 0,
+            error: "Smoke webhook did not return a deliveryId.",
+          };
+        }
+        const probe = await pollNativeAcceptance({
+          baseUrl,
+          channel,
+          deliveryId,
+          timeoutMs: pollTimeoutMs,
+          requestTimeoutMs: reqTimeout,
+        });
+        return {
+          channel,
+          deliveryId,
+          webhookAccepted: true,
+          nativeAccepted: probe.accepted,
+          nativeClassification: probe.nativeClassification,
+          deliveryState: probe.state,
+          replyObserved: probe.replyObserved,
+          timedOut: probe.timedOut,
+          durationMs: probe.durationMs,
+        };
+      }),
+    );
     const totalMs = Math.round(performance.now() - t0);
+    const passed =
+      channelResults.length > 0 &&
+      channelResults.every((result) => result.nativeAccepted);
 
-    // 5. Evaluate results
-    const channelResults = Object.entries(results).map(([ch, r]) => ({
-      channel: ch,
-      ...r,
-      durationMs: totalMs,
-    }));
-
-    const allSent = channelResults.every((r) => r.sent);
-    const passed = allSent;
-
-    log(phase, passed ? "ok" : "failed", { channelResults, configuredByUs });
-
-    // Clean up auto-configured test channels
-    if (configuredByUs) {
-      await removeTestChannels(baseUrl, reqTimeout);
-      log(phase, "test-channels-removed", {});
-    }
+    log(phase, passed ? "ok" : "failed", {
+      channelResults,
+      autoConfigured: cleanupToken !== null,
+    });
 
     return {
       phase, passed, durationMs: totalMs, endpoint: "/api/channels/*/webhook",
-      detail: { channels: channelResults, autoConfigured: configuredByUs },
+      detail: { channels: channelResults, autoConfigured: cleanupToken !== null },
       ...(!passed ? {
-        error: !allSent ? "Failed to send some webhooks" : "Queues did not drain within timeout",
-        errorCode: !allSent ? "WEBHOOK_SEND_FAILED" : "QUEUE_DRAIN_TIMEOUT",
-        hint: !allSent ? "Check channel configuration and signing secrets" : "Increase --timeout or check sandbox logs",
+        error: "Native acceptance was not observed for every smoke delivery",
+        errorCode: "NATIVE_ACCEPTANCE_NOT_OBSERVED",
+        hint: "Inspect the exact delivery IDs in /api/channels/summary; reply visibility is a separate proof surface",
       } : {}),
     };
-  } catch (err) {
-    // Clean up on failure too
-    if (configuredByUs) {
-      await removeTestChannels(baseUrl, reqTimeout);
+    } catch (err) {
+      return failFromError(phase, endpoint, err);
     }
-    return failFromError(phase, endpoint, err);
+  })();
+  if (cleanupToken) {
+    const removed = await removeTestChannels(baseUrl, reqTimeout, cleanupToken);
+    log(phase, removed ? "test-channels-removed" : "test-channel-cleanup-failed", {});
+    if (!removed) {
+      return {
+        phase,
+        passed: false,
+        durationMs: result.durationMs,
+        endpoint,
+        error: "Smoke channel cleanup failed after the round-trip phase",
+        errorCode: "TEST_CHANNEL_CLEANUP_FAILED",
+        hint: "Retry cleanup with the same owner token before trusting this smoke run",
+        detail: { originalResult: result },
+      };
+    }
   }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -817,30 +1059,44 @@ export async function channelWakeFromSleep(
   const endpoint = "/api/channels/*/webhook";
   const reqTimeout = opts?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
-  let configuredByUs = false;
+  let cleanupToken: string | null = null;
 
-  try {
+  const result = await (async (): Promise<PhaseResult> => {
+    try {
     // 1. Read channel configuration without delivering fake webhooks.
     let wakeChannel = selectWakeChannel(await fetchChannelSummary(baseUrl, reqTimeout));
 
     if (!wakeChannel) {
       // Auto-configure test channels
       log(phase, "auto-configuring", { reason: "no-wake-channel-configured" });
-      const configured = await configureTestChannels(baseUrl, reqTimeout);
-      if (!configured) {
-        log(phase, "skipped", { reason: "auto-configure-failed" });
+      const setup = await configureTestChannels(
+        baseUrl,
+        reqTimeout,
+        ["slack", "telegram"],
+      );
+      if (!setup) {
+        log(phase, "failed", { reason: "auto-configure-failed" });
         return {
-          phase, passed: true, durationMs: 0, endpoint,
-          detail: { skipped: true, reason: "No wake-capable channels configured and auto-configure failed" },
+          phase,
+          passed: false,
+          durationMs: 0,
+          endpoint,
+          error: "Wake-channel smoke setup failed or its result was ambiguous",
+          errorCode: "TEST_CHANNEL_SETUP_FAILED",
+          hint: "Retry with the same owner ID or remove any owned synthetic channel config before continuing",
         };
       }
-      configuredByUs = true;
+      cleanupToken = setup.cleanupToken;
       wakeChannel = selectWakeChannel(await fetchChannelSummary(baseUrl, reqTimeout));
       if (!wakeChannel) {
-        log(phase, "skipped", { reason: "still-not-configured-after-auto" });
+        log(phase, "failed", { reason: "still-not-configured-after-auto" });
         return {
-          phase, passed: true, durationMs: 0, endpoint,
-          detail: { skipped: true, reason: "Wake-capable channels still not configured after auto-configure" },
+          phase,
+          passed: false,
+          durationMs: 0,
+          endpoint,
+          error: "Wake-capable channels were not configured after setup",
+          errorCode: "TEST_CHANNEL_SETUP_FAILED",
         };
       }
     }
@@ -875,11 +1131,14 @@ export async function channelWakeFromSleep(
     const wakePayload =
       wakeChannel === "slack"
         ? buildSlackSmokePayload().body
-        : wakeChannel === "telegram"
-          ? buildTelegramSmokePayload()
-          : buildWhatsAppSmokePayload();
-    const wakeResult = await sendSmokeWebhook(baseUrl, wakeChannel!, wakePayload, reqTimeout);
-    if (!wakeResult?.sent) {
+        : buildTelegramSmokePayload();
+    const wakeResult = await sendSmokeWebhook(
+      baseUrl,
+      wakeChannel,
+      wakePayload,
+      reqTimeout,
+    );
+    if (!wakeResult?.webhookAccepted) {
       return {
         phase, passed: false, durationMs: Math.round(performance.now() - t0), endpoint,
         error: `Failed to send ${wakeChannel} webhook (status: ${wakeResult?.status ?? "unknown"})`,
@@ -930,22 +1189,77 @@ export async function channelWakeFromSleep(
       };
     }
 
-    // Clean up auto-configured test channels
-    if (configuredByUs) {
-      await removeTestChannels(baseUrl, reqTimeout);
-      log(phase, "test-channels-removed", {});
+    if (!wakeResult.deliveryId) {
+      return {
+        phase,
+        passed: false,
+        durationMs: totalMs,
+        endpoint,
+        error: "Wake webhook did not return a deliveryId",
+        errorCode: "DELIVERY_ID_MISSING",
+        hint: "Deploy a channel-secrets endpoint that returns exact delivery correlation IDs",
+      };
+    }
+
+    const remainingMs = Math.max(1_000, timeoutMs - totalMs);
+    const acceptance = await pollNativeAcceptance({
+      baseUrl,
+      channel: wakeChannel,
+      deliveryId: wakeResult.deliveryId,
+      timeoutMs: remainingMs,
+      requestTimeoutMs: reqTimeout,
+    });
+    const completedMs = Math.round(performance.now() - t0);
+    if (!acceptance.accepted) {
+      return {
+        phase,
+        passed: false,
+        durationMs: completedMs,
+        endpoint,
+        error: "Sandbox woke, but native acceptance was not observed for the wake delivery",
+        errorCode: "NATIVE_ACCEPTANCE_NOT_OBSERVED",
+        hint: "Inspect the exact deliveryId in /api/channels/summary; do not infer acceptance from sandbox status",
+        detail: {
+          sandboxWokeUp: true,
+          wakeChannel,
+          ...acceptance,
+        },
+      };
     }
 
     return {
-      phase, passed: true, durationMs: totalMs, endpoint,
-      detail: { sandboxWokeUp: true, queueDrained: true, autoConfigured: configuredByUs, wakeChannel },
+      phase, passed: true, durationMs: completedMs, endpoint,
+      detail: {
+        sandboxWokeUp: true,
+        nativeAccepted: true,
+        replyObserved: acceptance.replyObserved,
+        deliveryId: acceptance.deliveryId,
+        deliveryState: acceptance.state,
+        autoConfigured: cleanupToken !== null,
+        wakeChannel,
+      },
     };
-  } catch (err) {
-    if (configuredByUs) {
-      await removeTestChannels(baseUrl, reqTimeout);
+    } catch (err) {
+      return failFromError(phase, endpoint, err);
     }
-    return failFromError(phase, endpoint, err);
+  })();
+  if (cleanupToken) {
+    const removed = await removeTestChannels(baseUrl, reqTimeout, cleanupToken);
+    log(phase, removed ? "test-channels-removed" : "test-channel-cleanup-failed", {});
+    if (!removed) {
+      return {
+        phase,
+        passed: false,
+        durationMs: result.durationMs,
+        endpoint,
+        error: "Smoke channel cleanup failed after the wake phase",
+        errorCode: "TEST_CHANNEL_CLEANUP_FAILED",
+        hint: "Retry cleanup with the same owner token before trusting this smoke run",
+        detail: { originalResult: result },
+      };
+    }
   }
+  return result;
 }
 
 export async function chatCompletions(baseUrl: string, opts?: PhaseOptions): Promise<PhaseResult> {
@@ -1063,9 +1377,9 @@ export async function chatCompletions(baseUrl: string, opts?: PhaseOptions): Pro
 // Destructive phases (opt-in)
 // ---------------------------------------------------------------------------
 
-const HEAL_POLL_INITIAL_MS = 2_000;
-const HEAL_POLL_MAX_MS = 10_000;
-const HEAL_POLL_BACKOFF = 1.5;
+const POLL_INITIAL_MS = 2_000;
+const POLL_MAX_MS = 10_000;
+const POLL_BACKOFF = 1.5;
 
 async function pollUntilRunning(
   baseUrl: string,
@@ -1073,7 +1387,7 @@ async function pollUntilRunning(
   requestTimeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
 ): Promise<{ running: boolean; lastBody: Record<string, unknown> | null }> {
   const deadline = Date.now() + timeoutMs;
-  let delay = HEAL_POLL_INITIAL_MS;
+  let delay = POLL_INITIAL_MS;
   let lastBody: Record<string, unknown> | null = null;
 
   while (Date.now() < deadline) {
@@ -1093,7 +1407,7 @@ async function pollUntilRunning(
     } catch (err) {
       log("poll", "fetch-error", { error: errorMessage(err) });
     }
-    delay = Math.min(delay * HEAL_POLL_BACKOFF, HEAL_POLL_MAX_MS);
+    delay = Math.min(delay * POLL_BACKOFF, POLL_MAX_MS);
   }
 
   return { running: false, lastBody };
@@ -1279,44 +1593,47 @@ export async function restoreFromSnapshot(
 }
 
 // ---------------------------------------------------------------------------
-// Self-healing: corrupt gateway token → Telegram round-trip → verify recovery
+// Gateway continuity: prove exact native channel acceptance while chat remains
+// healthy before and after the delivery.
 // ---------------------------------------------------------------------------
 
-const HEAL_GATEWAY_TIMEOUT_MS = 60_000;
-const _HEAL_POST_KILL_SETTLE_MS = 3_000;
-const _HEAL_DEAD_CHECK_TIMEOUT_MS = 10_000;
+const CONTINUITY_GATEWAY_TIMEOUT_MS = 60_000;
 
-/**
- * Run a command on the sandbox via the admin SSH endpoint.
- * The SSH endpoint is auth-gated (admin secret or session cookie)
- * and only reachable with valid credentials.
- */
-async function _sshCommand(
-  baseUrl: string,
-  command: string,
-  timeoutMs: number,
-): Promise<{ stdout: string; stderr: string; exitCode: number } | null> {
-  try {
-    const hdrs = { ...authHeaders({ mutation: true }), "Content-Type": "application/json" };
-    const res = await fetchWithTimeout(
-      url(baseUrl, "/api/admin/ssh"),
-      { method: "POST", headers: hdrs, body: JSON.stringify({ command }) },
-      timeoutMs,
-    );
-    if (!res.ok) {
-      log("sshCommand", "error", { command: command.slice(0, 80), status: res.status });
-      return null;
-    }
-    return (await res.json()) as { stdout: string; stderr: string; exitCode: number };
-  } catch (err) {
-    log("sshCommand", "error", { command: command.slice(0, 80), error: String(err) });
-    return null;
+type GatewayContinuityHealth = {
+  healthy: boolean;
+  status: number | null;
+  contentPreview: string | null;
+};
+
+async function readGatewayContinuityHealth(
+  response: Response | null,
+): Promise<GatewayContinuityHealth> {
+  if (!response) {
+    return { healthy: false, status: null, contentPreview: null };
   }
+  const text = await response.text().catch(() => "");
+  const parsed = parseJsonBody(text);
+  const choices = parsed.ok
+    ? (parsed.data.choices as
+        | Array<{ message?: { content?: unknown } }>
+        | undefined)
+    : undefined;
+  const content = choices?.[0]?.message?.content;
+  const contentPreview =
+    typeof content === "string" ? content.slice(0, 200) : null;
+  return {
+    healthy:
+      response.status === 200 &&
+      typeof content === "string" &&
+      content.trim().length > 0,
+    status: response.status,
+    contentPreview,
+  };
 }
 
-export type SelfHealChannel = "slack" | "telegram" | "discord";
+export type ContinuityChannel = "slack" | "telegram" | "discord";
 
-function buildSelfHealPayload(channel: SelfHealChannel): string {
+function buildChannelSmokePayload(channel: ContinuityChannel): string {
   switch (channel) {
     case "slack":
       return buildSlackSmokePayload().body;
@@ -1327,18 +1644,19 @@ function buildSelfHealPayload(channel: SelfHealChannel): string {
   }
 }
 
-export async function selfHealTokenRefresh(
+export async function channelGatewayContinuity(
   baseUrl: string,
   pollTimeoutMs: number,
-  channel: SelfHealChannel,
+  channel: ContinuityChannel,
   opts?: PhaseOptions,
 ): Promise<PhaseResult> {
-  const phase = `selfHealTokenRefresh:${channel}`;
-  const endpoint = "/api/admin/ssh";
+  const phase = `channelGatewayContinuity:${channel}`;
+  const endpoint = "/api/admin/channel-secrets";
   const reqTimeout = opts?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const phaseStartedAt = performance.now();
 
   try {
-    // Step 1: Verify gateway is healthy before corrupting
+    // Step 1: Verify the gateway is healthy before channel delivery.
     const preCheck = await fetchWithTimeout(
       url(baseUrl, "/gateway/v1/chat/completions"),
       {
@@ -1346,26 +1664,32 @@ export async function selfHealTokenRefresh(
         headers: { ...authHeaders({ mutation: true }), "Content-Type": "application/json" },
         body: JSON.stringify({ model: "openclaw", messages: [{ role: "user", content: "say smoke-ok" }], stream: false }),
       },
-      HEAL_GATEWAY_TIMEOUT_MS,
+      CONTINUITY_GATEWAY_TIMEOUT_MS,
     );
-    if (!preCheck.ok) {
+    const preHealth = await readGatewayContinuityHealth(preCheck);
+    if (!preHealth.healthy) {
       return {
         phase, passed: false, durationMs: 0, endpoint,
-        error: `Gateway not healthy before corruption (HTTP ${preCheck.status})`,
+        error: `Gateway not healthy before channel delivery (HTTP ${preHealth.status ?? "unavailable"})`,
         errorCode: "PRE_CHECK_FAILED",
         hint: "Ensure the sandbox is running before this phase",
+        detail: { gateway: preHealth },
       };
     }
-    log(phase, "pre-check-ok", { status: preCheck.status });
+    log(phase, "pre-check-ok", { status: preHealth.status });
 
-    // Step 2: AI Gateway credential is brokered via network policy header
-    // transform — there is no on-disk token file to corrupt.  The self-heal
-    // test verifies the end-to-end channel round-trip path works when the
-    // gateway is healthy.
-    log(phase, "credential-brokered-via-transform", { note: "no on-disk token to corrupt" });
-
-    // Step 4: Read channel connectability
+    // Step 2: Read channel connectability.
     const baselineSummary = await fetchChannelSummary(baseUrl, reqTimeout);
+    if (!baselineSummary) {
+      return {
+        phase,
+        passed: false,
+        durationMs: Math.round(performance.now() - phaseStartedAt),
+        endpoint,
+        error: "Channel summary was unavailable before continuity delivery",
+        errorCode: "SUMMARY_UNAVAILABLE",
+      };
+    }
     const channelSummary = baselineSummary?.[channel];
     if (!channelSummary?.connected) {
       return {
@@ -1377,28 +1701,53 @@ export async function selfHealTokenRefresh(
       };
     }
 
-    // Step 5: Send a smoke webhook for the selected channel
-    const payload = buildSelfHealPayload(channel);
+    // Step 3: Send a smoke webhook and prove exact native acceptance.
+    const payload = buildChannelSmokePayload(channel);
     const sendResult = await sendSmokeWebhook(baseUrl, channel, payload, reqTimeout);
-    if (!sendResult?.sent) {
+    if (
+      sendResult?.webhookAccepted !== true ||
+      typeof sendResult.deliveryId !== "string" ||
+      sendResult.deliveryId.length === 0
+    ) {
       return {
         phase, passed: false, durationMs: 0, endpoint,
-        error: `Failed to send ${channel} smoke webhook`,
+        error: `Failed to admit ${channel} smoke webhook with an exact delivery ID`,
         errorCode: "WEBHOOK_SEND_FAILED",
         detail: { sendResult },
       };
     }
-    log(phase, "webhook-sent");
+    log(phase, "webhook-admitted", { deliveryId: sendResult.deliveryId });
 
-    // Step 6: Wait briefly then verify gateway is healthy (self-healing happens during workflow processing)
-    const t0 = performance.now();
+    const nativeAcceptance = await pollNativeAcceptance({
+      baseUrl,
+      channel,
+      deliveryId: sendResult.deliveryId,
+      timeoutMs: pollTimeoutMs,
+      requestTimeoutMs: reqTimeout,
+    });
+    if (!nativeAcceptance.accepted) {
+      return {
+        phase,
+        passed: false,
+        durationMs: nativeAcceptance.durationMs,
+        endpoint,
+        error: `Native acceptance was not observed for ${channel} delivery ${sendResult.deliveryId}`,
+        errorCode: "NATIVE_ACCEPTANCE_NOT_OBSERVED",
+        detail: { sendResult, nativeAcceptance },
+      };
+    }
+    log(phase, "native-accepted", {
+      deliveryId: sendResult.deliveryId,
+      replyObserved: nativeAcceptance.replyObserved,
+    });
+
+    // Step 4: Verify the gateway remains healthy after native acceptance.
     const deadline = Date.now() + pollTimeoutMs;
-    let delay = HEAL_POLL_INITIAL_MS;
+    let delay = POLL_INITIAL_MS;
 
     while (Date.now() < deadline) {
       await sleep(delay);
 
-      // Step 7: Verify gateway is healthy again
       const postCheck = await fetchWithTimeout(
         url(baseUrl, "/gateway/v1/chat/completions"),
         {
@@ -1406,34 +1755,43 @@ export async function selfHealTokenRefresh(
           headers: { ...authHeaders({ mutation: true }), "Content-Type": "application/json" },
           body: JSON.stringify({ model: "openclaw", messages: [{ role: "user", content: "say smoke-ok" }], stream: false }),
         },
-        HEAL_GATEWAY_TIMEOUT_MS,
+        CONTINUITY_GATEWAY_TIMEOUT_MS,
       ).catch(() => null);
 
-      const gatewayRecovered = postCheck?.ok === true;
-      const elapsedMs = Math.round(performance.now() - t0);
-      log(phase, gatewayRecovered ? "gateway-recovered" : "gateway-still-broken", {
-        status: postCheck?.status, elapsedMs,
+      const postHealth = await readGatewayContinuityHealth(postCheck);
+      const gatewayHealthyAfterDelivery = postHealth.healthy;
+      const elapsedMs = Math.round(performance.now() - phaseStartedAt);
+      log(phase, gatewayHealthyAfterDelivery ? "post-check-ok" : "post-check-failed", {
+        status: postHealth.status, elapsedMs,
       });
 
-      if (gatewayRecovered) {
+      if (gatewayHealthyAfterDelivery) {
         return {
           phase,
           passed: true,
           durationMs: elapsedMs,
           endpoint,
-          detail: { channel, gatewayRecovered, postCheckStatus: postCheck?.status, elapsedMs },
+          detail: {
+            channel,
+            gatewayHealthyAfterDelivery,
+            postCheckStatus: postHealth.status,
+            postCheckContentPreview: postHealth.contentPreview,
+            elapsedMs,
+            deliveryId: sendResult.deliveryId,
+            nativeAcceptance,
+          },
         };
       }
 
-      delay = Math.min(delay * HEAL_POLL_BACKOFF, HEAL_POLL_MAX_MS);
+      delay = Math.min(delay * POLL_BACKOFF, POLL_MAX_MS);
     }
 
-    const totalMs = Math.round(performance.now() - t0);
+    const totalMs = Math.round(performance.now() - phaseStartedAt);
     return {
       phase, passed: false, durationMs: totalMs, endpoint,
-      error: "Gateway did not recover within timeout",
+      error: "Gateway was not healthy after channel delivery within timeout",
       errorCode: "POLL_TIMEOUT",
-      hint: "Self-healing may be taking too long — increase --timeout",
+      hint: "Inspect gateway health for the exact delivery window, or increase --timeout",
     };
   } catch (err) {
     return failFromError(phase, endpoint, err);

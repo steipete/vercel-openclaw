@@ -649,6 +649,16 @@ test("cross-surface: unpinned package-spec is a warning, not a blocker", async (
           undefined,
           `channel ${ch.channel} should not have openclaw-package-spec issue`,
         );
+        if (ch.channel === "whatsapp") {
+          assert.equal(ch.canConnect, false);
+          assert.equal(
+            ch.issues.some(
+              (issue) => issue.id === "hosted-transport-unavailable",
+            ),
+            true,
+          );
+          continue;
+        }
         assert.equal(
           ch.canConnect,
           true,
@@ -1084,6 +1094,13 @@ test("preflight is config-only: passes on a fresh deployment before launch-verif
       assert.equal(payload.channels.slack.canConnect, true);
       assert.equal(payload.channels.telegram.canConnect, true);
       assert.equal(payload.channels.discord.canConnect, true);
+      assert.equal(payload.channels.whatsapp.canConnect, false);
+      assert.equal(
+        payload.channels.whatsapp.issues.some(
+          (issue) => issue.id === "hosted-transport-unavailable",
+        ),
+        true,
+      );
 
       // No launch-verification issue should appear in channel prerequisites
       for (const ch of Object.values(payload.channels)) {
@@ -1472,7 +1489,7 @@ test("preflight reports api-key when AI_GATEWAY_API_KEY is used without OIDC", a
 // Drift-resistant: webhook-bypass remediation copy and AI Gateway fallback
 // ===========================================================================
 
-test("preflight bypass remediation text mentions all channels", async () => {
+test("preflight bypass remediation text mentions only hosted channels", async () => {
   await withEnv(
     {
       VERCEL: "1",
@@ -1498,7 +1515,7 @@ test("preflight bypass remediation text mentions all channels", async () => {
       assert.ok(bypassCheck, "expected webhook-bypass check");
       assert.equal(bypassCheck.status, "warn", "missing bypass must be warn, not fail");
 
-      // The action copy must mention all channel webhooks
+      // The action copy must mention only hosted channel webhooks.
       const bypassAction = payload.actions.find(
         (a) => a.id === "configure-webhook-bypass",
       );
@@ -1506,6 +1523,11 @@ test("preflight bypass remediation text mentions all channels", async () => {
       assert.match(bypassAction.message, /Slack/i, "message must mention Slack");
       assert.match(bypassAction.message, /Telegram/i, "message must mention Telegram");
       assert.match(bypassAction.message, /Discord/i, "message must mention Discord");
+      assert.doesNotMatch(
+        bypassAction.message,
+        /WhatsApp/i,
+        "unsupported WhatsApp must not be presented as a protected webhook",
+      );
 
       // Overall preflight must still pass (bypass is diagnostic-only)
       assert.equal(payload.ok, true, "missing bypass must not make preflight fail");

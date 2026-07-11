@@ -595,10 +595,10 @@ test("buildChannelConnectabilityMap respects webhookUrlOverrides", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// WhatsApp — webhook-proxied channel
+// WhatsApp — unsupported hosted transport
 // ---------------------------------------------------------------------------
 
-test("whatsapp connectability uses webhook-proxied mode with a webhook URL", async () => {
+test("whatsapp connectability fails closed while hosted transports mismatch", async () => {
   process.env.NEXT_PUBLIC_APP_URL = PUBLIC_ORIGIN;
   process.env.REDIS_URL = "redis://default:token@example.com:6379";
   _setAiGatewayTokenOverrideForTesting("oidc-token");
@@ -609,17 +609,18 @@ test("whatsapp connectability uses webhook-proxied mode with a webhook URL", asy
   );
 
   assert.equal(result.channel, "whatsapp");
-  assert.equal(result.mode, "webhook-proxied");
-  assert.equal(
-    result.webhookUrl,
-    `${PUBLIC_ORIGIN}/api/channels/whatsapp/webhook`,
+  assert.equal(result.mode, "unsupported");
+  assert.equal(result.webhookUrl, null);
+  assert.equal(result.canConnect, false);
+  assert.equal(result.status, "fail");
+  assert.ok(
+    result.issues.some(
+      (issue) => issue.id === "hosted-transport-unavailable",
+    ),
   );
-  assert.equal(result.canConnect, true, "whatsapp should be connectable when prerequisites pass");
-  assert.equal(result.status, "pass");
-  assert.equal(result.issues.length, 0);
 });
 
-test("whatsapp connectability requires a public webhook URL", async () => {
+test("whatsapp connectability reports only the unsupported hosted transport", async () => {
   _setAiGatewayTokenOverrideForTesting("oidc-token");
 
   const result = await buildChannelConnectability(
@@ -627,12 +628,18 @@ test("whatsapp connectability requires a public webhook URL", async () => {
     makeRequest(LOCAL_ORIGIN),
   );
 
-  assert.equal(result.canConnect, false, "whatsapp should fail for missing public URL");
+  assert.equal(result.canConnect, false);
+  assert.equal(result.mode, "unsupported");
+  assert.equal(result.webhookUrl, null);
   const webhookIssue = result.issues.find((i) => i.id === "public-webhook-url");
-  assert.ok(webhookIssue, "whatsapp must have public-webhook-url issue");
+  assert.equal(webhookIssue, undefined);
+  assert.deepEqual(
+    result.issues.map((issue) => issue.id),
+    ["hosted-transport-unavailable"],
+  );
 });
 
-test("whatsapp surfaces contract issues (store, ai-gateway)", async () => {
+test("whatsapp does not advertise unrelated deployment blockers", async () => {
   process.env.VERCEL = "1";
   process.env.NEXT_PUBLIC_APP_URL = PUBLIC_ORIGIN;
   delete process.env.REDIS_URL;
@@ -645,10 +652,11 @@ test("whatsapp surfaces contract issues (store, ai-gateway)", async () => {
     makeRequest(PUBLIC_ORIGIN),
   );
 
-  const storeIssue = result.issues.find((i) => i.id === "store");
-  assert.ok(storeIssue, "whatsapp must surface store contract issue");
-  const aiGatewayIssue = result.issues.find((i) => i.id === "ai-gateway");
-  assert.ok(aiGatewayIssue, "whatsapp must surface ai-gateway contract issue");
+  assert.equal(result.issues.some((issue) => issue.id === "store"), false);
+  assert.equal(
+    result.issues.some((issue) => issue.id === "ai-gateway"),
+    false,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -665,18 +673,15 @@ test("whatsapp appears in webhook URL builders", () => {
   assert.ok(deliveryUrl?.includes("/api/channels/whatsapp/webhook"));
 });
 
-test("whatsapp connectability report includes webhookUrl in full report", async () => {
+test("whatsapp connectability report does not advertise a dead webhook", async () => {
   process.env.NEXT_PUBLIC_APP_URL = PUBLIC_ORIGIN;
   _setAiGatewayTokenOverrideForTesting("oidc-token");
 
   const request = makeRequest(PUBLIC_ORIGIN);
   const report = await buildChannelConnectabilityReport(request);
 
-  assert.equal(
-    report.whatsapp.webhookUrl,
-    `${PUBLIC_ORIGIN}/api/channels/whatsapp/webhook`,
-  );
-  assert.equal(report.whatsapp.mode, "webhook-proxied");
+  assert.equal(report.whatsapp.webhookUrl, null);
+  assert.equal(report.whatsapp.mode, "unsupported");
   assert.ok(report.slack.webhookUrl, "slack must have a webhookUrl in report");
   assert.ok(report.telegram.webhookUrl, "telegram must have a webhookUrl in report");
   assert.ok(report.discord.webhookUrl, "discord must have a webhookUrl in report");
@@ -687,8 +692,10 @@ test("webhook-proxied channels include mode field", async () => {
   _setAiGatewayTokenOverrideForTesting("oidc-token");
 
   const request = makeRequest(PUBLIC_ORIGIN);
-  for (const channel of ["slack", "telegram", "discord", "whatsapp"] as const) {
+  for (const channel of ["slack", "telegram", "discord"] as const) {
     const result = await buildChannelConnectability(channel, request);
     assert.equal(result.mode, "webhook-proxied", `${channel} should be webhook-proxied`);
   }
+  const whatsapp = await buildChannelConnectability("whatsapp", request);
+  assert.equal(whatsapp.mode, "unsupported");
 });

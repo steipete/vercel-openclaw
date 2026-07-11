@@ -1,7 +1,4 @@
-import {
-  computeGatewayConfigHash,
-  toWhatsAppGatewayConfig,
-} from "@/server/openclaw/config";
+import { computeGatewayConfigHash } from "@/server/openclaw/config";
 import { buildRestoreAssetManifest } from "@/server/openclaw/restore-assets";
 import type {
   RestoreDecision,
@@ -53,7 +50,6 @@ export function buildRestoreTargetAttestation(
           signingSecret: meta.channels.slack.signingSecret,
         }
       : undefined,
-    whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
     bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
 

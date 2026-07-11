@@ -143,6 +143,26 @@ export class MemoryStore {
     return true;
   }
 
+  async setValueIfLockHeld<T>(
+    lockKey: string,
+    token: string,
+    key: string,
+    value: T,
+    ttlSeconds: number,
+  ): Promise<boolean> {
+    this.gc();
+    const current = this.locks.get(lockKey);
+    if (!current || current.token !== token) {
+      return false;
+    }
+
+    this.values.set(key, {
+      value: JSON.stringify(value),
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+    return true;
+  }
+
   async releaseLock(key: string, token: string): Promise<void> {
     const current = this.locks.get(key);
     if (current?.token === token) {

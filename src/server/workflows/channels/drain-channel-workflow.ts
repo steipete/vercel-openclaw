@@ -5,6 +5,7 @@ import {
 } from "@/shared/channels";
 import type { BootMessageHandle } from "@/server/channels/core/types";
 import type { QueuedChannelJob } from "@/server/channels/driver";
+import { deleteSlackMessage } from "@/server/channels/slack/adapter";
 import { extractTelegramChatId } from "@/server/channels/telegram/adapter";
 import { deleteMessage, editMessageText } from "@/server/channels/telegram/bot-api";
 import { deriveChannelDeliveryId } from "@/server/channels/delivery-id";
@@ -29,7 +30,6 @@ import {
 import { ensureUsableAiGatewayCredential, markSandboxPortUrlStale } from "@/server/sandbox/lifecycle";
 import { getInitializedMeta } from "@/server/store/store";
 import { getStore } from "@/server/store/store";
-import { mutateMeta } from "@/server/store/store";
 import { createHmac } from "node:crypto";
 import { channelForwardDiagnosticKey } from "@/server/store/keyspace";
 // Discord deferred-interaction tokens are valid for 15 minutes. Soft-
@@ -290,6 +290,8 @@ export type ChannelWorkflowHandoff = {
   /** Re-enter lifecycle readiness when fast-path admission closed mid-stop. */
   revalidateSandboxBeforeForward?: boolean;
   fallbackTelegramConfig?: TelegramChannelConfig | null;
+  /** Configuration generation that authenticated the queued Telegram update. */
+  telegramConfigGeneration?: number | null;
   slackForwardHeaders?: Record<string, string> | null;
   slackRawBody?: string | null;
   discordForwardHeaders?: Record<string, string> | null;
@@ -494,6 +496,12 @@ export async function processChannelStep(
     channel === "telegram"
       ? options?.workflowHandoff?.fallbackTelegramConfig ?? null
       : null;
+  const telegramConfigGeneration =
+    channel === "telegram"
+      ? options?.workflowHandoff?.telegramConfigGeneration ??
+        fallbackTelegramConfig?.configuredAt ??
+        null
+      : null;
   const deliveryId = deriveChannelDeliveryId({
     channel,
     payload,
@@ -569,15 +577,66 @@ export async function processChannelStep(
     }
   }
 
-  await restoreTelegramConfigFromWorkflowHandoff({
-    requestId,
+  const existingBootHandle = await buildExistingBootHandle(
+    channel,
+    payload,
+    bootMessageId,
     fallbackTelegramConfig,
-  });
-
-  const existingBootHandle = await buildExistingBootHandle(channel, payload, bootMessageId);
+  );
   diag.hasExistingBootHandle = Boolean(existingBootHandle);
   let nativeAcceptance: NativeDeliveryAcceptance | null = null;
   let finalForwardClassification: string | null = null;
+
+  async function currentTelegramConfigOrSettle(
+    phase: "step-start" | "post-wake" | "pre-forward",
+  ): Promise<TelegramChannelConfig | null | undefined> {
+    if (channel !== "telegram") {
+      return null;
+    }
+
+    const state = await readTelegramWorkflowConfigState({
+      fallbackTelegramConfig,
+      expectedGeneration: telegramConfigGeneration,
+    });
+    if (state.status === "untracked" || state.status === "current") {
+      return state.config;
+    }
+
+    diag.telegramConfigGuard = state.status;
+    diag.telegramConfigGuardPhase = phase;
+    diag.outcome = `settled:telegram-config-${state.status}`;
+    diag.completedAt = Date.now();
+    diag.totalDurationMs = Date.now() - workflowStartedAt;
+    await existingBootHandle?.clear().catch((error) => {
+      logWarn("channels.telegram_stale_handoff_boot_cleanup_failed", {
+        requestId,
+        deliveryId,
+        phase,
+        reason: state.status,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+    await recordChannelDeliveryClosedOutcome({
+      channel: "telegram",
+      deliveryId,
+      outcome: "failed",
+      reason: `telegram-config-${state.status}`,
+    });
+    await resolveChannelDlqFailure("telegram", deliveryId).catch(() => {});
+    await persistDiagSnapshot("telegram-config-stale", {
+      telegramConfigGuard: state.status,
+      telegramConfigGuardPhase: phase,
+      outcome: diag.outcome,
+    });
+    logWarn("channels.telegram_workflow_handoff_stale", {
+      requestId,
+      deliveryId,
+      phase,
+      reason: state.status,
+      expectedGeneration: telegramConfigGeneration,
+    });
+    return undefined;
+  }
 
   // Discord interaction tokens expire 15 minutes after the user's slash
   // command. If we're already past the soft deadline on step entry
@@ -611,6 +670,10 @@ export async function processChannelStep(
   }
 
   try {
+    if ((await currentTelegramConfigOrSettle("step-start")) === undefined) {
+      return;
+    }
+
     // --- Phase 1: Wake the sandbox ---
     console.log(`[DIAG] Phase 1: runWithBootMessages starting`);
     // Slack and Telegram keep the boot message alive past sandbox-ready so we
@@ -655,10 +718,24 @@ export async function processChannelStep(
           timeoutMs: WORKFLOW_SANDBOX_READY_TIMEOUT_MS,
         });
     const currentMeta = await getInitializedMeta();
+    const currentTelegramConfig =
+      await currentTelegramConfigOrSettle("post-wake");
+    if (channel === "telegram" && currentTelegramConfig === undefined) {
+      return;
+    }
     let effectiveReadyMeta = {
       ...readyMeta,
       channels: readyMeta.channels ?? currentMeta.channels,
     };
+    if (channel === "telegram" && currentTelegramConfig) {
+      effectiveReadyMeta = {
+        ...effectiveReadyMeta,
+        channels: {
+          ...effectiveReadyMeta.channels,
+          telegram: currentTelegramConfig,
+        },
+      };
+    }
     let telegramRestoreContract =
       channel === "telegram"
         ? assessTelegramRestoreContract(effectiveReadyMeta)
@@ -785,6 +862,20 @@ export async function processChannelStep(
     // be the readiness mechanism. Serial local/public probe loops add seconds
     // before the first real delivery attempt on the core chat path.
     if (channel === "telegram") {
+      const telegramConfigBeforeProbe =
+        await currentTelegramConfigOrSettle("pre-forward");
+      if (telegramConfigBeforeProbe === undefined) {
+        return;
+      }
+      if (telegramConfigBeforeProbe) {
+        effectiveReadyMeta = {
+          ...effectiveReadyMeta,
+          channels: {
+            ...effectiveReadyMeta.channels,
+            telegram: telegramConfigBeforeProbe,
+          },
+        };
+      }
       const { OPENCLAW_TELEGRAM_WEBHOOK_PORT } = await import("@/server/openclaw/config");
       const webhookSecret = effectiveReadyMeta.channels?.telegram?.webhookSecret ?? null;
       // Fast-restore already verified a local 401 on 127.0.0.1:8787 before
@@ -910,6 +1001,20 @@ export async function processChannelStep(
         });
       }
 
+      const telegramConfigBeforeForward =
+        await currentTelegramConfigOrSettle("pre-forward");
+      if (telegramConfigBeforeForward === undefined) {
+        return;
+      }
+      if (telegramConfigBeforeForward) {
+        effectiveReadyMeta = {
+          ...effectiveReadyMeta,
+          channels: {
+            ...effectiveReadyMeta.channels,
+            telegram: telegramConfigBeforeForward,
+          },
+        };
+      }
       const capabilityAdmissions = await resolveWorkflowCapabilityAdmissions({
         meta: effectiveReadyMeta,
         hydrateVerifiedBundleIdentity,
@@ -1632,30 +1737,33 @@ export async function processChannelStep(
   }
 }
 
-async function restoreTelegramConfigFromWorkflowHandoff(input: {
-  requestId: string | null;
+type TelegramWorkflowConfigState =
+  | { status: "untracked"; config: TelegramChannelConfig | null }
+  | { status: "current"; config: TelegramChannelConfig }
+  | { status: "deleted" | "rotated"; config: null };
+
+async function readTelegramWorkflowConfigState(input: {
   fallbackTelegramConfig: TelegramChannelConfig | null;
-}): Promise<void> {
+  expectedGeneration: number | null;
+}): Promise<TelegramWorkflowConfigState> {
+  const current = (await getInitializedMeta()).channels.telegram;
   if (!input.fallbackTelegramConfig) {
-    return;
+    return { status: "untracked", config: current };
   }
 
-  const current = await getInitializedMeta();
-  if (current.channels.telegram) {
-    return;
+  if (!current) {
+    return { status: "deleted", config: null };
   }
 
-  await mutateMeta((meta) => {
-    if (!meta.channels.telegram) {
-      meta.channels.telegram = structuredClone(input.fallbackTelegramConfig);
-    }
-  });
-
-  logInfo("channels.telegram_workflow_handoff_restored_config", {
-    requestId: input.requestId,
-    configuredAt: input.fallbackTelegramConfig.configuredAt,
-    botUsername: input.fallbackTelegramConfig.botUsername,
-  });
+  const expectedGeneration =
+    input.expectedGeneration ?? input.fallbackTelegramConfig.configuredAt;
+  const sameGeneration = current.configuredAt === expectedGeneration;
+  const sameCredentials =
+    current.botToken === input.fallbackTelegramConfig.botToken &&
+    current.webhookSecret === input.fallbackTelegramConfig.webhookSecret;
+  return sameGeneration && sameCredentials
+    ? { status: "current", config: current }
+    : { status: "rotated", config: null };
 }
 
 const NATIVE_HANDLER_TIMEOUT_ERROR = "native_handler_timeout";
@@ -2789,14 +2897,18 @@ async function forwardToNativeHandlerWithRetry(
   };
 }
 
-async function buildExistingBootHandle(
+export async function buildExistingBootHandle(
   channel: string,
   payload: unknown,
   bootMessageId?: number | string | null,
+  telegramCleanupConfig?: TelegramChannelConfig | null,
 ): Promise<BootMessageHandle | undefined> {
   if (typeof bootMessageId === "number" && channel === "telegram") {
     const meta = await getInitializedMeta();
-    const tgConfig = meta.channels.telegram;
+    // The route posted this exact placeholder before enqueue. A handed-off
+    // credential is safe only for editing/deleting that message; delivery and
+    // sandbox config always use the current persisted generation.
+    const tgConfig = telegramCleanupConfig ?? meta.channels.telegram;
     const chatId = extractTelegramChatId(payload);
     if (tgConfig && chatId) {
       const token = tgConfig.botToken;
@@ -2853,20 +2965,18 @@ async function buildExistingBootHandle(
         },
         async clear() {
           try {
-            await fetch("https://slack.com/api/chat.delete", {
-              method: "POST",
-              headers: {
-                authorization: `Bearer ${token}`,
-                "content-type": "application/json",
-              },
-              body: JSON.stringify({ channel: slackChannel, ts: bootMessageId }),
-              signal: AbortSignal.timeout(5_000),
+            await deleteSlackMessage({
+              botToken: token,
+              channel: slackChannel,
+              ts: bootMessageId,
+              timeoutMs: 5_000,
             });
           } catch (error) {
             logWarn("channels.slack_boot_message_cleanup_failed", {
               bootMessageTs: bootMessageId,
               error: error instanceof Error ? error.message : String(error),
             });
+            throw error;
           }
         },
       };

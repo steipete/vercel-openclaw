@@ -6,6 +6,7 @@ import { RetryableSendError } from "@/server/channels/core/types";
 import type { ChannelReply } from "@/server/channels/core/types";
 import {
   createSlackAdapter,
+  deleteSlackMessage,
   getSlackUrlVerificationChallenge,
   isValidSlackSignature,
 } from "@/server/channels/slack/adapter";
@@ -203,6 +204,19 @@ test("createSlackAdapter startProcessingIndicator stop() tolerates message_not_f
   // Should not throw despite message_not_found
   await indicator?.stop();
   assert.equal(message.processingPlaceholderTs, undefined);
+});
+
+test("deleteSlackMessage rejects HTTP 200 Slack API failures", async () => {
+  await assert.rejects(
+    deleteSlackMessage({
+      botToken: "xoxb-token",
+      channel: "C123",
+      ts: "999.04",
+      fetchFn: async () =>
+        Response.json({ ok: false, error: "not_authed" }),
+    }),
+    /slack_message_delete_failed: status=200 error=not_authed/,
+  );
 });
 
 test("createSlackAdapter startProcessingIndicator stop() is idempotent", async () => {

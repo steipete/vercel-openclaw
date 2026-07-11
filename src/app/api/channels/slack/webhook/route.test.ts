@@ -14,7 +14,6 @@ import test from "node:test";
 
 import {
   channelDedupKey,
-  channelPendingBootMessageKey,
   channelUserMessageDedupKey,
 } from "@/server/channels/keys";
 import { hostSuspensionOperationKey } from "@/server/store/keyspace";
@@ -211,7 +210,7 @@ test("Slack webhook: valid event enqueues job and returns 200", async () => {
   });
 });
 
-test("Slack webhook: bot reply cleanup bypasses a host ingress fence", async () => {
+test("Slack webhook: bot reply skip bypasses a host ingress fence", async () => {
   await withHarness(async (h) => {
     await configureSlack(h);
     const now = Date.now();
@@ -237,8 +236,6 @@ test("Slack webhook: bot reply cleanup bypasses a host ingress fence", async () 
       lastErrorCode: null,
       lastErrorClass: null,
     });
-    const pendingKey = channelPendingBootMessageKey("slack", "C-bot", "thread-1");
-    await getStore().setValue(pendingKey, ["boot-ts"]);
     let deleteCalls = 0;
     h.fakeFetch.onPost(/slack\.com\/api\/chat\.delete$/, () => {
       deleteCalls += 1;
@@ -263,8 +260,12 @@ test("Slack webhook: bot reply cleanup bypasses a host ingress fence", async () 
     );
 
     assert.equal(result.status, 200);
-    assert.equal(deleteCalls, 1);
-    assert.equal(await getStore().getValue(pendingKey), null);
+    assert.equal(deleteCalls, 0);
+    assert.ok(
+      getServerLogs().some(
+        (entry) => entry.message === "channels.slack_webhook_bot_skip",
+      ),
+    );
   });
 });
 
@@ -981,14 +982,6 @@ test("Slack webhook: running fast path does not post wrapper processing placehol
       assert.equal(forwarded, true);
       assert.equal(wrapperPostMessageCalls, 0);
 
-      const pending = await getStore().getValue<unknown>(
-        channelPendingBootMessageKey(
-          "slack",
-          "C-fast-no-placeholder",
-          "1710000000.000200",
-        ),
-      );
-      assert.equal(pending, null);
       assert.equal(
         getServerLogs().some(
           (entry) => entry.message === "channels.slack_fast_path_processing_placeholder_sent",
@@ -1056,6 +1049,16 @@ test("Slack webhook: fast path token refresh failure logs and still forwards", a
 test("Slack webhook: releases dedup lock and returns 500 when workflow start fails", async () => {
   await withHarness(async (h) => {
     await configureSlack(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = null;
+    });
+    h.fakeFetch.onPost(/slack\.com\/api\/chat\.postMessage$/, () =>
+      Response.json({ ok: true, ts: "boot-start-failed" }),
+    );
+    h.fakeFetch.onPost(/slack\.com\/api\/chat\.delete$/, () =>
+      Response.json({ ok: false, error: "not_authed" }),
+    );
     const route = getSlackWebhookRoute();
     const payload = {
       type: "event_callback",
@@ -1103,6 +1106,17 @@ test("Slack webhook: releases dedup lock and returns 500 when workflow start fai
       await getStore().releaseLock(userMessageDedupKey, reacquiredUserMessageToken!);
 
       assert.equal(startMock.mock.callCount(), 1);
+      const cleanupFailure = getServerLogs().find(
+        (entry) =>
+          entry.message ===
+          "channels.slack_boot_message_cleanup_after_handoff_failed",
+      );
+      assert.ok(cleanupFailure);
+      const handoffFailure = getServerLogs().find(
+        (entry) => entry.message === "channels.slack_workflow_start_failed",
+      );
+      assert.equal(handoffFailure?.data?.bootMessageCleanupAttempted, true);
+      assert.equal(handoffFailure?.data?.bootMessageCleanupSucceeded, false);
     } finally {
       startMock.mock.restore();
     }

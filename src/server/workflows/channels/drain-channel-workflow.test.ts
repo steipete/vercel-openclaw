@@ -1,17 +1,21 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 import type { VerifiedBundleIdentity } from "@/shared/bundle-identity";
 import type { SingleMeta, RestorePhaseMetrics } from "@/shared/types";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
 import { _resetStoreForTesting, getInitializedMeta } from "@/server/store/store";
-import { setTelegramChannelConfig } from "@/server/channels/state";
+import {
+  setSlackChannelConfig,
+  setTelegramChannelConfig,
+} from "@/server/channels/state";
 import {
   getChannelDlqRecord,
   recordChannelDlqFailure,
 } from "@/server/channels/dlq";
 import {
   processChannelStep,
+  buildExistingBootHandle,
   toWorkflowProcessingError,
   type DrainChannelWorkflowDependencies,
   type ChannelWorkflowHandoff,
@@ -568,25 +572,26 @@ test("processChannelStep falls back to ensureSandboxReady when boot returns non-
   assert.equal(forwardedSandboxId, "sbx-restored");
 });
 
-test("processChannelStep restores Telegram config from workflow handoff when store is empty", async () => {
+test("processChannelStep settles a queued Telegram handoff after config deletion", async () => {
   const fallbackTelegramConfig = createFallbackTelegramConfig();
-  let bootHandleSawConfig = false;
-  let forwardedWebhookSecret: string | null = null;
+  let bootClearCalls = 0;
+  let bootCalls = 0;
+  let forwardCalls = 0;
 
   const dependencies = createWorkflowDependencies({
-    buildExistingBootHandle: async () => {
-      const meta = await getInitializedMeta();
-      bootHandleSawConfig = meta.channels.telegram?.webhookSecret === fallbackTelegramConfig.webhookSecret;
-      return undefined;
-    },
-    runWithBootMessages: async () => ({
-      meta: asMeta({ status: "running", sandboxId: "sbx-handoff" }),
-      bootMessageSent: false,
-      admissionReady: true,
+    buildExistingBootHandle: async () => ({
+      async update() {},
+      async clear() {
+        bootClearCalls += 1;
+      },
     }),
-    forwardToNativeHandlerWithRetry: async (_channel: unknown, _payload: unknown, meta: SingleMeta): Promise<RetryingForwardResult> => {
-      forwardedWebhookSecret = meta.channels.telegram?.webhookSecret ?? null;
-      return { ok: true, status: 200, attempts: 1, totalMs: 50, transport: "public", retries: [] };
+    runWithBootMessages: async () => {
+      bootCalls += 1;
+      throw new Error("must not wake after channel deletion");
+    },
+    forwardToNativeHandlerWithRetry: async () => {
+      forwardCalls += 1;
+      throw new Error("must not forward after channel deletion");
     },
   });
 
@@ -595,50 +600,50 @@ test("processChannelStep restores Telegram config from workflow handoff when sto
     { update_id: 1, message: { chat: { id: 123 } } },
     "test",
     "req-handoff",
-    null,
+    17,
     {
       dependencies,
       workflowHandoff: {
         fallbackTelegramConfig,
+        telegramConfigGeneration: fallbackTelegramConfig.configuredAt,
       } satisfies ChannelWorkflowHandoff,
     },
   );
 
   const meta = await getInitializedMeta();
-  assert.ok(bootHandleSawConfig, "boot handle should see restored Telegram config");
-  assert.equal(meta.channels.telegram?.webhookSecret, fallbackTelegramConfig.webhookSecret);
-  assert.equal(forwardedWebhookSecret, fallbackTelegramConfig.webhookSecret);
+  assert.equal(meta.channels.telegram, null);
+  assert.equal(bootClearCalls, 1);
+  assert.equal(bootCalls, 0);
+  assert.equal(forwardCalls, 0);
+  assert.equal(
+    getServerLogs().find(
+      (entry) => entry.message === "channels.telegram_workflow_handoff_stale",
+    )?.data?.reason,
+    "deleted",
+  );
 });
 
-test("processChannelStep preserves existing Telegram config over workflow handoff fallback", async () => {
+test("processChannelStep settles a queued Telegram handoff after config rotation", async () => {
   const existingConfig = {
     ...createFallbackTelegramConfig(),
     webhookSecret: "existing-secret",
     botUsername: "existing_bot",
+    configuredAt: createFallbackTelegramConfig().configuredAt + 1,
   };
   const fallbackTelegramConfig = createFallbackTelegramConfig();
-  let forwardedWebhookSecret: string | null = null;
+  let bootCalls = 0;
+  let forwardCalls = 0;
 
   await setTelegramChannelConfig(existingConfig);
 
   const dependencies = createWorkflowDependencies({
-    runWithBootMessages: async () => ({
-      meta: asMeta({
-        status: "running",
-        sandboxId: "sbx-existing",
-        channels: {
-          telegram: existingConfig as never,
-          slack: null,
-          discord: null,
-          whatsapp: null,
-        },
-      }),
-      bootMessageSent: false,
-      admissionReady: true,
-    }),
-    forwardToNativeHandlerWithRetry: async (_channel: unknown, _payload: unknown, meta: SingleMeta): Promise<RetryingForwardResult> => {
-      forwardedWebhookSecret = meta.channels.telegram?.webhookSecret ?? null;
-      return { ok: true, status: 200, attempts: 1, totalMs: 50, transport: "public", retries: [] };
+    runWithBootMessages: async () => {
+      bootCalls += 1;
+      throw new Error("must not wake after channel rotation");
+    },
+    forwardToNativeHandlerWithRetry: async () => {
+      forwardCalls += 1;
+      throw new Error("must not forward after channel rotation");
     },
   });
 
@@ -652,13 +657,130 @@ test("processChannelStep preserves existing Telegram config over workflow handof
       dependencies,
       workflowHandoff: {
         fallbackTelegramConfig,
+        telegramConfigGeneration: fallbackTelegramConfig.configuredAt,
       } satisfies ChannelWorkflowHandoff,
     },
   );
 
   const meta = await getInitializedMeta();
   assert.equal(meta.channels.telegram?.webhookSecret, existingConfig.webhookSecret);
-  assert.equal(forwardedWebhookSecret, existingConfig.webhookSecret);
+  assert.equal(bootCalls, 0);
+  assert.equal(forwardCalls, 0);
+  assert.equal(
+    getServerLogs().find(
+      (entry) => entry.message === "channels.telegram_workflow_handoff_stale",
+    )?.data?.reason,
+    "rotated",
+  );
+});
+
+test("processChannelStep rechecks Telegram config after sandbox wake", async () => {
+  const currentConfig = createFallbackTelegramConfig();
+  let forwardCalls = 0;
+  await setTelegramChannelConfig(currentConfig);
+
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => {
+      await setTelegramChannelConfig(null);
+      return {
+        meta: asMeta({
+          status: "running",
+          sandboxId: "sbx-config-deleted-during-wake",
+          channels: {
+            telegram: currentConfig,
+            slack: null,
+            discord: null,
+            whatsapp: null,
+          },
+        }),
+        bootMessageSent: false,
+        admissionReady: true,
+      };
+    },
+    forwardToNativeHandlerWithRetry: async () => {
+      forwardCalls += 1;
+      throw new Error("must not forward after channel deletion during wake");
+    },
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 4, message: { chat: { id: 999 } } },
+    "test",
+    "req-deleted-during-wake",
+    null,
+    {
+      dependencies,
+      workflowHandoff: {
+        fallbackTelegramConfig: currentConfig,
+        telegramConfigGeneration: currentConfig.configuredAt,
+      } satisfies ChannelWorkflowHandoff,
+    },
+  );
+
+  assert.equal(forwardCalls, 0);
+  assert.equal(
+    getServerLogs().find(
+      (entry) => entry.message === "channels.telegram_workflow_handoff_stale",
+    )?.data?.phase,
+    "post-wake",
+  );
+});
+
+test("processChannelStep forwards a queued Telegram handoff for the current generation", async () => {
+  const currentConfig = createFallbackTelegramConfig();
+  let forwardedWebhookSecret: string | null = null;
+
+  await setTelegramChannelConfig(currentConfig);
+
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-current",
+        channels: {
+          telegram: currentConfig,
+          slack: null,
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      bootMessageSent: false,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (
+      _channel: unknown,
+      _payload: unknown,
+      meta: SingleMeta,
+    ): Promise<RetryingForwardResult> => {
+      forwardedWebhookSecret = meta.channels.telegram?.webhookSecret ?? null;
+      return {
+        ok: true,
+        status: 200,
+        attempts: 1,
+        totalMs: 50,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 3, message: { chat: { id: 789 } } },
+    "test",
+    "req-current",
+    null,
+    {
+      dependencies,
+      workflowHandoff: {
+        fallbackTelegramConfig: currentConfig,
+        telegramConfigGeneration: currentConfig.configuredAt,
+      } satisfies ChannelWorkflowHandoff,
+    },
+  );
+
+  assert.equal(forwardedWebhookSecret, currentConfig.webhookSecret);
 });
 
 test("processChannelStep fails closed when post-wake bundle identity cannot be verified", async () => {
@@ -1995,6 +2117,62 @@ test("processChannelStep clears Slack boot message after native acceptance", asy
   assert.ok(cleanupLog, "Slack boot cleanup should be logged after native accept");
   assert.equal(cleanupLog?.data?.bootMessageId, "boot-slack-ts");
   assert.equal(cleanupLog?.data?.placeholderAction, "cleared");
+});
+
+test("processChannelStep does not report Slack boot cleanup success for API rejection", async () => {
+  await setSlackChannelConfig({
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  });
+  const fetchMock = mock.method(globalThis, "fetch", async () =>
+    Response.json({ ok: false, error: "not_authed" }),
+  );
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-slack-cleanup-rejected" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
+      ok: true,
+      status: 200,
+      attempts: 1,
+      totalMs: 50,
+      transport: "public",
+      retries: [],
+    }),
+  });
+
+  try {
+    await processChannelStep(
+      "slack",
+      { event: { channel: "C-cleanup", ts: "1710000000.000555" } },
+      "test",
+      "req-slack-cleanup-rejected",
+      "boot-slack-rejected",
+      { dependencies },
+    );
+
+    assert.equal(fetchMock.mock.callCount(), 1);
+    assert.equal(
+      getServerLogs().some(
+        (entry) =>
+          entry.message === "channels.slack_boot_message_cleared_after_accept",
+      ),
+      false,
+    );
+    assert.ok(
+      getServerLogs().some(
+        (entry) =>
+          entry.message ===
+          "channels.slack_boot_message_cleanup_after_accept_failed",
+      ),
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
 });
 
 test("processChannelStep keeps Slack 401 fatal (signature failure is unrecoverable)", async () => {

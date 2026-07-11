@@ -1020,6 +1020,7 @@ export async function POST(request: Request): Promise<Response> {
           receivedAtMs,
           workflowHandoff: {
             fallbackTelegramConfig: config,
+            telegramConfigGeneration: config.configuredAt,
             revalidateSandboxBeforeForward:
               routePlan.fastPath?.kind ===
                 FastPathOutcomeKind.FallbackToWorkflow &&

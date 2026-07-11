@@ -5,11 +5,10 @@
  * explicit shapes for the two events L4-host needs to drive end-to-end:
  *
  *   - `app_mention` (user-initiated wake)
- *   - `message` with `bot_id` (bot reply that should clear pending-boot state)
+ *   - `message` with `bot_id` (bot output that host ingress must skip)
  *
- * Both payloads accept `threadTs` so scenarios can verify the thread-rooted
- * cleanup path. The "no-thread" omission is the configuration that today
- * leaves the "🦞 Almost ready…" boot message dangling in production.
+ * Both payloads accept `threadTs` so scenarios can exercise threaded and
+ * top-level Slack event shapes.
  */
 
 import * as crypto from "node:crypto";

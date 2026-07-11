@@ -555,32 +555,35 @@ async function postProcessingPlaceholder(
   return payload.ts;
 }
 
-async function deleteProcessingPlaceholder(
-  botToken: string,
-  channel: string,
-  ts: string,
-  fetchFn?: typeof fetch,
-): Promise<void> {
-  const runFetch = fetchFn ?? globalThis.fetch;
+export async function deleteSlackMessage(input: {
+  botToken: string;
+  channel: string;
+  ts: string;
+  fetchFn?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<void> {
+  const runFetch = input.fetchFn ?? globalThis.fetch;
   let response: Response;
 
   try {
     response = await runFetch(SLACK_DELETE_MESSAGE_URL, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${botToken}`,
+        authorization: `Bearer ${input.botToken}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        channel,
-        ts,
+        channel: input.channel,
+        ts: input.ts,
       }),
-      signal: AbortSignal.timeout(SLACK_REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(
+        input.timeoutMs ?? SLACK_REQUEST_TIMEOUT_MS,
+      ),
     });
   } catch (error) {
     if (isLikelyNetworkError(error)) {
       throw toRetryableSendError(
-        `slack_processing_placeholder_delete_network: ${error instanceof Error ? error.message : String(error)}`,
+        `slack_message_delete_network: ${error instanceof Error ? error.message : String(error)}`,
         undefined,
         error,
       );
@@ -597,7 +600,7 @@ async function deleteProcessingPlaceholder(
 
   if (response.status === 429 || response.status >= 500) {
     throw toRetryableSendError(
-      `slack_processing_placeholder_delete_retryable status=${response.status}`,
+      `slack_message_delete_retryable status=${response.status}`,
       parseRetryAfterSeconds(response.headers.get("retry-after")),
     );
   }
@@ -605,8 +608,8 @@ async function deleteProcessingPlaceholder(
   const detail = typeof payload?.error === "string" ? payload.error : "";
   if (detail === "message_not_found") {
     logInfo("channels.slack_processing_placeholder_already_gone", {
-      channel,
-      ts,
+      channel: input.channel,
+      ts: input.ts,
     });
     return;
   }
@@ -614,14 +617,14 @@ async function deleteProcessingPlaceholder(
   if (!response.ok || payload?.ok !== true) {
     throw new Error(
       detail
-        ? `slack_processing_placeholder_delete_failed: status=${response.status} error=${detail}`
-        : `slack_processing_placeholder_delete_failed: status=${response.status}`,
+        ? `slack_message_delete_failed: status=${response.status} error=${detail}`
+        : `slack_message_delete_failed: status=${response.status}`,
     );
   }
 
   logInfo("channels.slack_processing_placeholder_deleted", {
-    channel,
-    ts,
+    channel: input.channel,
+    ts: input.ts,
   });
 }
 
@@ -1221,12 +1224,12 @@ export function createSlackAdapter(
 
       if (placeholderTs) {
         try {
-          await deleteProcessingPlaceholder(
-            config.botToken,
-            message.channel,
-            placeholderTs,
+          await deleteSlackMessage({
+            botToken: config.botToken,
+            channel: message.channel,
+            ts: placeholderTs,
             fetchFn,
-          );
+          });
           message.processingPlaceholderTs = undefined;
         } catch (error) {
           logWarn("channels.slack_processing_placeholder_delete_failed_after_reply", {
@@ -1310,12 +1313,12 @@ export function createSlackAdapter(
 
       if (placeholderTs) {
         try {
-          await deleteProcessingPlaceholder(
-            config.botToken,
-            message.channel,
-            placeholderTs,
+          await deleteSlackMessage({
+            botToken: config.botToken,
+            channel: message.channel,
+            ts: placeholderTs,
             fetchFn,
-          );
+          });
           message.processingPlaceholderTs = undefined;
         } catch (error) {
           logWarn("channels.slack_processing_placeholder_delete_failed_after_reply", {
@@ -1347,12 +1350,12 @@ export function createSlackAdapter(
             return;
           }
 
-          await deleteProcessingPlaceholder(
-            config.botToken,
-            message.channel,
+          await deleteSlackMessage({
+            botToken: config.botToken,
+            channel: message.channel,
             ts,
             fetchFn,
-          );
+          });
         },
       };
     },
@@ -1408,12 +1411,12 @@ export function createSlackAdapter(
         },
         async clear() {
           try {
-            await deleteProcessingPlaceholder(
-              config.botToken,
-              message.channel,
-              bootTs,
+            await deleteSlackMessage({
+              botToken: config.botToken,
+              channel: message.channel,
+              ts: bootTs,
               fetchFn,
-            );
+            });
           } catch {
             // Non-fatal — message may already be gone
           }

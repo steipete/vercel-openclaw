@@ -159,24 +159,6 @@ export function channelUserMessageDedupKey(
   return buildKey(`channels:${channel}:user-message-dedup:${channelId}:${ts}`);
 }
 
-export function channelPendingBootMessageKey(
-  channel: ChannelName,
-  channelId: string,
-  scope?: string,
-): string {
-  const base = `channels:${channel}:pending-boot:${channelId}`;
-  return buildKey(scope ? `${base}:${scope}` : base);
-}
-
-export function channelPendingBootMessageLockKey(
-  channel: ChannelName,
-  channelId: string,
-  scope?: string,
-): string {
-  const base = `channels:${channel}:pending-boot-lock:${channelId}`;
-  return buildKey(scope ? `${base}:${scope}` : base);
-}
-
 export function watchdogReportKey(): string {
   return buildKey("watchdog:latest");
 }

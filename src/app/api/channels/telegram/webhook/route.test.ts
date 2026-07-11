@@ -243,8 +243,16 @@ test("Telegram webhook: passes receivedAtMs to drainChannelWorkflow", async () =
       const envelope = args[0] as {
         version?: number;
         receivedAtMs?: number;
+        workflowHandoff?: {
+          fallbackTelegramConfig?: { configuredAt?: number };
+          telegramConfigGeneration?: number;
+        };
       };
       assert.equal(envelope.version, 1, "envelope must be v1");
+      assert.equal(
+        envelope.workflowHandoff?.telegramConfigGeneration,
+        envelope.workflowHandoff?.fallbackTelegramConfig?.configuredAt,
+      );
       const receivedAtMs = envelope.receivedAtMs as number;
       assert.equal(typeof receivedAtMs, "number", "receivedAtMs should be a number");
       assert.ok(receivedAtMs >= beforeMs, "receivedAtMs should be at or after test start");

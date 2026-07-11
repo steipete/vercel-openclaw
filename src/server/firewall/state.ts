@@ -1,5 +1,13 @@
 import { ApiError } from "@/shared/http";
-import type { FirewallEvent, FirewallIngestOutcome, FirewallReport, FirewallState, FirewallSyncOutcome, LearnedDomain } from "@/shared/types";
+import type {
+  FirewallEvent,
+  FirewallIngestOutcome,
+  FirewallReport,
+  FirewallState,
+  FirewallSyncOutcome,
+  LearnedDomain,
+  SingleMeta,
+} from "@/shared/types";
 import { computePolicyHash } from "@/shared/types";
 import { getInitializedMeta, getStore, mutateMeta } from "@/server/store/store";
 import { learningLockKey } from "@/server/store/keyspace";
@@ -22,6 +30,37 @@ type FirewallPolicyContext = {
   requestId?: string;
   controlPlaneOrigin?: string;
 };
+
+type SandboxGeneration = {
+  sandboxId: string;
+  lifecycleAttemptId: string | null;
+};
+
+function ownsSandboxGeneration(
+  meta: SingleMeta,
+  generation: SandboxGeneration,
+): boolean {
+  return (
+    meta.sandboxId === generation.sandboxId &&
+    (meta.lifecycleAttemptId ?? null) === generation.lifecycleAttemptId &&
+    (meta.status === "running" || meta.status === "booting")
+  );
+}
+
+async function mutateFirewallSyncForGeneration(
+  generation: SandboxGeneration,
+  mutator: (meta: SingleMeta) => void,
+): Promise<boolean> {
+  // The SDK update targets one external process generation. Never let its
+  // outcome or credential refresh attest a replacement sandbox.
+  let ownsGeneration = false;
+  await mutateMeta((meta) => {
+    ownsGeneration = ownsSandboxGeneration(meta, generation);
+    if (!ownsGeneration) return;
+    mutator(meta);
+  });
+  return ownsGeneration;
+}
 
 function requiredControlPlaneDomains(
   mode: FirewallState["mode"],
@@ -353,6 +392,10 @@ export async function syncFirewallPolicyIfRunning(
   }
 
   const syncStart = Date.now();
+  const generation: SandboxGeneration = {
+    sandboxId: meta.sandboxId,
+    lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+  };
   try {
     // Resolve the current AI Gateway credential so the firewall transform rule
     // is refreshed with a fresh OIDC token on every policy sync. Without this,
@@ -376,16 +419,7 @@ export async function syncFirewallPolicyIfRunning(
       applied: true,
       reason: "policy-applied",
     };
-    logInfo("firewall.sync_completed", {
-      operation: "sync",
-      durationMs,
-      policyHash: hash,
-      allowlistCount: meta.firewall.allowlist.length,
-      aiGatewayTokenApplied: !!credential?.token,
-      aiGatewayTokenSource: credential?.source ?? null,
-      requestId: options?.requestId,
-    });
-    await mutateMeta((m) => {
+    const persisted = await mutateFirewallSyncForGeneration(generation, (m) => {
       m.firewall.lastSyncAppliedAt = now;
       m.firewall.lastSyncReason = "policy-applied";
       m.firewall.lastSyncOutcome = outcome;
@@ -394,6 +428,31 @@ export async function syncFirewallPolicyIfRunning(
         m.lastTokenSource = credential.source;
         m.lastTokenExpiresAt = credential.expiresAt ?? null;
       }
+    });
+    if (!persisted) {
+      const staleOutcome: FirewallSyncOutcome = {
+        ...outcome,
+        applied: false,
+        reason: "sandbox-generation-changed",
+      };
+      logInfo("firewall.sync_discarded", {
+        operation: "sync",
+        reason: staleOutcome.reason,
+        sandboxId: generation.sandboxId,
+        lifecycleAttemptId: generation.lifecycleAttemptId,
+        policyHash: hash,
+        requestId: options?.requestId,
+      });
+      return staleOutcome;
+    }
+    logInfo("firewall.sync_completed", {
+      operation: "sync",
+      durationMs,
+      policyHash: hash,
+      allowlistCount: meta.firewall.allowlist.length,
+      aiGatewayTokenApplied: !!credential?.token,
+      aiGatewayTokenSource: credential?.source ?? null,
+      requestId: options?.requestId,
     });
     return outcome;
   } catch (error) {
@@ -409,7 +468,7 @@ export async function syncFirewallPolicyIfRunning(
       reason,
     };
     logWarn("firewall.sync_failed", { operation: "sync", code: "SYNC_APPLY_ERROR", reason, durationMs, policyHash: hash, requestId: options?.requestId });
-    await mutateMeta((m) => {
+    await mutateFirewallSyncForGeneration(generation, (m) => {
       m.firewall.lastSyncFailedAt = now;
       m.firewall.lastSyncReason = reason;
       m.firewall.lastSyncOutcome = outcome;

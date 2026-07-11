@@ -26,7 +26,11 @@ import { toNetworkPolicy } from "@/server/firewall/policy";
 import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
 import type { SandboxController, SandboxHandle } from "@/server/sandbox/controller";
 import { learningLockKey } from "@/server/store/keyspace";
-import { _resetStoreForTesting, mutateMeta } from "@/server/store/store";
+import {
+  _resetStoreForTesting,
+  getInitializedMeta,
+  mutateMeta,
+} from "@/server/store/store";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
 
 async function withFirewallTestStore(fn: () => Promise<void>): Promise<void> {
@@ -293,6 +297,7 @@ test(
 function installSucceedingSandboxController(opts?: {
   /** Shell command log content returned by `cat /tmp/shell-commands-for-learning.log` */
   shellLog?: string;
+  onUpdateNetworkPolicy?: () => void | Promise<void>;
 }): {
   readonly appliedPolicies: NetworkPolicy[];
   restore(): void;
@@ -328,6 +333,7 @@ function installSucceedingSandboxController(opts?: {
         async extendTimeout() {},
         async updateNetworkPolicy(policy: NetworkPolicy) {
           appliedPolicies.push(policy);
+          await opts?.onUpdateNetworkPolicy?.();
           return policy;
         },
         async readFileToBuffer() { return null; },
@@ -1492,6 +1498,40 @@ test("syncFirewallPolicyIfRunning persists lastSyncOutcome in metadata", async (
       assert.equal(state.lastSyncOutcome.applied, true);
       assert.equal(state.lastSyncOutcome.reason, "policy-applied");
       assert.equal(state.lastSyncOutcome.policyHash.length, 64);
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("syncFirewallPolicyIfRunning cannot attribute an old apply to a replacement generation", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-old";
+      meta.firewall.mode = "enforcing";
+      meta.firewall.allowlist = ["api.openai.com"];
+    });
+    const ctrl = installSucceedingSandboxController({
+      onUpdateNetworkPolicy: async () => {
+        await mutateMeta((meta) => {
+          meta.sandboxId = "sandbox-replacement";
+          meta.lifecycleAttemptId = "attempt-new";
+          meta.status = "booting";
+        });
+      },
+    });
+
+    try {
+      const outcome = await syncFirewallPolicyIfRunning();
+      const meta = await getInitializedMeta();
+
+      assert.equal(outcome.applied, false);
+      assert.equal(outcome.reason, "sandbox-generation-changed");
+      assert.equal(meta.sandboxId, "sandbox-replacement");
+      assert.equal(meta.lifecycleAttemptId, "attempt-new");
+      assert.equal(meta.firewall.lastSyncAppliedAt, null);
+      assert.equal(meta.firewall.lastSyncReason, null);
+      assert.equal(meta.firewall.lastSyncOutcome, null);
     } finally {
       ctrl.restore();
     }

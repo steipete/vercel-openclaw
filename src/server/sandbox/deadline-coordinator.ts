@@ -6,6 +6,7 @@ import { HostSuspensionBusyError } from "@/server/sandbox/host-suspension";
 import {
   sandboxDeadlineKey,
   sandboxDeadlineLockKey,
+  sandboxDeadlineV2Key,
 } from "@/server/store/keyspace";
 import { getInitializedMeta, getStore, mutateMeta } from "@/server/store/store";
 import {
@@ -22,12 +23,15 @@ const DEADLINE_STOP_LOCK_TTL_SECONDS = 330;
 const DEADLINE_LOCK_RETRY_MS = 25;
 const DEADLINE_LOCK_ATTEMPTS = 40;
 const WORKFLOW_STALL_GRACE_MS = 60_000;
+const WORKFLOW_START_LEASE_MS = 60_000;
+const DEADLINE_CAS_ATTEMPTS = 10;
 const MIN_BUSY_RETRY_MS = 15_000;
 const TRANSITIONAL_RETRY_MS = 5_000;
 const DEFAULT_ERROR_RETRY_MS = 30_000;
 
 export type SandboxDeadlineState = {
-  version: 1;
+  version: 2;
+  revision: number;
   generationId: string;
   lifecycleAttemptId: string | null;
   sandboxId: string;
@@ -37,6 +41,9 @@ export type SandboxDeadlineState = {
   desiredIdleMs: number;
   platformTimeoutMs: number;
   workflowRunId: string | null;
+  /** Fences a single durable Workflow-start intent for this generation. */
+  workflowAttemptId: string | null;
+  workflowStartLeaseExpiresAtMs: number | null;
   workflowStartedAtMs: number | null;
   /** Deadline the attached Workflow may currently be sleeping toward. */
   workflowScheduledDeadlineAtMs: number | null;
@@ -49,7 +56,13 @@ export type SandboxDeadlineState = {
 
 export type DeadlineCoordinatorDeps = {
   read: () => Promise<SandboxDeadlineState | null>;
+  readLegacy: () => Promise<SandboxDeadlineState | null>;
   write: (state: SandboxDeadlineState) => Promise<void>;
+  compareAndSet: (
+    expectedRevision: number | null,
+    state: SandboxDeadlineState,
+  ) => Promise<boolean>;
+  createMigrated: (state: SandboxDeadlineState) => Promise<boolean>;
   clear: () => Promise<void>;
   getMeta: () => Promise<SingleMeta>;
   recordActivity: (input: {
@@ -58,8 +71,12 @@ export type DeadlineCoordinatorDeps = {
     activityAtMs: number;
   }) => Promise<SingleMeta>;
   acquireLock: () => Promise<string | null>;
+  renewLock: (token: string) => Promise<boolean>;
   releaseLock: (token: string) => Promise<void>;
-  startWorkflow: (generationId: string) => Promise<string>;
+  startWorkflow: (
+    generationId: string,
+    workflowAttemptId: string,
+  ) => Promise<string>;
   getWorkflowStatus: (
     runId: string,
   ) => Promise<"pending" | "running" | "completed" | "failed" | "cancelled" | "missing" | "unknown">;
@@ -68,9 +85,20 @@ export type DeadlineCoordinatorDeps = {
 };
 
 const defaultDeps: DeadlineCoordinatorDeps = {
-  read: () => getStore().getValue<SandboxDeadlineState>(sandboxDeadlineKey()),
-  write: (state) => getStore().setValue(sandboxDeadlineKey(), state),
-  clear: () => getStore().deleteValue(sandboxDeadlineKey()),
+  read: () => getStore().getValue<SandboxDeadlineState>(sandboxDeadlineV2Key()),
+  readLegacy: () => getStore().getValue<SandboxDeadlineState>(sandboxDeadlineKey()),
+  write: (state) => getStore().setValue(sandboxDeadlineV2Key(), state),
+  compareAndSet: (expectedRevision, state) => getStore().compareAndSetValue(
+    sandboxDeadlineV2Key(),
+    expectedRevision,
+    state,
+  ),
+  createMigrated: (state) => getStore().compareAndSetValue(
+    sandboxDeadlineV2Key(),
+    null,
+    state,
+  ),
+  clear: () => getStore().deleteValue(sandboxDeadlineV2Key()),
   getMeta: getInitializedMeta,
   recordActivity: (input) => mutateMeta((meta) => {
     if (
@@ -87,12 +115,17 @@ const defaultDeps: DeadlineCoordinatorDeps = {
     sandboxDeadlineLockKey(),
     DEADLINE_COORDINATOR_LOCK_TTL_SECONDS,
   ),
+  renewLock: (token) => getStore().renewLock(
+    sandboxDeadlineLockKey(),
+    token,
+    DEADLINE_COORDINATOR_LOCK_TTL_SECONDS,
+  ),
   releaseLock: (token) => getStore().releaseLock(sandboxDeadlineLockKey(), token),
-  startWorkflow: async (generationId) => {
+  startWorkflow: async (generationId, workflowAttemptId) => {
     const { startSandboxDeadlineWorkflow } = await import(
       "@/server/workflows/sandbox/deadline-runtime"
     );
-    return startSandboxDeadlineWorkflow(generationId);
+    return startSandboxDeadlineWorkflow(generationId, workflowAttemptId);
   },
   getWorkflowStatus: async (runId) => {
     try {
@@ -134,7 +167,11 @@ function sameGeneration(
 type WorkflowStartPlan =
   | { kind: "none" }
   | { kind: "check"; generationId: string; workflowRunId: string }
-  | { kind: "start"; generationId: string };
+  | {
+      kind: "start";
+      generationId: string;
+      workflowAttemptId: string;
+    };
 
 function workflowRunIsTerminal(
   status: Awaited<ReturnType<DeadlineCoordinatorDeps["getWorkflowStatus"]>>,
@@ -164,25 +201,255 @@ function logDeadlineArmed(state: SandboxDeadlineState): void {
   });
 }
 
-async function startAttachedDeadlineWorkflow(
+function prepareDeadlineWorkflowStart(
   state: SandboxDeadlineState,
   deps: DeadlineCoordinatorDeps,
-): Promise<SandboxDeadlineState> {
-  // Keep the coordinator lock across Workflow creation, then persist the run
-  // ID with the deadline. A process death can leave an orphan Workflow, which
-  // exits on the generation check, but never a deadline with no repair owner.
-  const workflowRunId = await deps.startWorkflow(state.generationId);
+): { state: SandboxDeadlineState; plan: Extract<WorkflowStartPlan, { kind: "start" }> } {
   const startedAtMs = deps.now();
+  const workflowAttemptId = deps.randomId();
   return {
-    ...state,
-    workflowRunId,
-    workflowStartedAtMs: startedAtMs,
-    workflowScheduledDeadlineAtMs: state.deadlineAtMs,
-    updatedAtMs: startedAtMs,
+    state: {
+      ...state,
+      workflowRunId: null,
+      workflowAttemptId,
+      workflowStartLeaseExpiresAtMs: startedAtMs + WORKFLOW_START_LEASE_MS,
+      workflowStartedAtMs: startedAtMs,
+      workflowScheduledDeadlineAtMs: state.deadlineAtMs,
+      updatedAtMs: startedAtMs,
+      lastOutcome: "armed",
+      lastErrorCode: null,
+      lastErrorClass: null,
+    },
+    plan: {
+      kind: "start",
+      generationId: state.generationId,
+      workflowAttemptId,
+    },
+  };
+}
+
+async function migrateLegacyDeadlineState(
+  state: SandboxDeadlineState | null,
+  lockToken: string,
+  deps: DeadlineCoordinatorDeps,
+): Promise<SandboxDeadlineState | null> {
+  if (state) {
+    const persisted = state as unknown as {
+      version?: unknown;
+      revision?: unknown;
+    };
+    if (persisted.version === 2 && Number.isInteger(persisted.revision)) {
+      return state;
+    }
+    throw new ApiError(
+      503,
+      "SANDBOX_DEADLINE_TRANSITION",
+      "Sandbox deadline v2 state is not a recognized durable schema.",
+    );
+  }
+
+  const legacy = await deps.readLegacy();
+  if (!legacy) return null;
+  const persisted = legacy as unknown as {
+    version?: unknown;
+    revision?: unknown;
+  };
+  if (persisted.version !== 1 || Number.isInteger(persisted.revision)) {
+    throw new ApiError(
+      503,
+      "SANDBOX_DEADLINE_TRANSITION",
+      "Sandbox deadline v1 state is not a recognized durable schema.",
+    );
+  }
+  if (!await deps.renewLock(lockToken)) {
+    throw new ApiError(
+      503,
+      "SANDBOX_DEADLINE_TRANSITION",
+      "Sandbox deadline migration ownership expired; retry this request.",
+    );
+  }
+
+  // Rotate the generation so a Workflow pinned to the v1 deployment exits
+  // instead of publishing the unrevisioned record again after migration.
+  const migrated: SandboxDeadlineState = {
+    ...legacy,
+    version: 2,
+    revision: 1,
+    generationId: deps.randomId(),
+    workflowRunId: null,
+    workflowAttemptId: null,
+    workflowStartLeaseExpiresAtMs: null,
+    workflowStartedAtMs: null,
+    workflowScheduledDeadlineAtMs: null,
+    updatedAtMs: deps.now(),
+    lastAttemptAtMs: null,
     lastOutcome: "armed",
     lastErrorCode: null,
     lastErrorClass: null,
   };
+  if (await deps.createMigrated(migrated)) return migrated;
+  const winner = await deps.read();
+  if (winner?.version === 2 && Number.isInteger(winner.revision)) return winner;
+  throw new ApiError(
+    503,
+    "SANDBOX_DEADLINE_TRANSITION",
+    "Sandbox deadline state changed during schema migration; retry this request.",
+  );
+}
+
+async function publishDeadlineState(
+  expected: SandboxDeadlineState | null,
+  state: SandboxDeadlineState,
+  lockToken: string,
+  deps: DeadlineCoordinatorDeps,
+): Promise<SandboxDeadlineState> {
+  let currentExpected = expected;
+  let desired = state;
+  for (let attempt = 0; attempt < DEADLINE_CAS_ATTEMPTS; attempt += 1) {
+    if (!await deps.renewLock(lockToken)) {
+      throw new ApiError(
+        503,
+        "SANDBOX_DEADLINE_TRANSITION",
+        "Sandbox idle transition ownership expired; retry this request.",
+      );
+    }
+    const revision = (currentExpected?.revision ?? 0) + 1;
+    const published = { ...desired, revision };
+    if (await deps.compareAndSet(currentExpected?.revision ?? null, published)) {
+      return published;
+    }
+
+    const winner = await deps.read();
+    const attachmentWon = currentExpected?.workflowRunId === null
+      && currentExpected.workflowAttemptId !== null
+      && winner?.generationId === currentExpected.generationId
+      && winner.workflowAttemptId === currentExpected.workflowAttemptId
+      && winner.workflowRunId !== null;
+    if (!attachmentWon) break;
+    currentExpected = winner;
+    desired = {
+      ...desired,
+      workflowRunId: winner.workflowRunId,
+      workflowAttemptId: winner.workflowAttemptId,
+      workflowStartLeaseExpiresAtMs: null,
+      workflowStartedAtMs: winner.workflowStartedAtMs,
+      workflowScheduledDeadlineAtMs: winner.workflowScheduledDeadlineAtMs,
+    };
+  }
+  throw new ApiError(
+    503,
+    "SANDBOX_DEADLINE_TRANSITION",
+    "Sandbox idle transition changed concurrently; retry this request.",
+  );
+}
+
+async function attachDeadlineWorkflowRun(
+  generationId: string,
+  workflowAttemptId: string,
+  workflowRunId: string,
+  deps: DeadlineCoordinatorDeps,
+): Promise<SandboxDeadlineState | null> {
+  for (let attempt = 0; attempt < DEADLINE_CAS_ATTEMPTS; attempt += 1) {
+    const current = await deps.read();
+    if (
+      !current
+      || current.generationId !== generationId
+      || current.workflowAttemptId !== workflowAttemptId
+    ) return null;
+    if (current.workflowRunId === workflowRunId) return current;
+    if (current.workflowRunId !== null) return null;
+
+    const attached: SandboxDeadlineState = {
+      ...current,
+      revision: current.revision + 1,
+      workflowRunId,
+      workflowStartLeaseExpiresAtMs: null,
+      workflowStartedAtMs: deps.now(),
+      workflowScheduledDeadlineAtMs: current.deadlineAtMs,
+      updatedAtMs: deps.now(),
+      lastOutcome: "armed",
+      lastErrorCode: null,
+      lastErrorClass: null,
+    };
+    if (await deps.compareAndSet(current.revision, attached)) return attached;
+  }
+  throw new ApiError(
+    503,
+    "SANDBOX_DEADLINE_TRANSITION",
+    "Sandbox deadline Workflow attachment changed concurrently; retry this step.",
+  );
+}
+
+async function releaseFailedDeadlineWorkflowStart(
+  generationId: string,
+  workflowAttemptId: string,
+  error: unknown,
+  deps: DeadlineCoordinatorDeps,
+): Promise<void> {
+  for (let attempt = 0; attempt < DEADLINE_CAS_ATTEMPTS; attempt += 1) {
+    const current = await deps.read();
+    if (
+      !current
+      || current.generationId !== generationId
+      || current.workflowAttemptId !== workflowAttemptId
+      || current.workflowRunId !== null
+    ) return;
+    const identity = errorIdentity(error);
+    const released: SandboxDeadlineState = {
+      ...current,
+      revision: current.revision + 1,
+      workflowAttemptId: null,
+      workflowStartLeaseExpiresAtMs: null,
+      workflowStartedAtMs: null,
+      updatedAtMs: deps.now(),
+      lastOutcome: "error",
+      lastErrorCode: identity.code,
+      lastErrorClass: identity.className,
+    };
+    if (await deps.compareAndSet(current.revision, released)) return;
+  }
+}
+
+/** Attach a started Workflow only while its durable start intent is canonical. */
+export async function adoptSandboxDeadlineWorkflow(
+  generationId: string,
+  workflowAttemptId: string,
+  workflowRunId: string,
+  deps: DeadlineCoordinatorDeps = defaultDeps,
+): Promise<boolean> {
+  return await attachDeadlineWorkflowRun(
+    generationId,
+    workflowAttemptId,
+    workflowRunId,
+    deps,
+  ) !== null;
+}
+
+async function executeDeadlineWorkflowStart(
+  plan: Extract<WorkflowStartPlan, { kind: "start" }>,
+  deps: DeadlineCoordinatorDeps,
+): Promise<SandboxDeadlineState | null> {
+  let workflowRunId: string;
+  try {
+    workflowRunId = await deps.startWorkflow(
+      plan.generationId,
+      plan.workflowAttemptId,
+    );
+  } catch (error) {
+    await releaseFailedDeadlineWorkflowStart(
+      plan.generationId,
+      plan.workflowAttemptId,
+      error,
+      deps,
+    );
+    throw error;
+  }
+  return attachDeadlineWorkflowRun(
+    plan.generationId,
+    plan.workflowAttemptId,
+    workflowRunId,
+    deps,
+  );
 }
 
 /** Arm or move one durable desired-idle deadline for the current sandbox generation. */
@@ -254,7 +521,11 @@ export async function armSandboxDeadline(
       ? latestMeta.lastAccessedAt
       : now;
     const desiredDeadlineAtMs = committedActivityAtMs + desiredIdleMs;
-    const existing = await deps.read();
+    const existing = await migrateLegacyDeadlineState(
+      await deps.read(),
+      token,
+      deps,
+    );
     const current = sameGeneration(existing, latestMeta) ? existing : null;
     // The lifecycle owner claimed this exact expired generation while holding
     // the lifecycle lock. Activity may not reopen it behind the admission
@@ -284,16 +555,20 @@ export async function armSandboxDeadline(
           desiredIdleMs,
           platformTimeoutMs,
           workflowRunId: current.workflowRunId ?? null,
+          workflowAttemptId: current.workflowAttemptId ?? null,
+          workflowStartLeaseExpiresAtMs:
+            current.workflowStartLeaseExpiresAtMs ?? null,
           workflowScheduledDeadlineAtMs: current.workflowRunId
             ? current.workflowScheduledDeadlineAtMs ?? current.deadlineAtMs
-            : null,
+            : current.workflowScheduledDeadlineAtMs ?? null,
           updatedAtMs: now,
           lastOutcome: "armed",
           lastErrorCode: null,
           lastErrorClass: null,
         }
       : {
-          version: 1,
+          version: 2,
+          revision: existing?.revision ?? 0,
           generationId: deps.randomId(),
           lifecycleAttemptId: latestMeta.lifecycleAttemptId ?? null,
           sandboxId: latestMeta.sandboxId,
@@ -302,6 +577,8 @@ export async function armSandboxDeadline(
           desiredIdleMs,
           platformTimeoutMs,
           workflowRunId: null,
+          workflowAttemptId: null,
+          workflowStartLeaseExpiresAtMs: null,
           workflowStartedAtMs: null,
           workflowScheduledDeadlineAtMs: null,
           updatedAtMs: now,
@@ -316,19 +593,17 @@ export async function armSandboxDeadline(
     const deadlineMovedEarlier = state.workflowRunId !== null
       && priorScheduledDeadlineAtMs !== null
       && state.deadlineAtMs < priorScheduledDeadlineAtMs;
-    if (state.workflowRunId === null) {
-      workflowPlan = {
-        kind: "start",
-        generationId: state.generationId,
-      };
+    const pendingStartIsLive = state.workflowRunId === null
+      && state.workflowAttemptId !== null
+      && (state.workflowStartLeaseExpiresAtMs ?? 0) > now;
+    if (state.workflowRunId === null && !pendingStartIsLive) {
+      const prepared = prepareDeadlineWorkflowStart(state, deps);
+      state = prepared.state;
+      workflowPlan = prepared.plan;
     } else if (deadlineMovedEarlier) {
-      state.workflowRunId = null;
-      state.workflowStartedAtMs = null;
-      state.workflowScheduledDeadlineAtMs = null;
-      workflowPlan = {
-        kind: "start",
-        generationId: state.generationId,
-      };
+      const prepared = prepareDeadlineWorkflowStart(state, deps);
+      state = prepared.state;
+      workflowPlan = prepared.plan;
     } else if (
       state.workflowRunId !== null
       && options.forceWorkflowStart === true
@@ -339,17 +614,40 @@ export async function armSandboxDeadline(
         workflowRunId: state.workflowRunId,
       };
     }
-    if (workflowPlan.kind === "start") {
-      state = await startAttachedDeadlineWorkflow(state, deps);
-      workflowPlan = { kind: "none" };
+    armedState = await publishDeadlineState(existing, state, token, deps);
+    if (
+      workflowPlan.kind === "none"
+      && armedState.workflowRunId !== null
+      && (armedState.workflowScheduledDeadlineAtMs ?? armedState.deadlineAtMs)
+        > armedState.deadlineAtMs
+    ) {
+      const prepared = prepareDeadlineWorkflowStart(armedState, deps);
+      armedState = await publishDeadlineState(
+        armedState,
+        prepared.state,
+        token,
+        deps,
+      );
+      workflowPlan = prepared.plan;
     }
-    await deps.write(state);
-    armedState = state;
   } finally {
     await deps.releaseLock(token);
   }
 
   if (!armedState) return null;
+
+  if (workflowPlan.kind === "start") {
+    const attached = await executeDeadlineWorkflowStart(workflowPlan, deps);
+    if (attached) {
+      armedState = attached;
+      workflowPlan = { kind: "none" };
+    } else {
+      const current = await deps.read();
+      if (current?.generationId !== workflowPlan.generationId) return null;
+      armedState = current;
+      workflowPlan = { kind: "none" };
+    }
+  }
 
   if (workflowPlan.kind === "check") {
     const workflowStatus = await deps.getWorkflowStatus(workflowPlan.workflowRunId);
@@ -386,19 +684,35 @@ export async function armSandboxDeadline(
         logDeadlineArmed(current);
         return current;
       }
-      let repairedState: SandboxDeadlineState = {
+      const repairCandidate: SandboxDeadlineState = {
         ...current,
         workflowRunId: null,
+        workflowAttemptId: null,
+        workflowStartLeaseExpiresAtMs: null,
         workflowStartedAtMs: null,
         workflowScheduledDeadlineAtMs: null,
         updatedAtMs: now,
       };
-      repairedState = await startAttachedDeadlineWorkflow(repairedState, deps);
-      await deps.write(repairedState);
-      armedState = repairedState;
-      workflowPlan = { kind: "none" };
+      const prepared = prepareDeadlineWorkflowStart(repairCandidate, deps);
+      armedState = await publishDeadlineState(
+        current,
+        prepared.state,
+        repairToken,
+        deps,
+      );
+      workflowPlan = prepared.plan;
     } finally {
       await deps.releaseLock(repairToken);
+    }
+  }
+
+  if (workflowPlan.kind === "start") {
+    const attached = await executeDeadlineWorkflowStart(workflowPlan, deps);
+    if (attached) armedState = attached;
+    else {
+      const current = await deps.read();
+      if (current?.generationId !== workflowPlan.generationId) return null;
+      armedState = current;
     }
   }
 
@@ -500,12 +814,14 @@ export async function claimSandboxDeadlineStop(
     if (state.deadlineAtMs > deps.now() || activityDeadlineAtMs > deps.now()) {
       return false;
     }
-    await deps.write({
+    if (!await deps.renewLock(token)) return false;
+    const stoppingState: SandboxDeadlineState = {
       ...state,
+      revision: state.revision + 1,
       lastOutcome: "stopping",
       updatedAtMs: deps.now(),
-    });
-    return true;
+    };
+    return deps.compareAndSet(state.revision, stoppingState);
   } finally {
     await deps.releaseLock(token);
   }
@@ -514,8 +830,10 @@ export async function claimSandboxDeadlineStop(
 export type DeadlineStepDeps = {
   read: () => Promise<SandboxDeadlineState | null>;
   write: (state: SandboxDeadlineState) => Promise<void>;
+  compareAndSet: DeadlineCoordinatorDeps["compareAndSet"];
   clear: () => Promise<void>;
   acquireLock: () => Promise<string | null>;
+  renewLock: (token: string) => Promise<boolean>;
   releaseLock: (token: string) => Promise<void>;
   getMeta: () => Promise<SingleMeta>;
   getSandbox: (sandboxId: string) => ReturnType<ReturnType<typeof getSandboxController>["get"]>;
@@ -535,9 +853,15 @@ export type DeadlineStepDeps = {
 const defaultStepDeps: DeadlineStepDeps = {
   read: defaultDeps.read,
   write: defaultDeps.write,
+  compareAndSet: defaultDeps.compareAndSet,
   clear: defaultDeps.clear,
   acquireLock: () => getStore().acquireLock(
     sandboxDeadlineLockKey(),
+    DEADLINE_STOP_LOCK_TTL_SECONDS,
+  ),
+  renewLock: (token) => getStore().renewLock(
+    sandboxDeadlineLockKey(),
+    token,
     DEADLINE_STOP_LOCK_TTL_SECONDS,
   ),
   releaseLock: defaultDeps.releaseLock,
@@ -602,8 +926,49 @@ function deadlineSandboxIsGone(error: unknown): boolean {
 
 function deadlineStopClaimWasRevoked(error: unknown): boolean {
   return error instanceof Error
-    && "code" in error
-    && error.code === "SANDBOX_LIFECYCLE_GUARD_REJECTED";
+    && (
+      error.name === "SandboxLifecycleGuardRejectedError"
+      || error.name === "LifecycleLockOwnershipLostError"
+      || ("code" in error && error.code === "SANDBOX_LIFECYCLE_GUARD_REJECTED")
+    );
+}
+
+class DeadlineStepLeaseLostError extends Error {
+  constructor() {
+    super("Deadline step ownership changed concurrently.");
+    this.name = "DeadlineStepLeaseLostError";
+  }
+}
+
+async function publishDeadlineStepState(
+  expected: SandboxDeadlineState,
+  state: SandboxDeadlineState,
+  lockToken: string,
+  deps: DeadlineStepDeps,
+): Promise<SandboxDeadlineState> {
+  if (!await deps.renewLock(lockToken)) throw new DeadlineStepLeaseLostError();
+  const published = { ...state, revision: expected.revision + 1 };
+  if (!await deps.compareAndSet(expected.revision, published)) {
+    throw new DeadlineStepLeaseLostError();
+  }
+  return published;
+}
+
+function deadlineStepLeaseLossResult(
+  current: SandboxDeadlineState | null,
+  generationId: string,
+  workflowAttemptId: string,
+  now: number,
+): DeadlineStepResult {
+  if (
+    !current
+    || current.generationId !== generationId
+    || current.workflowAttemptId !== workflowAttemptId
+  ) return { status: "done", reason: "generation-replaced-or-cleared" };
+  return {
+    status: "sleep",
+    deadlineAtMs: Math.max(current.deadlineAtMs, now + 1_000),
+  };
 }
 
 async function reconcileDeadlinePlatformDeparture(
@@ -613,8 +978,15 @@ async function reconcileDeadlinePlatformDeparture(
     metaStatus: "uninitialized" | "stopped" | "error";
     lastError: string | null;
   },
+  lockToken: string,
   deps: DeadlineStepDeps,
 ): Promise<DeadlineStepResult> {
+  const owned = await publishDeadlineStepState(
+    state,
+    { ...state, updatedAtMs: deps.now() },
+    lockToken,
+    deps,
+  );
   await deps.reconcile({
     sandboxId: state.sandboxId,
     lifecycleAttemptId: state.lifecycleAttemptId,
@@ -634,8 +1006,21 @@ async function reconcileDeadlinePlatformDeparture(
   }
 
   const current = await deps.read();
-  if (!current || current.generationId !== state.generationId) {
+  if (
+    !current
+    || current.generationId !== owned.generationId
+    || current.workflowAttemptId !== owned.workflowAttemptId
+    || current.revision !== owned.revision
+  ) {
     return { status: "done", reason: "generation-replaced-or-cleared" };
+  }
+  if (!await deps.renewLock(lockToken)) {
+    return deadlineStepLeaseLossResult(
+      await deps.read(),
+      owned.generationId,
+      owned.workflowAttemptId!,
+      deps.now(),
+    );
   }
   await deps.clear();
   return { status: "done", reason: `${reason}-reconciled` };
@@ -643,12 +1028,17 @@ async function reconcileDeadlinePlatformDeparture(
 
 export async function processSandboxDeadlineStep(
   generationId: string,
+  workflowAttemptId: string,
   deps: DeadlineStepDeps = defaultStepDeps,
 ): Promise<DeadlineStepResult> {
   const token = await deps.acquireLock();
   if (!token) {
     const current = await deps.read();
-    if (!current || current.generationId !== generationId) {
+    if (
+      !current
+      || current.generationId !== generationId
+      || current.workflowAttemptId !== workflowAttemptId
+    ) {
       return { status: "done", reason: "generation-replaced-or-cleared" };
     }
     return {
@@ -662,7 +1052,11 @@ export async function processSandboxDeadlineStep(
   let lockReleased = false;
   try {
     const state = await deps.read();
-    if (!state || state.generationId !== generationId) {
+    if (
+      !state
+      || state.generationId !== generationId
+      || state.workflowAttemptId !== workflowAttemptId
+    ) {
       return { status: "done", reason: "generation-replaced-or-cleared" };
     }
 
@@ -672,6 +1066,7 @@ export async function processSandboxDeadlineStep(
       || meta.sandboxId !== state.sandboxId
       || (meta.lifecycleAttemptId ?? null) !== state.lifecycleAttemptId
     ) {
+      if (!await deps.renewLock(token)) throw new DeadlineStepLeaseLostError();
       await deps.clear();
       return { status: "done", reason: `sandbox-${meta.status}` };
     }
@@ -679,51 +1074,63 @@ export async function processSandboxDeadlineStep(
     const now = deps.now();
     if (now < state.deadlineAtMs) {
       if (state.workflowScheduledDeadlineAtMs !== state.deadlineAtMs) {
-        await deps.write({
-          ...state,
-          workflowScheduledDeadlineAtMs: state.deadlineAtMs,
-          updatedAtMs: now,
-        });
+        await publishDeadlineStepState(
+          state,
+          {
+            ...state,
+            workflowScheduledDeadlineAtMs: state.deadlineAtMs,
+            updatedAtMs: now,
+          },
+          token,
+          deps,
+        );
       }
       return { status: "sleep", deadlineAtMs: state.deadlineAtMs };
     }
 
     const claimedAtMs = deps.now();
-    const claimedState: SandboxDeadlineState = {
-      ...state,
-      lastAttemptAtMs: claimedAtMs,
-      updatedAtMs: claimedAtMs,
-    };
-    await deps.write(claimedState);
+    const claimedState = await publishDeadlineStepState(
+      state,
+      {
+        ...state,
+        lastAttemptAtMs: claimedAtMs,
+        updatedAtMs: claimedAtMs,
+      },
+      token,
+      deps,
+    );
 
     let sandbox;
     try {
-      sandbox = await deps.getSandbox(state.sandboxId);
+      sandbox = await deps.getSandbox(claimedState.sandboxId);
     } catch (error) {
       if (!deadlineSandboxIsGone(error)) throw error;
       return await reconcileDeadlinePlatformDeparture(
-        state,
+        claimedState,
         "platform-not-found",
         { metaStatus: "uninitialized", lastError: null },
+        token,
         deps,
       );
     }
     if (sandbox.status === "stopped") {
       return await reconcileDeadlinePlatformDeparture(
-        state,
+        claimedState,
         "platform-stopped",
         { metaStatus: "stopped", lastError: null },
+        token,
         deps,
       );
     }
     if (sandbox.status === "failed" || sandbox.status === "aborted") {
       return await reconcileDeadlinePlatformDeparture(
-        state,
+        claimedState,
         `platform-${sandbox.status}`,
         {
           metaStatus: "error",
           lastError: `sandbox ${sandbox.status}`,
         },
+        token,
         deps,
       );
     }
@@ -740,7 +1147,7 @@ export async function processSandboxDeadlineStep(
     const remainingMs = sandbox.timeoutRemaining;
     const stopRunwayMs = Math.max(
       SANDBOX_TIMEOUT_SAFETY_RUNWAY_MS,
-      state.platformTimeoutMs - state.desiredIdleMs,
+      claimedState.platformTimeoutMs - claimedState.desiredIdleMs,
     );
     const extendByMs = getSandboxTimeoutExtensionMs({
       currentTotalMs: sandbox.timeout,
@@ -752,7 +1159,11 @@ export async function processSandboxDeadlineStep(
     // Activity refresh uses this same lock. Re-read after the platform call
     // so only the still-current expired generation may cross into stop.
     const [latest, latestMeta] = await Promise.all([deps.read(), deps.getMeta()]);
-    if (!latest || latest.generationId !== generationId) {
+    if (
+      !latest
+      || latest.generationId !== generationId
+      || latest.workflowAttemptId !== workflowAttemptId
+    ) {
       return { status: "done", reason: "generation-replaced-or-cleared" };
     }
     if (
@@ -760,7 +1171,6 @@ export async function processSandboxDeadlineStep(
       || latestMeta.sandboxId !== latest.sandboxId
       || (latestMeta.lifecycleAttemptId ?? null) !== latest.lifecycleAttemptId
     ) {
-      await deps.clear();
       return { status: "done", reason: `sandbox-${latestMeta.status}` };
     }
     const activityDeadlineAtMs = typeof latestMeta.lastAccessedAt === "number"
@@ -784,19 +1194,29 @@ export async function processSandboxDeadlineStep(
         lastErrorCode: null,
         lastErrorClass: null,
       };
-      await deps.write(refreshed);
-      return { status: "sleep", deadlineAtMs: refreshed.deadlineAtMs };
+      const published = await publishDeadlineStepState(
+        latest,
+        refreshed,
+        token,
+        deps,
+      );
+      return { status: "sleep", deadlineAtMs: published.deadlineAtMs };
     }
     if (
       latest.deadlineAtMs > deps.now()
       || latest.lastAttemptAtMs !== claimedAtMs
     ) {
       if (latest.workflowScheduledDeadlineAtMs !== latest.deadlineAtMs) {
-        await deps.write({
-          ...latest,
-          workflowScheduledDeadlineAtMs: latest.deadlineAtMs,
-          updatedAtMs: deps.now(),
-        });
+        await publishDeadlineStepState(
+          latest,
+          {
+            ...latest,
+            workflowScheduledDeadlineAtMs: latest.deadlineAtMs,
+            updatedAtMs: deps.now(),
+          },
+          token,
+          deps,
+        );
       }
       return { status: "sleep", deadlineAtMs: latest.deadlineAtMs };
     }
@@ -812,7 +1232,10 @@ export async function processSandboxDeadlineStep(
       if (settleToken) {
         try {
           const current = await deps.read();
-          if (current?.generationId === generationId) await deps.clear();
+          if (
+            current?.generationId === generationId
+            && current.workflowAttemptId === workflowAttemptId
+          ) await deps.clear();
         } finally {
           await deps.releaseLock(settleToken);
         }
@@ -821,6 +1244,14 @@ export async function processSandboxDeadlineStep(
     }
     throw new Error(`Unexpected stop status: ${stopped.status}`);
   } catch (error) {
+    if (error instanceof DeadlineStepLeaseLostError) {
+      return deadlineStepLeaseLossResult(
+        await deps.read(),
+        generationId,
+        workflowAttemptId,
+        deps.now(),
+      );
+    }
     let retryToken: string | null = null;
     if (lockReleased) {
       retryToken = await deps.acquireLock();
@@ -831,7 +1262,11 @@ export async function processSandboxDeadlineStep(
     try {
       if (deadlineStopClaimWasRevoked(error)) {
         const current = await deps.read();
-        if (!current || current.generationId !== generationId) {
+        if (
+          !current
+          || current.generationId !== generationId
+          || current.workflowAttemptId !== workflowAttemptId
+        ) {
           return { status: "done", reason: "generation-replaced-or-cleared" };
         }
         return {
@@ -842,7 +1277,11 @@ export async function processSandboxDeadlineStep(
       const retryAfterMs = deadlineRetryAfterMs(error);
       const identity = errorIdentity(error);
       const retryCurrent = await deps.read();
-      if (!retryCurrent || retryCurrent.generationId !== generationId) {
+      if (
+        !retryCurrent
+        || retryCurrent.generationId !== generationId
+        || retryCurrent.workflowAttemptId !== workflowAttemptId
+      ) {
         return { status: "done", reason: "generation-replaced-or-cleared" };
       }
       const retryAtMs = deps.now();
@@ -857,7 +1296,13 @@ export async function processSandboxDeadlineStep(
         lastErrorCode: identity.code,
         lastErrorClass: identity.className,
       };
-      await deps.write(retryState);
+      const retryLockToken = retryToken ?? token;
+      const publishedRetry = await publishDeadlineStepState(
+        retryCurrent,
+        retryState,
+        retryLockToken,
+        deps,
+      );
       logWarn("sandbox.deadline.stop_deferred", {
         generationId,
         sandboxId: retryCurrent.sandboxId,
@@ -865,7 +1310,7 @@ export async function processSandboxDeadlineStep(
         errorCode: identity.code,
         errorClass: identity.className,
       });
-      return { status: "sleep", deadlineAtMs: retryState.deadlineAtMs };
+      return { status: "sleep", deadlineAtMs: publishedRetry.deadlineAtMs };
     } finally {
       if (retryToken) await deps.releaseLock(retryToken);
     }

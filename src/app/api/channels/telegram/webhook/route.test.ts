@@ -30,6 +30,7 @@ import {
   type VerifiedBundleAdmission,
 } from "@/server/openclaw/bundle-identity";
 import type { VerifiedBundleIdentity } from "@/shared/bundle-identity";
+import { channelConfigLockKey } from "@/server/store/keyspace";
 
 const TELEGRAM_WEBHOOK_SECRET = "test-telegram-webhook-secret-direct";
 
@@ -449,8 +450,13 @@ test("Telegram webhook: fast path fires when telegramListenerReady is missing", 
     });
 
     let fastPathForwardCount = 0;
-    h.fakeFetch.onPost(/telegram-webhook$/, () => {
+    h.fakeFetch.onPost(/telegram-webhook$/, async () => {
       fastPathForwardCount += 1;
+      assert.equal(
+        await getStore().acquireLock(channelConfigLockKey("telegram"), 90),
+        null,
+        "warm delivery must retain the Telegram config lease through dispatch",
+      );
       return new Response("ok", {
         status: 200,
         headers: { "x-openclaw-delivery-accepted": "durable" },
@@ -480,6 +486,57 @@ test("Telegram webhook: fast path fires when telegramListenerReady is missing", 
       );
       resetAfterCallbacks();
     } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
+test("Telegram webhook: busy config lease falls back durably before dispatch", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-telegram-config-busy";
+      meta.portUrls = {
+        "8787": "https://sbx-telegram-config-busy-8787.fake.vercel.run",
+      };
+    });
+    let forwardCalls = 0;
+    h.fakeFetch.onPost(/telegram-webhook$/, () => {
+      forwardCalls += 1;
+      return new Response("ok", { status: 200 });
+    });
+    h.fakeFetch.onPost(/api\.telegram\.org/, () =>
+      Response.json({ ok: true, result: { message_id: 1 } }),
+    );
+    const token = await getStore().acquireLock(
+      channelConfigLockKey("telegram"),
+      90,
+    );
+    assert.ok(token);
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+
+    try {
+      const result = await callRoute(
+        getTelegramWebhookRoute().POST,
+        buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+      );
+      assert.equal(result.status, 200);
+      assert.equal(forwardCalls, 0);
+      assert.equal(startMock.mock.callCount(), 1);
+      assert.equal(
+        getServerLogs().find(
+          (entry) => entry.message === "channels.telegram_fast_path_setup_failed",
+        )?.data?.error,
+        "telegram_config_lease_unavailable_before_dispatch",
+      );
+      resetAfterCallbacks();
+    } finally {
+      await getStore().releaseLock(channelConfigLockKey("telegram"), token);
       startMock.mock.restore();
     }
   });
@@ -1387,6 +1444,10 @@ test("Telegram webhook: fast path non-ok response falls through to workflow wake
 test("Telegram webhook: duplicate update_id is deduplicated", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
+    const config = (await h.getMeta()).channels.telegram;
+    assert.ok(config);
+    const telegramDeliveryId =
+      `telegram:${config.botUsername}:${config.configuredAt}:99999`;
     _resetLogBuffer();
     h.fakeFetch.onPost(/api\.telegram\.org/, () =>
       Response.json({ ok: true, result: { message_id: 1 } }),
@@ -1422,7 +1483,143 @@ test("Telegram webhook: duplicate update_id is deduplicated", async () => {
       );
       assert.ok(dedupSkip, "duplicate Telegram update skip should be logged");
       assert.equal(dedupSkip.data?.updateId, "99999");
-      assert.equal(dedupSkip.data?.dedupKey, channelDedupKey("telegram", "99999"));
+      assert.equal(
+        dedupSkip.data?.dedupKey,
+        channelDedupKey("telegram", telegramDeliveryId),
+      );
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
+test("Telegram webhook: the same update_id is distinct after config rotation", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    const firstConfig = (await h.getMeta()).channels.telegram;
+    assert.ok(firstConfig);
+    h.fakeFetch.onPost(/api\.telegram\.org/, () =>
+      Response.json({ ok: true, result: { message_id: 1 } }),
+    );
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    const payload = {
+      update_id: 777,
+      message: { chat: { id: 123 }, text: "generation scoped" },
+    };
+
+    try {
+      const first = await callRoute(
+        route.POST,
+        buildTelegramWebhook({
+          webhookSecret: firstConfig.webhookSecret,
+          payload,
+        }),
+      );
+      assert.equal(first.status, 200);
+      resetAfterCallbacks();
+
+      const secondSecret = "rotated-webhook-secret";
+      await h.mutateMeta((meta) => {
+        assert.ok(meta.channels.telegram);
+        meta.channels.telegram = {
+          ...meta.channels.telegram,
+          webhookSecret: secondSecret,
+          configuredAt: firstConfig.configuredAt + 1,
+        };
+      });
+      const second = await callRoute(
+        route.POST,
+        buildTelegramWebhook({ webhookSecret: secondSecret, payload }),
+      );
+      assert.equal(second.status, 200);
+      assert.equal(startMock.mock.callCount(), 2);
+
+      const deliveryIds = startMock.mock.calls.map((call) => {
+        const envelope = (call.arguments[1] as unknown[])[0] as {
+          workflowHandoff?: { fallbackTelegramConfig?: { configuredAt?: number } };
+        };
+        const configuredAt =
+          envelope.workflowHandoff?.fallbackTelegramConfig?.configuredAt;
+        return `telegram:test_bot:${configuredAt}:777`;
+      });
+      assert.deepEqual(deliveryIds, [
+        `telegram:test_bot:${firstConfig.configuredAt}:777`,
+        `telegram:test_bot:${firstConfig.configuredAt + 1}:777`,
+      ]);
+      resetAfterCallbacks();
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
+test("Telegram webhook: previous-secret retry keeps its original delivery generation", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    const firstConfig = (await h.getMeta()).channels.telegram;
+    assert.ok(firstConfig);
+    h.fakeFetch.onPost(/api\.telegram\.org/, () =>
+      Response.json({ ok: true, result: { message_id: 1 } }),
+    );
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(
+      telegramWebhookWorkflowRuntime,
+      "start",
+      async () => {},
+    );
+    const payload = {
+      update_id: 778,
+      message: { chat: { id: 123 }, text: "grace retry" },
+    };
+
+    try {
+      const first = await callRoute(
+        route.POST,
+        buildTelegramWebhook({
+          webhookSecret: firstConfig.webhookSecret,
+          payload,
+        }),
+      );
+      assert.equal(first.status, 200);
+      resetAfterCallbacks();
+      _resetLogBuffer();
+
+      await h.mutateMeta((meta) => {
+        assert.ok(meta.channels.telegram);
+        meta.channels.telegram = {
+          ...meta.channels.telegram,
+          webhookSecret: "current-secret-after-rotation",
+          configuredAt: firstConfig.configuredAt + 1,
+          previousWebhookSecret: firstConfig.webhookSecret,
+          previousSecretExpiresAt: Date.now() + 60_000,
+          previousBotUsername: firstConfig.botUsername,
+          previousConfiguredAt: firstConfig.configuredAt,
+        };
+      });
+      const retry = await callRoute(
+        route.POST,
+        buildTelegramWebhook({
+          webhookSecret: firstConfig.webhookSecret,
+          payload,
+        }),
+      );
+      assert.equal(retry.status, 200);
+      assert.equal(startMock.mock.callCount(), 1);
+      const dedupSkip = getServerLogs().find(
+        (entry) => entry.message === "channels.telegram_webhook_dedup_skip",
+      );
+      assert.equal(
+        dedupSkip?.data?.dedupKey,
+        channelDedupKey(
+          "telegram",
+          `telegram:${firstConfig.botUsername}:${firstConfig.configuredAt}:778`,
+        ),
+      );
     } finally {
       startMock.mock.restore();
     }
@@ -1468,6 +1665,8 @@ test("Telegram webhook: unexpected enqueue failure returns 500", async () => {
 test("Telegram webhook: deletes boot message and releases dedup lock when workflow start fails", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
+    const config = (await h.getMeta()).channels.telegram;
+    assert.ok(config);
     const bootMessageId = 77;
     const sendCalls: string[] = [];
     const deleteCalls: string[] = [];
@@ -1490,7 +1689,10 @@ test("Telegram webhook: deletes boot message and releases dedup lock when workfl
         text: "boot cleanup",
       },
     };
-    const dedupKey = channelDedupKey("telegram", String(payload.update_id));
+    const dedupKey = channelDedupKey(
+      "telegram",
+      `telegram:${config.botUsername}:${config.configuredAt}:${payload.update_id}`,
+    );
     const startMock = mock.method(telegramWebhookWorkflowRuntime, "start", async () => {
       throw new Error("workflow engine unavailable");
     });
@@ -1521,6 +1723,8 @@ test("Telegram webhook: deletes boot message and releases dedup lock when workfl
 test("Telegram webhook: releases dedup lock and returns 500 when workflow start fails", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
+    const config = (await h.getMeta()).channels.telegram;
+    assert.ok(config);
     h.fakeFetch.onPost(/api\.telegram\.org/, () =>
       Response.json({ ok: true, result: { message_id: 42 } }),
     );
@@ -1535,7 +1739,10 @@ test("Telegram webhook: releases dedup lock and returns 500 when workflow start 
         text: "start fail",
       },
     };
-    const dedupKey = channelDedupKey("telegram", String(payload.update_id));
+    const dedupKey = channelDedupKey(
+      "telegram",
+      `telegram:${config.botUsername}:${config.configuredAt}:${payload.update_id}`,
+    );
     const startMock = mock.method(telegramWebhookWorkflowRuntime, "start", async () => {
       throw new Error("workflow engine unavailable");
     });

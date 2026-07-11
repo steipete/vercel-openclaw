@@ -37,6 +37,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 const sourceId = randomUUID();
 const sourceStartedAtMs = Date.now();
 const attemptTimeoutMs = 30_000;
+const sourceLeaseHeartbeatMs = 30_000;
 const maxProjectedWakes = ${OPENCLAW_CRON_PROJECTION_MAX_WAKES};
 const settlementGraceMs = 5 * 60_000;
 const overdueSafetyIntervalMs = 15 * 60_000;
@@ -84,6 +85,8 @@ export default definePluginEntry({
     let activeAttempt;
     let settlementTimer;
     let reconciliationSignal;
+    let sourceLeaseToken = null;
+    let sourceLeaseHeartbeat;
 
     const waitUntil = async (deadlineMs, signal) => {
       while (Date.now() < deadlineMs) {
@@ -111,6 +114,20 @@ export default definePluginEntry({
       void waitUntil(deadlineMs, signal)
         .then(() => {
           if (!signal.aborted && settlementTimer === timer) {
+            return requestProjection("changed");
+          }
+        })
+        .catch(() => undefined);
+    };
+
+    const scheduleSourceLeaseHeartbeat = () => {
+      sourceLeaseHeartbeat?.abort();
+      const timer = new AbortController();
+      sourceLeaseHeartbeat = timer;
+      const signal = AbortSignal.any([lifecycle.signal, timer.signal]);
+      void sleep(sourceLeaseHeartbeatMs, undefined, { signal })
+        .then(() => {
+          if (!signal.aborted && sourceLeaseHeartbeat === timer) {
             return requestProjection("changed");
           }
         })
@@ -175,6 +192,7 @@ export default definePluginEntry({
               schemaVersion: 1,
               gatewayGeneration,
               sourceId,
+              sourceLeaseToken,
               sourceStartedAtMs,
               sourceRevision: targetRevision,
               reason: targetReason,
@@ -193,12 +211,17 @@ export default definePluginEntry({
             if (responseStatus !== "accepted" && responseStatus !== "idempotent") {
               throw new Error("host did not accept cron projection ownership");
             }
+            if (typeof payload?.sourceLeaseToken !== "string") {
+              throw new Error("host omitted cron projection lease token");
+            }
+            sourceLeaseToken = payload.sourceLeaseToken;
           } finally {
             if (!response.bodyUsed) await response.body?.cancel();
           }
           if (signal.aborted || targetRevision !== requestedRevision) continue;
           appliedRevision = targetRevision;
           scheduleSettlementSafety(wakes);
+          scheduleSourceLeaseHeartbeat();
           retryMs = 1_000;
         } catch {
           if (lifecycle.signal.aborted) return;
@@ -254,6 +277,7 @@ export default definePluginEntry({
     api.on("gateway_stop", async () => {
       lifecycle.abort();
       settlementTimer?.abort();
+      sourceLeaseHeartbeat?.abort();
       await worker;
     });
   },

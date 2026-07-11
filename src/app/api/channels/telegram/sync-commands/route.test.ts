@@ -8,6 +8,7 @@ import {
   buildAuthPostRequest,
   getTelegramSyncCommandsRoute,
 } from "@/test-utils/route-caller";
+import { channelConfigLockKey } from "@/server/store/keyspace";
 
 test("Telegram sync-commands: POST without auth returns 401", async () => {
   await withHarness(async () => {
@@ -43,8 +44,19 @@ test("Telegram sync-commands: syncs commands and stores success state", async ()
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = h.fakeFetch.fetch;
-    h.fakeFetch.onPost(/api\.telegram\.org\/bot.*\/setMyCommands/, () =>
-      Response.json({ ok: true, result: true }),
+    h.fakeFetch.onPost(
+      /api\.telegram\.org\/bot.*\/setMyCommands/,
+      async () => {
+        assert.equal(
+          await h.getStore().acquireLock(
+            channelConfigLockKey("telegram"),
+            90,
+          ),
+          null,
+          "command sync must retain the Telegram config lease",
+        );
+        return Response.json({ ok: true, result: true });
+      },
     );
 
     try {

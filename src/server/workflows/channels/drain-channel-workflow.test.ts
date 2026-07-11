@@ -21,13 +21,13 @@ import {
 import {
   processChannelStep,
   buildExistingBootHandle,
-  drainChannelWorkflow,
   toWorkflowProcessingError,
   type DrainChannelWorkflowDependencies,
   type ChannelWorkflowHandoff,
   type RetryingForwardResult,
   type TelegramProbeResult,
-} from "@/server/workflows/channels/drain-channel-workflow";
+} from "@/server/workflows/channels/drain-channel-step";
+import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-workflow";
 
 class TestRetryableError extends Error {
   retryAfter?: string;
@@ -644,6 +644,13 @@ test("processChannelStep settles a queued Telegram handoff after config deletion
     )?.data?.reason,
     "deleted",
   );
+  const failure = await getChannelDlqRecord(
+    "telegram",
+    `telegram:${fallbackTelegramConfig.botUsername}:${fallbackTelegramConfig.configuredAt}:1`,
+  );
+  assert.equal(failure?.terminal, true);
+  assert.equal(failure?.deliveryOutcome, "not-accepted");
+  assert.equal(failure?.errorMessage, "telegram-config-deleted");
 });
 
 test("processChannelStep settles a queued Telegram handoff after config rotation", async () => {
@@ -695,6 +702,13 @@ test("processChannelStep settles a queued Telegram handoff after config rotation
     )?.data?.reason,
     "rotated",
   );
+  const failure = await getChannelDlqRecord(
+    "telegram",
+    `telegram:${fallbackTelegramConfig.botUsername}:${fallbackTelegramConfig.configuredAt}:2`,
+  );
+  assert.equal(failure?.terminal, true);
+  assert.equal(failure?.deliveryOutcome, "not-accepted");
+  assert.equal(failure?.errorMessage, "telegram-config-rotated");
 });
 
 test("processChannelStep rechecks Telegram config after sandbox wake", async () => {
@@ -827,6 +841,71 @@ test("processChannelStep forwards a queued Telegram handoff for the current gene
     "Telegram dispatch lease must cover the retry deadline and final fetch",
   );
   store.acquireLock = acquireLock;
+});
+
+test("processChannelStep closes Telegram delivery as unknown when its lease is lost after dispatch", async () => {
+  const currentConfig = createFallbackTelegramConfig();
+  await setTelegramChannelConfig(currentConfig);
+  const store = getStore();
+  const renewLock = store.renewLock.bind(store);
+
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-lease-lost",
+        channels: {
+          telegram: currentConfig,
+          slack: null,
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      bootMessageSent: false,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      store.renewLock = async () => false;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 50,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  try {
+    await assert.rejects(
+      processChannelStep(
+        "telegram",
+        { update_id: 88, message: { chat: { id: 789 } } },
+        "test",
+        "req-lease-lost",
+        null,
+        {
+          dependencies,
+          workflowHandoff: {
+            fallbackTelegramConfig: currentConfig,
+            telegramConfigGeneration: currentConfig.configuredAt,
+          },
+        },
+      ),
+      (error: unknown) => error instanceof TestFatalError,
+    );
+  } finally {
+    store.renewLock = renewLock;
+  }
+
+  const failure = await getChannelDlqRecord(
+    "telegram",
+    `telegram:${currentConfig.botUsername}:${currentConfig.configuredAt}:88`,
+  );
+  assert.equal(failure?.deliveryOutcome, "unknown");
+  assert.equal(failure?.terminal, true);
 });
 
 test("processChannelStep fails closed when post-wake bundle identity cannot be verified", async () => {
@@ -2221,6 +2300,319 @@ test("processChannelStep does not report Slack boot cleanup success for API reje
   }
 });
 
+test("processChannelStep creates and clears the Slack placeholder inside durable workflow", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const calls: string[] = [];
+  const postBodies: Array<Record<string, unknown>> = [];
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("chat.postMessage")) {
+        postBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return Response.json({ ok: true, ts: "boot-durable-ts" });
+      }
+      if (url.endsWith("chat.delete")) {
+        return Response.json({ ok: true });
+      }
+      throw new Error(`unexpected Slack API call: ${url}`);
+    },
+  );
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-slack-durable-placeholder",
+        channels: {
+          telegram: null,
+          slack: config,
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+  });
+
+  try {
+    await processChannelStep(
+      "slack",
+      { event_id: "Ev-durable", event: { channel: "C-durable" } },
+      "test",
+      "req-slack-durable",
+      null,
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: {
+            botToken: config.botToken,
+            configuredAt: config.configuredAt,
+          },
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: { channel: "C-durable", threadTs: "thread-1" },
+        },
+      },
+    );
+    assert.deepEqual(calls, [
+      "https://slack.com/api/chat.postMessage",
+      "https://slack.com/api/chat.delete",
+    ]);
+    assert.match(
+      String(postBodies[0]?.client_msg_id),
+      /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("Slack workflow retry reuses one persisted placeholder", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const calls: string[] = [];
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("chat.postMessage")) {
+        return Response.json({ ok: true, ts: "boot-retry-ts" });
+      }
+      return Response.json({ ok: true });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-slack-retry-placeholder",
+        channels: {
+          telegram: null,
+          slack: config,
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return forwardCalls === 1
+        ? {
+            ok: false,
+            acceptance: "rejected",
+            status: 502,
+            attempts: 1,
+            totalMs: 50,
+            transport: "public",
+            retries: [],
+          }
+        : {
+            ok: true,
+            acceptance: "accepted",
+            status: 200,
+            attempts: 1,
+            totalMs: 50,
+            transport: "public",
+            retries: [],
+          };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      { event_id: "Ev-retry", event: { channel: "C-retry" } },
+      "test",
+      "req-slack-retry",
+      null,
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: {
+            botToken: config.botToken,
+            configuredAt: config.configuredAt,
+          },
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: { channel: "C-retry", threadTs: null },
+        },
+      },
+    );
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    await run();
+    assert.equal(
+      calls.filter((url) => url.endsWith("chat.postMessage")).length,
+      1,
+    );
+    assert.equal(
+      calls.filter((url) => url.endsWith("chat.update")).length,
+      2,
+    );
+    assert.equal(
+      calls.filter((url) => url.endsWith("chat.delete")).length,
+      1,
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("Slack placeholder construction failure is recorded by workflow catch", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle: async () => {
+      throw new Error("placeholder_post_succeeded_then_record_failed");
+    },
+  });
+
+  await assert.rejects(
+    processChannelStep(
+      "slack",
+      { event_id: "Ev-placeholder-failed", event: { channel: "C-failed" } },
+      "test",
+      "req-slack-placeholder-failed",
+      null,
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: {
+            botToken: config.botToken,
+            configuredAt: config.configuredAt,
+          },
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: { channel: "C-failed", threadTs: null },
+        },
+      },
+    ),
+    TestFatalError,
+  );
+  const failure = await getChannelDlqRecord(
+    "slack",
+    "slack:Ev-placeholder-failed",
+  );
+  assert.equal(failure?.terminal, true);
+  assert.equal(failure?.errorMessage, "placeholder_post_succeeded_then_record_failed");
+});
+
+test("stale Slack handoff cleans a legacy placeholder before wake", async () => {
+  const originalConfig = {
+    signingSecret: "original-signing-secret",
+    botToken: "xoxb-original-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig({
+    ...originalConfig,
+    botToken: "xoxb-current-token",
+    configuredAt: originalConfig.configuredAt + 1,
+  });
+  let deleteAuthorization: string | null = null;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (
+      _input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      deleteAuthorization = new Headers(init?.headers).get("authorization");
+      return Response.json({ ok: true });
+    },
+  );
+  let wakeCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => {
+      wakeCalls += 1;
+      throw new Error("must not wake stale Slack handoff");
+    },
+  });
+
+  try {
+    await processChannelStep(
+      "slack",
+      { event_id: "Ev-stale-start", event: { channel: "C-stale-start" } },
+      "test",
+      "req-slack-stale-start",
+      "legacy-boot-ts",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: {
+            botToken: originalConfig.botToken,
+            configuredAt: originalConfig.configuredAt,
+          },
+          slackConfigGeneration: originalConfig.configuredAt,
+        },
+      },
+    );
+    assert.equal(wakeCalls, 0);
+    assert.equal(deleteAuthorization, "Bearer xoxb-original-token");
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("Slack placeholder update rejects a 200 response with ok false", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input);
+      return url.endsWith("chat.postMessage")
+        ? Response.json({ ok: true, ts: "boot-update-ts" })
+        : Response.json({ ok: false, error: "message_not_found" });
+    },
+  );
+
+  try {
+    const handle = await buildExistingBootHandle(
+      "slack",
+      { event: { channel: "C-update" } },
+      null,
+      { slack: config },
+      { channel: "C-update", threadTs: null },
+    );
+    assert.ok(handle);
+    await assert.rejects(
+      handle.update("still waking"),
+      /message_not_found/,
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
 test("processChannelStep cleans a Slack boot message with its handoff credential after rotation", async () => {
   const originalConfig = {
     signingSecret: "original-signing-secret",
@@ -2233,6 +2625,7 @@ test("processChannelStep cleans a Slack boot message with its handoff credential
     configuredAt: originalConfig.configuredAt + 1,
   };
   await setSlackChannelConfig(originalConfig);
+  let forwardCalls = 0;
   let deleteAuthorization: string | null = null;
   const fetchMock = mock.method(globalThis, "fetch", async (
     _input: Parameters<typeof fetch>[0],
@@ -2260,14 +2653,17 @@ test("processChannelStep cleans a Slack boot message with its handoff credential
         admissionReady: true,
       };
     },
-    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
-      ok: true,
-      status: 200,
-      attempts: 1,
-      totalMs: 50,
-      transport: "public",
-      retries: [],
-    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        status: 200,
+        attempts: 1,
+        totalMs: 50,
+        transport: "public",
+        retries: [],
+      };
+    },
   });
 
   try {
@@ -2289,6 +2685,13 @@ test("processChannelStep cleans a Slack boot message with its handoff credential
     );
 
     assert.equal(deleteAuthorization, "Bearer xoxb-original-token");
+    assert.equal(forwardCalls, 0);
+    const failure = await getChannelDlqRecord(
+      "slack",
+      "slack:C-rotated:1710000000.000666",
+    );
+    assert.equal(failure?.terminal, true);
+    assert.equal(failure?.deliveryOutcome, "not-accepted");
   } finally {
     fetchMock.mock.restore();
   }
@@ -2456,8 +2859,10 @@ test("processChannelStep passes Discord raw body and signature headers to retryi
   let capturedHeaders: Record<string, string> | null = null;
   let capturedRawBody: string | null = null;
   let capturedDeliveryId: string | null = null;
+  let capturedGatewayAdmission = false;
 
   const dependencies = createWorkflowDependencies({
+    hydrateVerifiedBundleIdentity: async () => VERIFIED_DELIVERY_BUNDLE_IDENTITY,
     forwardToNativeHandlerWithRetry: async (
       _channel,
       _payload,
@@ -2468,10 +2873,13 @@ test("processChannelStep passes Discord raw body and signature headers to retryi
       extraForwardHeaders,
       rawBody,
       deliveryId,
+      _telegramAdmission,
+      gatewayAdmission,
     ): Promise<RetryingForwardResult> => {
       capturedHeaders = extraForwardHeaders ?? null;
       capturedRawBody = rawBody ?? null;
       capturedDeliveryId = deliveryId ?? null;
+      capturedGatewayAdmission = gatewayAdmission;
       return { ok: true, status: 200, attempts: 1, totalMs: 50, transport: "public", retries: [] };
     },
   });
@@ -2502,6 +2910,7 @@ test("processChannelStep passes Discord raw body and signature headers to retryi
   });
   assert.equal(capturedRawBody, '{"id":"interaction-handoff-1"}');
   assert.equal(capturedDeliveryId, "discord:interaction-handoff-1");
+  assert.equal(capturedGatewayAdmission, true);
 });
 
 test("processChannelStep rejects hosted WhatsApp before delivery side effects", async () => {

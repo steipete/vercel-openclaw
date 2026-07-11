@@ -47,6 +47,10 @@ export function sandboxDeadlineKey(): string {
   return buildKey("lifecycle:sandbox-deadline");
 }
 
+export function sandboxDeadlineV2Key(): string {
+  return buildKey("lifecycle:sandbox-deadline-v2");
+}
+
 export function sandboxDeadlineLockKey(): string {
   return buildKey("lock:sandbox-deadline");
 }
@@ -161,6 +165,13 @@ export function channelUserMessageDedupKey(
 
 export function channelConfigLockKey(channel: ChannelName): string {
   return buildKey(`channels:${channel}:config-lock`);
+}
+
+export function channelBootMessageKey(
+  channel: ChannelName,
+  deliveryId: string,
+): string {
+  return buildKey(`channels:${channel}:boot-message:${deliveryId}`);
 }
 
 export function watchdogReportKey(): string {

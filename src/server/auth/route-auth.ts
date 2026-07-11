@@ -59,6 +59,11 @@ const LIFECYCLE_MANAGED_MUTATION_PATHS = new Set([
   "/api/admin/stop",
   "/api/admin/watchdog",
   "/api/debug/restore-waterfall",
+  "/api/firewall",
+  "/api/firewall/allowlist",
+  "/api/firewall/ingest",
+  "/api/firewall/promote",
+  "/api/firewall/sync",
 ]);
 
 const HOST_MUTATION_LOCK_TTL_SECONDS = 330;

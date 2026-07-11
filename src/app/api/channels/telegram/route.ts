@@ -5,8 +5,10 @@ import { syncTelegramCommands } from "@/server/channels/telegram/commands";
 import {
   buildTelegramWebhookUrl,
   createTelegramWebhookSecret,
-  setTelegramChannelConfig,
+  setTelegramChannelConfigUnderLease,
 } from "@/server/channels/state";
+import { withChannelConfigLease } from "@/server/channels/config-lock";
+import { getInitializedMeta } from "@/server/store/store";
 
 const PREVIOUS_SECRET_GRACE_MS = 30 * 60 * 1000;
 
@@ -34,49 +36,61 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
     return { ...state, webhookInfo };
   },
 
-  async put({ request, meta }) {
-    const body = (await request.json()) as { botToken?: unknown };
-    const botToken = parseBotToken(body.botToken);
-    const bot = await getMe(botToken);
+  async put({ request }) {
+    await withChannelConfigLease("telegram", async (lease) => {
+      const body = (await request.json()) as { botToken?: unknown };
+      const botToken = parseBotToken(body.botToken);
+      const bot = await getMe(botToken, { signal: lease.signal });
 
-    const current = meta.channels.telegram;
-    const webhookSecret = createTelegramWebhookSecret();
-    const webhookUrl = buildTelegramWebhookUrl(request);
+      const current = (await getInitializedMeta()).channels.telegram;
+      const webhookSecret = createTelegramWebhookSecret();
+      const webhookUrl = buildTelegramWebhookUrl(request);
 
-    await setWebhook(botToken, webhookUrl, webhookSecret);
+      await setWebhook(botToken, webhookUrl, webhookSecret, {
+        signal: lease.signal,
+      });
 
-    const now = Date.now();
-    let commandSyncStatus: "synced" | "error" = "synced";
-    let commandSyncError: string | undefined;
-    let commandsRegisteredAt: number | undefined = now;
+      const now = Date.now();
+      let commandSyncStatus: "synced" | "error" = "synced";
+      let commandSyncError: string | undefined;
+      let commandsRegisteredAt: number | undefined = now;
 
-    try {
-      await syncTelegramCommands(botToken);
-    } catch (error) {
-      commandSyncStatus = "error";
-      commandSyncError = error instanceof Error ? error.message : String(error);
-      commandsRegisteredAt = undefined;
-    }
+      try {
+        await syncTelegramCommands(botToken, { signal: lease.signal });
+      } catch (error) {
+        commandSyncStatus = "error";
+        commandSyncError = error instanceof Error ? error.message : String(error);
+        commandsRegisteredAt = undefined;
+      }
 
-    await setTelegramChannelConfig({
-      botToken,
-      webhookSecret,
-      previousWebhookSecret: current?.webhookSecret,
-      previousSecretExpiresAt: current?.webhookSecret ? now + PREVIOUS_SECRET_GRACE_MS : undefined,
-      webhookUrl,
-      botUsername: bot.username ?? "",
-      configuredAt: now,
-      commandSyncStatus,
-      commandsRegisteredAt,
-      commandSyncError,
+      await setTelegramChannelConfigUnderLease(lease, {
+        botToken,
+        webhookSecret,
+        previousWebhookSecret: current?.webhookSecret,
+        previousSecretExpiresAt: current?.webhookSecret
+          ? now + PREVIOUS_SECRET_GRACE_MS
+          : undefined,
+        previousBotUsername: current?.botUsername,
+        previousConfiguredAt: current?.configuredAt,
+        webhookUrl,
+        botUsername: bot.username ?? "",
+        configuredAt: now,
+        commandSyncStatus,
+        commandsRegisteredAt,
+        commandSyncError,
+      });
     });
   },
 
-  async delete({ meta }) {
-    if (meta.channels.telegram?.botToken) {
-      await deleteWebhook(meta.channels.telegram.botToken).catch(() => {});
-    }
-
-    await setTelegramChannelConfig(null);
+  async delete() {
+    await withChannelConfigLease("telegram", async (lease) => {
+      const current = (await getInitializedMeta()).channels.telegram;
+      if (current?.botToken) {
+        await deleteWebhook(current.botToken, { signal: lease.signal }).catch(
+          () => {},
+        );
+      }
+      await setTelegramChannelConfigUnderLease(lease, null);
+    });
   },
 });

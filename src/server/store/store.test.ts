@@ -10,7 +10,7 @@ import {
   _setInstanceIdOverrideForTesting,
   getOpenclawInstanceId,
 } from "@/server/env";
-import { getServerLogs, _resetLogBuffer } from "@/server/log";
+import { _resetLogBuffer } from "@/server/log";
 import { initLockKey, metaKey } from "@/server/store/keyspace";
 import {
   getInitializedMeta,
@@ -983,6 +983,14 @@ test("[redis-store] low-level redis methods reject unscoped keys", async () => {
         () => store.compareAndSetValue("plain-key", null, { revision: 1 }),
         /outside instance prefix "fork-a:"/,
       );
+      await assert.rejects(
+        () => store.deleteValuesIfValueToken(
+          "fork-a:owner",
+          "token",
+          ["fork-b:legacy"],
+        ),
+        /outside instance prefix "fork-a:"/,
+      );
       await assert.rejects(() => store.deleteValue("fork-b:key"), /outside instance prefix "fork-a:"/);
       await assert.rejects(() => store.acquireLock("fork-b:lock", 30), /outside instance prefix "fork-a:"/);
       await assert.rejects(() => store.renewLock("fork-b:lock", "token", 30), /outside instance prefix "fork-a:"/);
@@ -1035,6 +1043,46 @@ test("[redis-store] lock-owned value writes are atomic", async () => {
         false,
       );
       assert.deepEqual(await store.getValue("fork-a:value"), { version: 2 });
+    },
+  );
+});
+
+test("[redis-store] token-owned cleanup is atomic", async () => {
+  await withEnv(
+    {
+      NODE_ENV: "test",
+      OPENCLAW_INSTANCE_ID: "fork-a",
+    },
+    async () => {
+      const redis = new FakeRedis();
+      redis.values.set("fork-a:owner", "current-token");
+      redis.values.set("fork-a:legacy", "private");
+      redis.evalHandler = (keys, args) => {
+        const [ownerKey, ...cleanupKeys] = keys;
+        if (redis.values.get(ownerKey) !== args[0]) return 0;
+        for (const key of cleanupKeys) redis.values.delete(key);
+        return 1;
+      };
+      const store = new RedisStore(redis as never);
+
+      assert.equal(
+        await store.deleteValuesIfValueToken(
+          "fork-a:owner",
+          "stale-token",
+          ["fork-a:legacy"],
+        ),
+        false,
+      );
+      assert.equal(redis.values.has("fork-a:legacy"), true);
+      assert.equal(
+        await store.deleteValuesIfValueToken(
+          "fork-a:owner",
+          "current-token",
+          ["fork-a:legacy"],
+        ),
+        true,
+      );
+      assert.equal(redis.values.has("fork-a:legacy"), false);
     },
   );
 });

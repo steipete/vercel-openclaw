@@ -219,7 +219,7 @@ test("PUT /api/firewall: rejects invalid mode with 400", async () => {
   });
 });
 
-test("PUT /api/firewall: same-mode transition is idempotent (no mutation)", async () => {
+test("PUT /api/firewall: same-mode transition preserves state and reconciles policy", async () => {
   await withHarness(async (h) => {
     await h.mutateMeta((meta) => {
       meta.status = "running";
@@ -245,8 +245,8 @@ test("PUT /api/firewall: same-mode transition is idempotent (no mutation)", asyn
     assert.equal(body.firewall.commandsObserved, 10);
     assert.equal(
       h.controller.eventsOfKind("update_network_policy").length - before,
-      0,
-      "expected no sandbox policy update for a same-mode transition",
+      1,
+      "expected same-mode transition to reconcile sandbox policy",
     );
   });
 });

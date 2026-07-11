@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { RestoreOracleCycleResult } from "@/server/sandbox/restore-oracle";
+import type { SandboxDeadlineState } from "@/server/sandbox/deadline-coordinator";
 import type { RestoreDecision } from "@/shared/restore-decision";
-import type { SingleMeta } from "@/shared/types";
+import {
+  FIREWALL_FAIL_CLOSED_LAST_ERROR,
+  type SingleMeta,
+} from "@/shared/types";
 import type { WatchdogReport } from "@/shared/watchdog";
 import { runSandboxWatchdog, type WatchdogDeps } from "@/server/watchdog/run";
 
@@ -44,6 +48,30 @@ function stubDecision(overrides: Partial<RestoreDecision> = {}): RestoreDecision
 /** Build a partial oracle result — only the fields the watchdog actually reads. */
 function oracleResult(partial: Record<string, unknown>): RestoreOracleCycleResult {
   return partial as unknown as RestoreOracleCycleResult;
+}
+
+function attachedDeadlineState(): SandboxDeadlineState {
+  return {
+    version: 2,
+    revision: 4,
+    generationId: "deadline-generation",
+    lifecycleAttemptId: "attempt-running",
+    sandboxId: "sbx-running",
+    deadlineAtMs: 60_000,
+    nativeStopDeadlineAtMs: null,
+    desiredIdleMs: 60_000,
+    platformTimeoutMs: 360_000,
+    workflowRunId: "wrun-deadline-repaired",
+    workflowAttemptId: "deadline-attempt",
+    workflowStartLeaseExpiresAtMs: null,
+    workflowStartedAtMs: 10,
+    workflowScheduledDeadlineAtMs: 60_000,
+    updatedAtMs: 10,
+    lastAttemptAtMs: null,
+    lastOutcome: "armed",
+    lastErrorCode: null,
+    lastErrorClass: null,
+  };
 }
 
 const PREVIOUS: WatchdogReport = {
@@ -112,7 +140,7 @@ function makeDeps(overrides: Partial<WatchdogDeps> = {}): WatchdogDeps {
       reason: "skipped" as const,
       candidateSandboxId: null,
     }),
-    armDeadline: async () => null,
+    armDeadline: async () => attachedDeadlineState(),
     now: (() => {
       let current = 0;
       return () => (current += 10);
@@ -131,6 +159,63 @@ test("running sandbox with healthy probe reports ok", async () => {
   assert.equal(report.triggeredRepair, false);
   assert.equal(report.consecutiveFailures, 0);
   assert.equal(findCheck(report, "cron.wake")?.status, "skip");
+});
+
+test("watchdog repairs a persisted firewall fail-closed handoff", async () => {
+  let repairCalls = 0;
+  await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      getMeta: async () => ({
+        status: "error",
+        sandboxId: "sbx-firewall-error",
+        lastError: FIREWALL_FAIL_CLOSED_LAST_ERROR,
+      }) as SingleMeta,
+      reconcileFailClosed: async () => {
+        repairCalls += 1;
+        return { status: "stopped", sandboxId: "sbx-firewall-error" } as SingleMeta;
+      },
+    }),
+  );
+
+  assert.equal(repairCalls, 1);
+});
+
+test("watchdog repairs the durable sandbox deadline owner on every running pass", async () => {
+  let calls = 0;
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      armDeadline: async () => {
+        calls += 1;
+        return attachedDeadlineState();
+      },
+    }),
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(findCheck(report, "sandbox.deadline")?.status, "pass");
+  assert.equal(
+    findCheck(report, "sandbox.deadline")?.data?.workflowAttached,
+    true,
+  );
+});
+
+test("watchdog fails while deadline workflow attachment is unsettled", async () => {
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      armDeadline: async () => ({
+        ...attachedDeadlineState(),
+        workflowRunId: null,
+        workflowStartLeaseExpiresAtMs: 60_000,
+      }),
+    }),
+  );
+
+  assert.equal(report.status, "failed");
+  assert.equal(findCheck(report, "sandbox.deadline")?.status, "fail");
+  assert.match(report.lastError ?? "", /attachment has not settled/);
 });
 
 test("running sandbox with healthy probe refreshes AI Gateway token", async () => {
@@ -232,6 +317,27 @@ test("watchdog marks stale cron dispatch repair as active repair", async () => {
   assert.equal(report.triggeredRepair, true);
   assert.equal(report.status, "repairing");
   assert.equal(findCheck(report, "cron.wake")?.status, "pass");
+});
+
+test("watchdog fails while a cron dispatch start lease is unsettled", async () => {
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      reconcileCronProjection: async () => ({
+        status: "starting",
+        projectionRevision: 3,
+        nextRunAtMs: 1234,
+        workflowRunId: null,
+        repaired: false,
+      }),
+    }),
+  );
+  assert.equal(report.status, "failed");
+  assert.equal(findCheck(report, "cron.wake")?.status, "fail");
+  assert.match(
+    findCheck(report, "cron.wake")?.message ?? "",
+    /start lease has not settled/,
+  );
 });
 
 test("watchdog reports token refresh failure", async () => {

@@ -341,6 +341,21 @@ test("[state] setSlackChannelConfig -> persists and clears slack config", async 
   });
 });
 
+test("[state] Slack config generations advance when timestamps collide", async () => {
+  await withHarness(async (h) => {
+    await setSlackChannelConfig(
+      makeSlackConfig({ signingSecret: "first-secret", configuredAt: 1000 }),
+    );
+    await setSlackChannelConfig(
+      makeSlackConfig({ signingSecret: "second-secret", configuredAt: 1000 }),
+    );
+
+    const config = (await h.getMeta()).channels.slack;
+    assert.equal(config?.signingSecret, "second-secret");
+    assert.equal(config?.configuredAt, 1001);
+  });
+});
+
 test("[state] setTelegramChannelConfig -> persists and clears telegram config", async () => {
   await withHarness(async (h) => {
     const config = makeTelegramConfig({ botUsername: "set_bot" });

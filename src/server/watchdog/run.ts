@@ -17,6 +17,7 @@ import {
   prepareRestoreTarget,
   probeGatewayReady,
   reconcileSandboxHealth,
+  reconcileSnapshottingStatus,
   reconcileStaleRunningStatus,
   type PrepareHotSpareResult,
   type ProbeResult,
@@ -33,17 +34,24 @@ import {
   getCronProjectionDiagnostics,
   type CronProjectionDiagnostics,
 } from "@/server/cron/projection";
-import { cronWakeWorkflow } from "@/server/workflows/cron/cron-wake-workflow";
+import {
+  cronDispatchRepairWorkflow,
+  cronWakeWorkflow,
+} from "@/server/workflows/cron/cron-wake-workflow";
 import {
   runRestoreOracleCycle,
   type RestoreOracleCycleResult,
 } from "@/server/sandbox/restore-oracle";
 import { getInitializedMeta, mutateMeta } from "@/server/store/store";
-import type {
-  OperationContext,
-  SingleMeta,
+import {
+  FIREWALL_FAIL_CLOSED_LAST_ERROR,
+  type OperationContext,
+  type SingleMeta,
 } from "@/shared/types";
-import { armSandboxDeadline } from "@/server/sandbox/deadline-coordinator";
+import {
+  armSandboxDeadline,
+  type SandboxDeadlineState,
+} from "@/server/sandbox/deadline-coordinator";
 import { getSandboxController } from "@/server/sandbox/controller";
 import type { WatchdogCheck, WatchdogReport } from "@/shared/watchdog";
 import {
@@ -60,6 +68,7 @@ export type RunSandboxWatchdogOptions = {
 export type WatchdogDeps = {
   buildContract: (options: { request?: Request }) => Promise<DeploymentContract>;
   getMeta: () => Promise<SingleMeta>;
+  reconcileFailClosed?: () => Promise<SingleMeta>;
   probe: () => Promise<ProbeResult>;
   reconcileStale: () => Promise<SingleMeta>;
   reconcile: (options: {
@@ -91,7 +100,7 @@ export type WatchdogDeps = {
   prepareHotSpare: (options?: {
     op?: OperationContext;
   }) => Promise<PrepareHotSpareResult>;
-  armDeadline: (meta: SingleMeta) => Promise<unknown>;
+  armDeadline: (meta: SingleMeta) => Promise<SandboxDeadlineState | null>;
   now: () => number;
 };
 
@@ -107,6 +116,19 @@ async function startCronWakeWorkflow(
   return { runId: run.runId };
 }
 
+async function startCronDispatchRepairWorkflow(
+  envelope: CronWakeWorkflowEnvelopeV1,
+  repairAtMs: number,
+): Promise<{ runId: string }> {
+  const { start } = await import("workflow/api");
+  const run = await start(
+    cronDispatchRepairWorkflow,
+    [envelope, repairAtMs],
+    { deploymentId: "latest" },
+  );
+  return { runId: run.runId };
+}
+
 async function getCronWakeWorkflowStatus(
   runId: string,
 ): Promise<CronWorkflowRunStatus> {
@@ -119,6 +141,7 @@ async function getCronWakeWorkflowStatus(
 const defaultDeps: WatchdogDeps = {
   buildContract: buildDeploymentContract,
   getMeta: getInitializedMeta,
+  reconcileFailClosed: reconcileSnapshottingStatus,
   probe: () => probeGatewayReady({ resume: false, thaw: false }),
   reconcileStale: reconcileStaleRunningStatus,
   reconcile: reconcileSandboxHealth,
@@ -128,6 +151,7 @@ const defaultDeps: WatchdogDeps = {
     reconcileCronProjection({
       ...options,
       startWorkflow: startCronWakeWorkflow,
+      startRepairWorkflow: startCronDispatchRepairWorkflow,
       getWorkflowRunStatus: getCronWakeWorkflowStatus,
     }),
   getCronProjectionDiagnostics,
@@ -237,11 +261,19 @@ export async function runSandboxWatchdog(
   let triggeredRepair = false;
   let lastError: string | null = null;
   let tokenRefreshFailed = false;
+  let deadlineOwnerFailed = false;
   let cronProjectionEnabled = false;
 
   try {
     previous = await deps.readPrevious();
     meta = await deps.getMeta();
+    if (
+      meta.status === "error"
+      && meta.lastError === FIREWALL_FAIL_CLOSED_LAST_ERROR
+      && deps.reconcileFailClosed
+    ) {
+      meta = await deps.reconcileFailClosed();
+    }
     const bundleIdentity = matchesConfiguredBundleIdentity(meta.bundleIdentity)
       ? meta.bundleIdentity
       : null;
@@ -337,7 +369,37 @@ export async function runSandboxWatchdog(
         meta = reconciledMeta;
         status = failingRequirementIds.length > 0 ? "failed" : "idle";
       } else {
-        await deps.armDeadline(reconciledMeta);
+        const deadlineStartedAt = deps.now();
+        try {
+          const deadline = await deps.armDeadline(reconciledMeta);
+          const workflowAttached = deadline?.workflowRunId !== null
+            && deadline?.workflowRunId !== undefined;
+          addCheck(
+            "sandbox.deadline",
+            workflowAttached ? "pass" : "fail",
+            deadlineStartedAt,
+            workflowAttached
+              ? "Sandbox deadline Workflow is attached."
+              : "Sandbox deadline Workflow attachment has not settled.",
+            deadline
+              ? {
+                  generationId: deadline.generationId,
+                  workflowAttached,
+                  deadlineAtMs: deadline.deadlineAtMs,
+                }
+              : undefined,
+          );
+          if (!workflowAttached) {
+            deadlineOwnerFailed = true;
+            lastError = "Sandbox deadline Workflow attachment has not settled.";
+          }
+        } catch (deadlineError) {
+          const message = deadlineError instanceof Error
+            ? deadlineError.message
+            : String(deadlineError);
+          addCheck("sandbox.deadline", "fail", deadlineStartedAt, message);
+          throw deadlineError;
+        }
 
         const probeStartedAt = deps.now();
         const probe = await deps.probe();
@@ -469,8 +531,10 @@ export async function runSandboxWatchdog(
           Boolean(meta.sandboxId || meta.snapshotId),
       });
       const diagnostics = await deps.getCronProjectionDiagnostics();
-      if (cron.status === "failed") {
-        lastError = "Cron projection workflow could not be started.";
+      if (cron.status === "failed" || cron.status === "starting") {
+        lastError = cron.status === "starting"
+          ? "Cron projection workflow start lease has not settled."
+          : "Cron projection workflow could not be started.";
         addCheck(
           WATCHDOG_CRON_WAKE_CHECK_ID,
           "fail",
@@ -516,6 +580,8 @@ export async function runSandboxWatchdog(
     });
     status = "failed";
   }
+
+  if (deadlineOwnerFailed) status = "failed";
 
   const report: WatchdogReport = {
     deploymentId,

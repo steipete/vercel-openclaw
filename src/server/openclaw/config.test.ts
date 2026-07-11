@@ -1266,7 +1266,7 @@ test("buildFastRestoreScript polls for process death instead of fixed sleep", ()
 
   // The script should contain the conditional pkill + poll pattern.
   assert.ok(
-    script.includes("if pkill -f \"$_gateway_process_pattern\""),
+    script.includes("&& (pkill -f \"$_gateway_process_pattern\""),
     "expected conditional pkill check",
   );
   assert.ok(
@@ -1291,7 +1291,7 @@ test("buildFastRestoreScript polls for process death instead of fixed sleep", ()
   // Verify pgrep poll is inside the if-block
   const lines = script.split("\n");
   const pkillLine = lines.findIndex((l) =>
-    l.includes("if pkill -f \"$_gateway_process_pattern\""),
+    l.includes("&& (pkill -f \"$_gateway_process_pattern\""),
   );
   const pgrepLine = lines.findIndex(
     (l, i) => i > pkillLine && l.includes("pgrep -f \"$_gateway_process_pattern\""),
@@ -1306,6 +1306,19 @@ test("buildFastRestoreScript polls for process death instead of fixed sleep", ()
     pgrepLine < fiLine,
     "pgrep poll must be inside the if-block (before fi)",
   );
+});
+
+test("buildFastRestoreScript supports a durable kill/start orchestration boundary", () => {
+  const script = buildFastRestoreScript();
+
+  assert.match(script, /all\|kill\|start/);
+  assert.match(script, /\[ "\$_restore_phase" != "start" \]/);
+  assert.match(script, /\[ "\$_restore_phase" = "kill" \]/);
+  assert.match(script, /fast_restore\.gateway_kill_failed/);
+  const killVerification = script.indexOf("process_still_running");
+  const killExit = script.indexOf('"event":"fast_restore.kill_complete"');
+  const start = script.indexOf('"event":"fast_restore.start_gateway"');
+  assert.ok(killVerification >= 0 && killExit > killVerification && start > killExit);
 });
 
 test("buildFastRestoreScript emits fast_restore.gateway_reset log with killed, sleepMs, killMs", () => {

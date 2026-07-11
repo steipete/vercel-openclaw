@@ -328,6 +328,16 @@ async function writePhase(
       );
     }
     if (
+      current.sandboxId !== state.sandboxId
+      || current.lifecycleAttemptId !== state.lifecycleAttemptId
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_CONFLICT",
+        "The durable host suspension generation changed concurrently.",
+      );
+    }
+    if (
       patch.phase !== undefined
       && current.phase !== state.phase
       && patch.phase !== current.phase
@@ -438,6 +448,58 @@ export async function ensureHostStopMonitor(
     await deps.write(acknowledged);
     return acknowledged;
   });
+}
+
+/** Durably hand an exact sandbox generation to the stop monitor. */
+export async function enqueueHostStopOperation(input: {
+  sandboxId: string;
+  lifecycleAttemptId: string | null;
+  reason: string;
+  assertOwned?: () => Promise<void>;
+}, deps: HostSuspensionDeps = defaultDeps): Promise<HostSuspensionState> {
+  const state = await withHostSuspensionStateLock(deps, async () => {
+    await input.assertOwned?.();
+    const current = await deps.getCurrentGeneration();
+    if (
+      current.sandboxId !== input.sandboxId
+      || current.lifecycleAttemptId !== input.lifecycleAttemptId
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_STALE_GENERATION",
+        "The requested stop no longer owns the current sandbox generation.",
+      );
+    }
+    const existing = await readHostSuspensionState(deps);
+    if (existing?.ingressFenced) {
+      if (
+        existing.sandboxId !== input.sandboxId
+        || existing.lifecycleAttemptId !== input.lifecycleAttemptId
+      ) {
+        throw new ApiError(
+          409,
+          "HOST_SUSPENSION_CONFLICT",
+          "A fenced lifecycle operation belongs to another sandbox generation.",
+        );
+      }
+      return existing;
+    }
+    const created = createOperation({
+      sandboxId: input.sandboxId,
+      lifecycleAttemptId: input.lifecycleAttemptId,
+      intent: "stop",
+      reason: input.reason,
+    }, deps);
+    const queued: HostSuspensionState = {
+      ...created,
+      phase: "stop-requesting",
+      stopRequestDeadlineAtMs: deps.now() + HOST_STOP_REQUEST_MAX_MS,
+    };
+    await input.assertOwned?.();
+    await deps.write(queued);
+    return queued;
+  });
+  return ensureHostStopMonitor(state, deps);
 }
 
 export async function heartbeatHostStopMonitor(
@@ -678,17 +740,69 @@ export async function markHostSuspensionStopRequesting(
 }
 
 export async function markHostSuspensionStopped(
-  operationId?: string,
+  expected: HostSuspensionState,
   deps: HostSuspensionDeps = defaultDeps,
 ): Promise<HostSuspensionState | null> {
-  const state = await readHostSuspensionState(deps);
-  if (!state || (operationId && state.operationId !== operationId)) return state;
-  return writePhase(state, {
-    phase: "stopped",
-    ingressFenced: true,
-    stopRequestDeadlineAtMs: null,
-    stoppedAtMs: deps.now(),
-  }, deps);
+  return withHostSuspensionStateLock(deps, async () => {
+    const current = await readHostSuspensionState(deps);
+    if (
+      !current
+      || current.operationId !== expected.operationId
+      || current.sandboxId !== expected.sandboxId
+      || current.lifecycleAttemptId !== expected.lifecycleAttemptId
+      || !["stop-requesting", "stopping", "stopped"].includes(expected.phase)
+      || !["stop-requesting", "stopping", "stopped"].includes(current.phase)
+    ) {
+      return current;
+    }
+    if (current.phase === "stopped") return current;
+    const stopped: HostSuspensionState = {
+      ...current,
+      phase: "stopped",
+      ingressFenced: true,
+      stopRequestDeadlineAtMs: null,
+      stoppedAtMs: deps.now(),
+      updatedAtMs: deps.now(),
+    };
+    await deps.write(stopped);
+    return stopped;
+  });
+}
+
+/** Retire the exact old-process lease after its Gateway has been killed. */
+export async function clearHostSuspensionAfterGatewayReplacement(
+  input: {
+    expected: HostSuspensionState;
+    sandboxId: string;
+    lifecycleAttemptId: string | null;
+  },
+  deps: HostSuspensionDeps = defaultDeps,
+): Promise<boolean> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const [current, generation] = await Promise.all([
+      readHostSuspensionState(deps),
+      deps.getCurrentGeneration(),
+    ]);
+    if (
+      !current
+      || current.operationId !== input.expected.operationId
+      || current.sandboxId !== input.expected.sandboxId
+      || current.lifecycleAttemptId !== input.expected.lifecycleAttemptId
+      || current.phase !== input.expected.phase
+      || !current.ingressFenced
+      || (
+        current.phase !== "stopped"
+        && current.phase !== "rollback-pending"
+      )
+      || input.sandboxId !== current.sandboxId
+      || generation.sandboxId !== input.sandboxId
+      || generation.lifecycleAttemptId !== input.lifecycleAttemptId
+    ) {
+      return false;
+    }
+    await deps.clear();
+    return true;
+  });
 }
 
 async function resumePreparedGateway(input: {
@@ -828,8 +942,13 @@ export async function thawHostSuspensionIfNeeded(input: {
     input.lifecycleAttemptId !== undefined
     && state.lifecycleAttemptId !== input.lifecycleAttemptId
   ) {
-    if (state.phase !== "stopped") return false;
+    if (
+      state.phase !== "stopped"
+      && state.phase !== "thawing"
+      && state.phase !== "rollback-pending"
+    ) return false;
     const observedOperationId = state.operationId;
+    const observedPhase = state.phase;
     const suspensionId = state.suspensionId;
     if (!suspensionId) return false;
     const status = await deps.callRpc<SuspendStatusResult>({
@@ -848,7 +967,7 @@ export async function thawHostSuspensionIfNeeded(input: {
         if (
           !latest
           || latest.operationId !== observedOperationId
-          || latest.phase !== "stopped"
+          || latest.phase !== observedPhase
           || latest.sandboxId !== input.sandbox.sandboxId
           || currentGeneration.sandboxId !== input.sandbox.sandboxId
           || currentGeneration.lifecycleAttemptId !== input.lifecycleAttemptId
@@ -872,7 +991,7 @@ export async function thawHostSuspensionIfNeeded(input: {
       if (
         !latest
         || latest.operationId !== observedOperationId
-        || latest.phase !== "stopped"
+        || latest.phase !== observedPhase
         || latest.sandboxId !== input.sandbox.sandboxId
         || currentGeneration.sandboxId !== input.sandbox.sandboxId
         || currentGeneration.lifecycleAttemptId !== input.lifecycleAttemptId

@@ -4,6 +4,7 @@ import { isPinnedPackageSpec } from "@/server/deployment-contract";
 import {
   admitConfiguredOpenClawBundle,
   bundleIdentityFromAdmission,
+  OPENCLAW_BUNDLE_COMPATIBILITY_ERROR_CODE,
   type VerifiedBundleAdmission,
   type VerifiedBundleIdentity,
 } from "@/server/openclaw/bundle-identity";
@@ -215,11 +216,102 @@ function buildBundleCompatibilityShimScript(): string {
 const OPENCLAW_BUNDLE_METADATA_DIR = "/home/vercel-sandbox/.openclaw-bundle";
 export const OPENCLAW_BUNDLE_IDENTITY_PATH =
   `${OPENCLAW_BUNDLE_METADATA_DIR}/identity.json`;
+export const OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH =
+  `${OPENCLAW_BUNDLE_METADATA_DIR}/release.tar.gz`;
 const OPENCLAW_BUNDLE_STAGE_DIR = "/tmp/openclaw-bundle-assets";
 const OPENCLAW_BUNDLE_ARCHIVE_PATH = "/tmp/openclaw-release.tar.gz";
+const OPENCLAW_BUNDLE_VERIFY_DIR = "/tmp/openclaw-bundle-verify";
 
 function shellArg(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function buildSafeTarVerificationScript(): string {
+  return [
+    "set -e;",
+    'archive="$1";',
+    "tar -tzf \"$archive\" | awk '",
+    '  /^\\// { exit 1 }',
+    '  /(^|\\/)\\.\\.(\\/|$)/ { exit 1 }',
+    '  seen[$0]++ { exit 1 }',
+    "';",
+    "tar -tvzf \"$archive\" | awk '",
+    '  { type = substr($1, 1, 1) }',
+    '  type != "-" && type != "d" { exit 1 }',
+    "'",
+  ].join("\n");
+}
+
+export function buildNpmBinLinksVerificationScript(): string {
+  return [
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    "const [expectedRoot, actualRoot, label] = process.argv.slice(1);",
+    'const fail = (detail) => { throw new Error(`verified bundle npm bin mismatch: ${label}: ${detail}`); };',
+    "const packageDirs = (nodeModules) => {",
+    "  const result = [];",
+    "  for (const entry of fs.readdirSync(nodeModules, { withFileTypes: true })) {",
+    '    if (!entry.isDirectory() || entry.name === ".bin") continue;',
+    "    const entryPath = path.join(nodeModules, entry.name);",
+    '    if (!entry.name.startsWith("@")) { result.push(entryPath); continue; }',
+    "    for (const scoped of fs.readdirSync(entryPath, { withFileTypes: true })) {",
+    "      if (scoped.isDirectory()) result.push(path.join(entryPath, scoped.name));",
+    "    }",
+    "  }",
+    "  return result.sort();",
+    "};",
+    "const verifyNodeModules = (expectedNodeModules) => {",
+    "  const relativeNodeModules = path.relative(expectedRoot, expectedNodeModules);",
+    "  const actualNodeModules = path.join(actualRoot, relativeNodeModules);",
+    "  const expectedBins = new Map();",
+    "  for (const packageDir of packageDirs(expectedNodeModules)) {",
+    '    const packageJsonPath = path.join(packageDir, "package.json");',
+    "    if (!fs.existsSync(packageJsonPath)) continue;",
+    '    const manifest = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));',
+    "    let bins = manifest.bin;",
+    '    if (typeof bins === "string") {',
+    '      const packageName = typeof manifest.name === "string" ? manifest.name.split("/").at(-1) : null;',
+    "      bins = packageName ? { [packageName]: bins } : {};",
+    "    }",
+    '    if (!bins || typeof bins !== "object" || Array.isArray(bins)) continue;',
+    "    for (const [name, target] of Object.entries(bins)) {",
+    '      if (!name || path.basename(name) !== name || typeof target !== "string") fail(`invalid bin declaration ${name}`);',
+    "      const resolvedTarget = path.resolve(packageDir, target);",
+    "      if (!resolvedTarget.startsWith(`${packageDir}${path.sep}`)) fail(`escaping bin target ${name}`);",
+    "      const targetStat = fs.lstatSync(resolvedTarget);",
+    "      if (!targetStat.isFile()) fail(`non-file bin target ${name}`);",
+    '      if (expectedBins.has(name)) fail(`duplicate bin name ${name}`);',
+    '      expectedBins.set(name, path.relative(path.join(expectedNodeModules, ".bin"), resolvedTarget));',
+    "    }",
+    "  }",
+    '  const actualBinDir = path.join(actualNodeModules, ".bin");',
+    "  let actualEntries = [];",
+    "  try {",
+    "    const stat = fs.lstatSync(actualBinDir);",
+    '    if (!stat.isDirectory() || stat.isSymbolicLink()) fail(`invalid .bin directory ${relativeNodeModules}`);',
+    "    actualEntries = fs.readdirSync(actualBinDir, { withFileTypes: true });",
+    "  } catch (error) {",
+    '    if (error.code !== "ENOENT") throw error;',
+    "  }",
+    "  const actualNames = actualEntries.map((entry) => entry.name).sort();",
+    "  const expectedNames = [...expectedBins.keys()].sort();",
+    '  if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) fail(`unexpected .bin inventory ${relativeNodeModules}`);',
+    "  for (const entry of actualEntries) {",
+    '    if (!entry.isSymbolicLink()) fail(`non-symlink .bin entry ${entry.name}`);',
+    "    const actualTarget = fs.readlinkSync(path.join(actualBinDir, entry.name));",
+    "    if (actualTarget !== expectedBins.get(entry.name)) fail(`wrong .bin target ${entry.name}`);",
+    "  }",
+    "};",
+    "const walk = (directory) => {",
+    "  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {",
+    "    if (!entry.isDirectory()) continue;",
+    "    const child = path.join(directory, entry.name);",
+    '    if (entry.name === "node_modules") verifyNodeModules(child);',
+    "    walk(child);",
+    "  }",
+    "};",
+    "walk(expectedRoot);",
+  ].join("\n");
 }
 
 export function buildVerifiedBundleInstallScript(
@@ -282,19 +374,7 @@ export function buildVerifiedBundleInstallScript(
     );
   }
 
-  const verifyTar = [
-    "set -e;",
-    'archive="$1";',
-    "tar -tzf \"$archive\" | awk '",
-    '  /^\\// { exit 1 }',
-    '  /(^|\\/)\\.\\.(\\/|$)/ { exit 1 }',
-    '  seen[$0]++ { exit 1 }',
-    "';",
-    "tar -tvzf \"$archive\" | awk '",
-    '  { type = substr($1, 1, 1) }',
-    '  type != "-" && type != "d" { exit 1 }',
-    "'",
-  ].join("\n");
+  const verifyTar = buildSafeTarVerificationScript();
   for (const assetName of nestedTarAssets) {
     lines.push(
       `bash -c ${shellArg(verifyTar)} verify-tar ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/${assetName}`)}`,
@@ -357,9 +437,229 @@ export function buildVerifiedBundleInstallScript(
     );
   }
   lines.push(
+    `install -m 0400 ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)}`,
     `rm -rf ${shellArg(OPENCLAW_BUNDLE_STAGE_DIR)} ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} /tmp/openclaw-bundle-expected.txt /tmp/openclaw-bundle-actual.txt`,
   );
   return lines.join("\n");
+}
+
+/**
+ * Revalidates every executable bundle-owned tree against the exact canonical
+ * release archive before a persisted sandbox may launch its Gateway again.
+ * The archive is digest-pinned by host admission; a missing or modified local
+ * copy is replaced from the same immutable release URL before comparison.
+ */
+export function buildVerifiedBundleRuntimeVerificationScript(
+  admission: VerifiedBundleAdmission,
+): string {
+  const archiveAssets = Object.keys(admission.assets)
+    .filter((assetName) => assetName !== admission.canonicalTarball)
+    .sort((left, right) => left.localeCompare(right));
+  const expectedEntries = archiveAssets.map(shellArg).join(" ");
+  const canonicalAsset = admission.assets[admission.canonicalTarball];
+  const assetsDir = `${OPENCLAW_BUNDLE_VERIFY_DIR}/assets`;
+  const expectedDir = `${OPENCLAW_BUNDLE_VERIFY_DIR}/expected`;
+  const nestedTarAssets = [
+    "bundle-deps.tar.gz",
+    "bundle-openclaw-pkg.tar.gz",
+    "channels.tar.gz",
+    "runtime-plugins.tar.gz",
+    "control-ui.tar.gz",
+    ...admission.externalPlugins.map((plugin) => plugin.artifact),
+    ...(admission.assets["channel-shared-chunks.tar.gz"]
+      ? ["channel-shared-chunks.tar.gz"]
+      : []),
+  ];
+  const lines = [
+    "set -euo pipefail",
+    "export LC_ALL=C",
+    `rm -rf ${shellArg(OPENCLAW_BUNDLE_VERIFY_DIR)}`,
+    `mkdir -p ${shellArg(assetsDir)} ${shellArg(expectedDir)}`,
+    "archive_ok() {",
+    `  test -f ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)} && test ! -L ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)} || return 1`,
+    `  test "$(wc -c < ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)} | tr -d '[:space:]')" = ${shellArg(String(canonicalAsset.bytes))} || return 1`,
+    `  printf '%s  %s\\n' ${shellArg(admission.identity.canonicalSha256)} ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)} | sha256sum -c - >/dev/null 2>&1`,
+    "}",
+    "if ! archive_ok; then",
+    `  rm -f ${shellArg(`${OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH}.tmp`)}`,
+    `  curl -fsSL --proto '=https' --proto-redir '=https' --max-time 180 --connect-timeout 10 --max-filesize ${canonicalAsset.bytes} -o ${shellArg(`${OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH}.tmp`)} ${shellArg(admission.canonicalTarballUrl)}`,
+    `  test "$(wc -c < ${shellArg(`${OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH}.tmp`)} | tr -d '[:space:]')" = ${shellArg(String(canonicalAsset.bytes))}`,
+    `  printf '%s  %s\\n' ${shellArg(admission.identity.canonicalSha256)} ${shellArg(`${OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH}.tmp`)} | sha256sum -c -`,
+    `  install -m 0400 ${shellArg(`${OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH}.tmp`)} ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)}`,
+    `  rm -f ${shellArg(`${OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH}.tmp`)}`,
+    "fi",
+    `printf '%s\\n' ${expectedEntries} | sort > ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/expected-entries.txt`)}`,
+    `tar -tzf ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)} | sed 's#^\\./##' | sort > ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/actual-entries.txt`)}`,
+    `cmp -s ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/expected-entries.txt`)} ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/actual-entries.txt`)} || { echo 'sealed bundle entries do not match asset-manifest.json' >&2; exit 1; }`,
+    `tar -tvzf ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)} | awk 'substr($1,1,1) != "-" { exit 1 }'`,
+    `tar xzf ${shellArg(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)} -C ${shellArg(assetsDir)}`,
+  ];
+
+  for (const assetName of archiveAssets) {
+    const asset = admission.assets[assetName];
+    const assetPath = `${assetsDir}/${assetName}`;
+    lines.push(
+      `test -f ${shellArg(assetPath)} && test ! -L ${shellArg(assetPath)}`,
+      `test "$(wc -c < ${shellArg(assetPath)} | tr -d '[:space:]')" = ${shellArg(String(asset.bytes))}`,
+      `printf '%s  %s\\n' ${shellArg(asset.sha256)} ${shellArg(assetPath)} | sha256sum -c -`,
+    );
+  }
+  const verifyTar = buildSafeTarVerificationScript();
+  for (const assetName of nestedTarAssets) {
+    lines.push(
+      `bash -c ${shellArg(verifyTar)} verify-tar ${shellArg(`${assetsDir}/${assetName}`)}`,
+    );
+  }
+
+  const verifyNpmBinLinks = buildNpmBinLinksVerificationScript();
+
+  lines.push(
+    "verify_file() {",
+    "  expected=$1; actual=$2; label=$3",
+    "  test -f \"$actual\" && test ! -L \"$actual\" && cmp -s \"$expected\" \"$actual\" || { echo \"verified bundle runtime mismatch: $label\" >&2; exit 1; }",
+    "}",
+    "verify_tree() {",
+    "  expected=$1; actual=$2; label=$3",
+    "  test -d \"$actual\" && test ! -L \"$actual\" || { echo \"verified bundle runtime tree missing: $label\" >&2; exit 1; }",
+    "  ! find \"$actual\" -type l -print -quit | grep -q . || { echo \"verified bundle runtime symlink found: $label\" >&2; exit 1; }",
+    "  diff -qr --no-dereference \"$expected\" \"$actual\" >/dev/null || { echo \"verified bundle runtime tree mismatch: $label\" >&2; exit 1; }",
+    "}",
+    "tree_manifest_without_npm_links() {",
+    "  root=$1; output=$2",
+    "  (cd \"$root\" && find . -mindepth 1 \\",
+    "    \\( -path './node_modules/openclaw' -o -path './node_modules/openclaw/*' -o -path '*/node_modules/.bin' -o -path '*/node_modules/.bin/*' \\) -prune -o \\",
+    "    \\( -type f -o -type d \\) -print0 | sort -z | while IFS= read -r -d '' entry; do",
+    "      if test -d \"$entry\"; then printf 'd %s\\n' \"$entry\"; else printf 'f %s ' \"$entry\"; sha256sum \"$entry\" | cut -d ' ' -f 1; fi",
+    "    done) > \"$output\"",
+    "}",
+    "verify_external_plugin_tree() {",
+    "  expected=$1; actual=$2; label=$3",
+    "  peer=$actual/node_modules/openclaw",
+    "  test -L \"$peer\" || { echo \"verified bundle peer link missing: $label\" >&2; exit 1; }",
+    "  peer_target=$(readlink -f \"$peer\")",
+    "  test \"$peer_target\" = /home/vercel-sandbox/node_modules/openclaw || { echo \"verified bundle peer link mismatch: $label\" >&2; exit 1; }",
+    "  test -z \"$(find \"$actual\" -type l ! -path \"$peer\" ! -path '*/node_modules/.bin/*' -print -quit)\" || { echo \"verified bundle runtime symlink found: $label\" >&2; exit 1; }",
+    `  node -e ${shellArg(verifyNpmBinLinks)} -- "$expected" "$actual" "$label"`,
+    `  tree_manifest_without_npm_links "$expected" ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/plugin-expected.txt`)}`,
+    `  tree_manifest_without_npm_links "$actual" ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/plugin-actual.txt`)}`,
+    `  cmp -s ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/plugin-expected.txt`)} ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/plugin-actual.txt`)} || { echo "verified bundle runtime tree mismatch: $label" >&2; exit 1; }`,
+    "}",
+    `verify_file ${shellArg(`${assetsDir}/openclaw.bundle.mjs`)} ${shellArg(OPENCLAW_BUNDLE_PATH)} openclaw.bundle.mjs`,
+    `verify_file ${shellArg(`${assetsDir}/channel-catalog.json`)} /home/vercel-sandbox/dist/channel-catalog.json channel-catalog.json`,
+    `verify_file ${shellArg(`${assetsDir}/bundle-capabilities.json`)} ${shellArg(`${OPENCLAW_BUNDLE_METADATA_DIR}/bundle-capabilities.json`)} bundle-capabilities.json`,
+    `verify_file ${shellArg(`${assetsDir}/bundle-contract.json`)} ${shellArg(`${OPENCLAW_BUNDLE_METADATA_DIR}/bundle-contract.json`)} bundle-contract.json`,
+    `verify_file ${shellArg(`${assetsDir}/release.json`)} ${shellArg(`${OPENCLAW_BUNDLE_METADATA_DIR}/release.json`)} release.json`,
+    `mkdir -p ${shellArg(`${expectedDir}/runtime`)} ${shellArg(`${expectedDir}/bundled-plugins`)} ${shellArg(`${expectedDir}/dist`)}`,
+    `tar xzf ${shellArg(`${assetsDir}/bundle-deps.tar.gz`)} -C ${shellArg(`${expectedDir}/runtime`)}`,
+    `tar xzf ${shellArg(`${assetsDir}/bundle-openclaw-pkg.tar.gz`)} -C ${shellArg(`${expectedDir}/runtime`)}`,
+    `verify_tree ${shellArg(`${expectedDir}/runtime/node_modules`)} /home/vercel-sandbox/node_modules node_modules`,
+    `tar xzf ${shellArg(`${assetsDir}/channels.tar.gz`)} -C ${shellArg(`${expectedDir}/bundled-plugins`)}`,
+    `tar xzf ${shellArg(`${assetsDir}/runtime-plugins.tar.gz`)} -C ${shellArg(`${expectedDir}/bundled-plugins`)}`,
+    `verify_tree ${shellArg(`${expectedDir}/bundled-plugins`)} ${shellArg(OPENCLAW_BUNDLED_PLUGINS_DIR_PATH)} bundled-plugins`,
+    `tar xzf ${shellArg(`${assetsDir}/control-ui.tar.gz`)} -C ${shellArg(`${expectedDir}/dist`)}`,
+    `verify_tree ${shellArg(`${expectedDir}/dist/control-ui`)} /home/vercel-sandbox/dist/control-ui control-ui`,
+  );
+
+  lines.push(`mkdir -p ${shellArg(`${expectedDir}/shared`)}`);
+  if (admission.assets["channel-shared-chunks.tar.gz"]) {
+    lines.push(
+      `tar xzf ${shellArg(`${assetsDir}/channel-shared-chunks.tar.gz`)} -C ${shellArg(`${expectedDir}/shared`)}`,
+      `while IFS= read -r rel; do case "$rel" in ""|*/) continue ;; esac; verify_file ${shellArg(`${expectedDir}/shared`)}/"$rel" /home/vercel-sandbox/"$rel" "channel-shared-chunks:$rel"; done < <(tar -tzf ${shellArg(`${assetsDir}/channel-shared-chunks.tar.gz`)} | sed 's#^\\./##')`,
+    );
+  }
+  lines.push(
+    `find ${shellArg(`${expectedDir}/shared`)} -maxdepth 1 -type f \\( -name '*.js' -o -name '*.cjs' \\) -printf '%f\\n' | sort > ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/expected-root-chunks.txt`)}`,
+    `find /home/vercel-sandbox -maxdepth 1 -type f \\( -name '*.js' -o -name '*.cjs' \\) -printf '%f\\n' | sort > ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/actual-root-chunks.txt`)}`,
+    `test -z "$(find /home/vercel-sandbox -maxdepth 1 -type l \\( -name '*.js' -o -name '*.cjs' \\) -print -quit)"`,
+    `cmp -s ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/expected-root-chunks.txt`)} ${shellArg(`${OPENCLAW_BUNDLE_VERIFY_DIR}/actual-root-chunks.txt`)} || { echo 'verified bundle root chunk inventory mismatch' >&2; exit 1; }`,
+  );
+
+  for (const plugin of admission.externalPlugins) {
+    const expectedPluginDir = `${expectedDir}/external-${plugin.id}`;
+    const installedPluginDir =
+      `/home/vercel-sandbox/.openclaw/npm/node_modules/${plugin.packageName}`;
+    lines.push(
+      `verify_file ${shellArg(`${assetsDir}/${plugin.artifact}`)} ${shellArg(`${OPENCLAW_BUNDLE_METADATA_DIR}/${plugin.artifact}`)} ${shellArg(plugin.artifact)}`,
+      `mkdir -p ${shellArg(expectedPluginDir)}`,
+      `tar xzf ${shellArg(`${assetsDir}/${plugin.artifact}`)} -C ${shellArg(expectedPluginDir)}`,
+      `verify_external_plugin_tree ${shellArg(`${expectedPluginDir}/package`)} ${shellArg(installedPluginDir)} ${shellArg(`external-plugin:${plugin.id}`)}`,
+    );
+  }
+
+  lines.push(
+    `rm -rf /home/vercel-sandbox/agents /home/vercel-sandbox/config /home/vercel-sandbox/plugins /home/vercel-sandbox/dist/agents /home/vercel-sandbox/dist/config /home/vercel-sandbox/dist/plugins`,
+    buildBundleCompatibilityShimScript(),
+    `printf '%s\\n' ${shellArg(JSON.stringify({ name: "openclaw", private: true, version: admission.identity.version, type: "module" }))} > /home/vercel-sandbox/package.json`,
+    `rm -rf ${shellArg(OPENCLAW_BUNDLE_VERIFY_DIR)}`,
+  );
+  return lines.join("\n");
+}
+
+function bundleCompatibilityError(detail: string): Error {
+  return new Error(`${OPENCLAW_BUNDLE_COMPATIBILITY_ERROR_CODE}: ${detail}`);
+}
+
+function assertExactVerifiedBundleRuntimeVersion(
+  admission: VerifiedBundleAdmission,
+  reportedVersion: string | null,
+): void {
+  const installedVersion = extractReportedOpenClawVersion(reportedVersion);
+  if (installedVersion !== admission.identity.version) {
+    throw bundleCompatibilityError(
+      `reported OpenClaw version ${installedVersion ?? "missing"} does not match admitted bundle version ${admission.identity.version}`,
+    );
+  }
+}
+
+async function persistVerifiedBundleIdentityReceipt(
+  sandbox: SandboxHandle,
+  admission: VerifiedBundleAdmission,
+  progress?: SetupProgressWriter,
+): Promise<void> {
+  const receiptPath = OPENCLAW_BUNDLE_IDENTITY_PATH;
+  const receiptResult = await sandbox.runCommand({
+    cmd: "bash",
+    args: [
+      "-c",
+      [
+        "set -e",
+        "umask 077",
+        `printf '%s\\n' ${shellArg(JSON.stringify(admission.identity))} > ${shellArg(`${receiptPath}.tmp`)}`,
+        `mv -f ${shellArg(`${receiptPath}.tmp`)} ${shellArg(receiptPath)}`,
+      ].join("\n"),
+    ],
+    stdout: progress?.makeWritable("stdout"),
+    stderr: progress?.makeWritable("stderr"),
+  });
+  await assertCommandSuccess("persist verified bundle identity", receiptResult);
+}
+
+export async function verifyPersistedVerifiedBundleRuntime(
+  sandbox: SandboxHandle,
+  admission: VerifiedBundleAdmission,
+  progress?: SetupProgressWriter,
+): Promise<string> {
+  const verifyResult = await sandbox.runCommand({
+    cmd: "bash",
+    args: ["-c", buildVerifiedBundleRuntimeVerificationScript(admission)],
+    stdout: progress?.makeWritable("stdout"),
+    stderr: progress?.makeWritable("stderr"),
+  });
+  await assertCommandSuccess("verify persisted bundle runtime", verifyResult);
+
+  const versionResult = await sandbox.runCommand({
+    cmd: "node",
+    args: [OPENCLAW_BUNDLE_PATH, "--version"],
+    stdout: progress?.makeWritable("stdout"),
+    stderr: progress?.makeWritable("stderr"),
+  });
+  await assertCommandSuccess("openclaw --version", versionResult);
+  const installedVersion = normalizeOpenClawVersion(
+    await versionResult.output("stdout"),
+  );
+  assertExactVerifiedBundleRuntimeVersion(admission, installedVersion);
+  await persistVerifiedBundleIdentityReceipt(sandbox, admission, progress);
+  return admission.identity.version;
 }
 
 export type BootstrapRuntime = {
@@ -624,24 +924,28 @@ export async function setupOpenClaw(
         stderr: progress?.makeWritable("stderr"),
       });
       await assertCommandSuccess(`install external plugin ${plugin.id}`, pluginResult);
+
+      const installedPluginDir =
+        `/home/vercel-sandbox/.openclaw/npm/node_modules/${plugin.packageName}`;
+      const peerLinkResult = await sandbox.runCommand({
+        cmd: "bash",
+        args: [
+          "-c",
+          [
+            "set -e",
+            "test -d /home/vercel-sandbox/node_modules/openclaw",
+            `rm -rf ${shellArg(`${installedPluginDir}/node_modules/openclaw`)}`,
+            `ln -s /home/vercel-sandbox/node_modules/openclaw ${shellArg(`${installedPluginDir}/node_modules/openclaw`)}`,
+          ].join("\n"),
+        ],
+        stdout: progress?.makeWritable("stdout"),
+        stderr: progress?.makeWritable("stderr"),
+      });
+      await assertCommandSuccess(
+        `pin external plugin ${plugin.id} OpenClaw peer`,
+        peerLinkResult,
+      );
     }
-    const receiptPath = OPENCLAW_BUNDLE_IDENTITY_PATH;
-    const receiptResult = await sandbox.runCommand({
-      cmd: "bash",
-      args: [
-        "-c",
-        [
-          "set -e",
-          `umask 077`,
-          `printf '%s\\n' ${shellArg(JSON.stringify(bundleAdmission.identity))} > ${shellArg(`${receiptPath}.tmp`)}`,
-          `mv -f ${shellArg(`${receiptPath}.tmp`)} ${shellArg(receiptPath)}`,
-        ].join("\n"),
-      ],
-      stdout: progress?.makeWritable("stdout"),
-      stderr: progress?.makeWritable("stderr"),
-    });
-    await assertCommandSuccess("persist verified bundle identity", receiptResult);
-    bundleIdentity = bundleIdentityFromAdmission(bundleAdmission);
   }
 
   // Install patches only apply to the npm-installed package tree.
@@ -687,7 +991,22 @@ export async function setupOpenClaw(
   );
   progress?.setPreview(openclawVersion ? `Installed ${openclawVersion}` : "Version check passed");
 
-  const drift = detectDrift(packageSpec, openclawVersion);
+  if (bundleAdmission) {
+    assertExactVerifiedBundleRuntimeVersion(bundleAdmission, openclawVersion);
+    await persistVerifiedBundleIdentityReceipt(
+      sandbox,
+      bundleAdmission,
+      progress,
+    );
+    bundleIdentity = bundleIdentityFromAdmission(bundleAdmission);
+  }
+
+  const drift = detectDrift(
+    packageSpec,
+    bundleAdmission
+      ? extractReportedOpenClawVersion(openclawVersion)
+      : openclawVersion,
+  );
   const runtime: BootstrapRuntime = { packageSpec, installedVersion: openclawVersion, drift };
 
   logInfo("openclaw.setup.installed", {
@@ -974,6 +1293,18 @@ async function sleep(ms: number): Promise<void> {
 function normalizeOpenClawVersion(raw: string): string | null {
   const trimmed = raw.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function extractReportedOpenClawVersion(
+  reportedVersion: string | null,
+): string | null {
+  if (!reportedVersion) return null;
+  const matches = [
+    ...reportedVersion.matchAll(
+      /(?:^|\s)(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?)(?=$|\s|\()/g,
+    ),
+  ];
+  return matches.length === 1 ? matches[0]?.[1] ?? null : null;
 }
 
 /**

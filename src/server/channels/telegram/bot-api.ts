@@ -26,6 +26,10 @@ type TelegramApiResponse<T> = {
   };
 };
 
+type TelegramApiCallOptions = {
+  signal?: AbortSignal;
+};
+
 export type TelegramBotCommand = {
   command: string;
   description: string;
@@ -89,12 +93,16 @@ async function callTelegramApi<T>(
   botToken: string,
   method: string,
   body?: Record<string, unknown>,
+  options?: TelegramApiCallOptions,
 ): Promise<T> {
+  options?.signal?.throwIfAborted();
   const response = await fetch(`${TELEGRAM_API_BASE}/bot${botToken}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15_000),
+    signal: options?.signal
+      ? AbortSignal.any([options.signal, AbortSignal.timeout(15_000)])
+      : AbortSignal.timeout(15_000),
   });
 
   let payload: TelegramApiResponse<T> | null = null;
@@ -125,22 +133,25 @@ async function callTelegramApi<T>(
   return payload.result;
 }
 
-export async function getMe(botToken: string): Promise<TelegramUser> {
-  return callTelegramApi<TelegramUser>(botToken, "getMe");
+export async function getMe(
+  botToken: string,
+  options?: TelegramApiCallOptions,
+): Promise<TelegramUser> {
+  return callTelegramApi<TelegramUser>(botToken, "getMe", undefined, options);
 }
 
 export async function setWebhook(
   botToken: string,
   url: string,
   secretToken: string,
-  options?: { dropPendingUpdates?: boolean },
+  options?: TelegramApiCallOptions & { dropPendingUpdates?: boolean },
 ): Promise<void> {
   await callTelegramApi(botToken, "setWebhook", {
     url,
     secret_token: secretToken,
     allowed_updates: ["message", "edited_message", "callback_query"],
     drop_pending_updates: options?.dropPendingUpdates ?? false,
-  });
+  }, options);
 }
 
 export type TelegramWebhookInfo = {
@@ -161,18 +172,33 @@ export async function getWebhookInfo(botToken: string): Promise<TelegramWebhookI
 export async function setMyCommands(
   botToken: string,
   commands: TelegramBotCommand[],
+  options?: TelegramApiCallOptions,
 ): Promise<void> {
-  await callTelegramApi(botToken, "setMyCommands", { commands });
+  await callTelegramApi(botToken, "setMyCommands", { commands }, options);
 }
 
 export async function getMyCommands(
   botToken: string,
+  options?: TelegramApiCallOptions,
 ): Promise<TelegramBotCommand[]> {
-  return callTelegramApi<TelegramBotCommand[]>(botToken, "getMyCommands");
+  return callTelegramApi<TelegramBotCommand[]>(
+    botToken,
+    "getMyCommands",
+    undefined,
+    options,
+  );
 }
 
-export async function deleteWebhook(botToken: string): Promise<void> {
-  await callTelegramApi(botToken, "deleteWebhook", { drop_pending_updates: false });
+export async function deleteWebhook(
+  botToken: string,
+  options?: TelegramApiCallOptions,
+): Promise<void> {
+  await callTelegramApi(
+    botToken,
+    "deleteWebhook",
+    { drop_pending_updates: false },
+    options,
+  );
 }
 
 export async function sendChatAction(

@@ -4,10 +4,13 @@ import test from "node:test";
 import { ApiError } from "@/shared/http";
 import {
   createDefaultHotSpareState,
+  FIREWALL_FAIL_CLOSED_LAST_ERROR,
+  FIREWALL_FAIL_CLOSED_REASON,
   type SingleMeta,
 } from "@/shared/types";
 import {
   OPENCLAW_BUNDLE_IDENTITY_PATH,
+  OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH,
 } from "@/server/openclaw/bootstrap";
 import {
   _resetBundleIdentityForTesting,
@@ -58,8 +61,8 @@ import {
 import {
   hostSuspensionOperationKey,
   lifecycleLockKey,
-  sandboxDeadlineKey,
   sandboxDeadlineLockKey,
+  sandboxDeadlineV2Key,
 } from "@/server/store/keyspace";
 import {
   HOST_STOP_REQUEST_MAX_MS,
@@ -212,6 +215,34 @@ function hostSuspensionState(
     lastErrorCode: null,
     lastErrorClass: null,
     ...overrides,
+  };
+}
+
+function sandboxDeadlineState(
+  sandboxId: string,
+  lifecycleAttemptId: string | null = null,
+) {
+  const now = Date.now();
+  return {
+    version: 2 as const,
+    revision: 1,
+    generationId: `deadline-${sandboxId}`,
+    lifecycleAttemptId,
+    sandboxId,
+    deadlineAtMs: now + 60_000,
+    nativeStopDeadlineAtMs: null,
+    desiredIdleMs: 60_000,
+    platformTimeoutMs: 120_000,
+    workflowRunId: null,
+    workflowAttemptId: null,
+    workflowStartLeaseExpiresAtMs: null,
+    workflowStartedAtMs: null,
+    workflowScheduledDeadlineAtMs: null,
+    updatedAtMs: now,
+    lastAttemptAtMs: null,
+    lastOutcome: "armed" as const,
+    lastErrorCode: null,
+    lastErrorClass: null,
   };
 }
 
@@ -1374,6 +1405,210 @@ test("persistent resume requests explicit SDK resume", async () => {
   });
 });
 
+test("ensureSandboxRunning retries the exact rollback-pending operation without fast restore", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-rollback-recovery";
+    const lifecycleAttemptId = "attempt-rollback-recovery";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = "transient thaw failed";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        lifecycleAttemptId,
+        phase: "rollback-pending",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+
+    const result = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "rollback-recovery-test",
+    });
+
+    assert.equal(result.state, "running");
+    assert.equal(result.meta.sandboxId, sandboxId);
+    assert.equal(result.meta.lifecycleAttemptId, lifecycleAttemptId);
+    assert.equal(result.meta.lastError, null);
+    assert.deepEqual(fake.getCalls.at(-1), { sandboxId, resume: false });
+    assert.equal(
+      handle.commands.some(
+        (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+      ),
+      false,
+    );
+    assert.equal((await readHostSuspensionState())?.phase, "running");
+  });
+});
+
+test("rollback-pending recovery retires a deleted generation before scheduling replacement", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-rollback-deleted";
+    const lifecycleAttemptId = "attempt-rollback-deleted";
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = "transient thaw failed";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        lifecycleAttemptId,
+        phase: "rollback-pending",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+    let lookup: { sandboxId: string; resume?: boolean } | undefined;
+    fake.get = async (input) => {
+      lookup = input;
+      throw new Error("404 sandbox not found");
+    };
+    let scheduled = false;
+
+    const result = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "rollback-deleted-test",
+      schedule() {
+        scheduled = true;
+      },
+    });
+
+    assert.deepEqual(lookup, { sandboxId, resume: false });
+    assert.equal(result.state, "waiting");
+    assert.equal(result.meta.status, "creating");
+    assert.equal(result.meta.sandboxId, null);
+    assert.equal(scheduled, true);
+    assert.equal(await getStore().getValue(hostSuspensionOperationKey()), null);
+  });
+});
+
+test("suspended persistent resume retires the durable lease before starting a replacement Gateway", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-suspended-resume";
+      meta.gatewayToken = "test-gw-token";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = preRegisterResumeHandle(fake);
+    const originalRunCommand = handle.runCommand.bind(handle);
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      if (
+        (typeof commandOrOpts === "string" ? commandOrOpts : commandOrOpts.cmd) === "bash"
+        && commandArgs?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
+        && commandArgs[2] === "start"
+      ) {
+        assert.equal(
+          await getStore().getValue(hostSuspensionOperationKey()),
+          null,
+          "the old process lease must be durably retired before replacement start",
+        );
+      }
+      return originalRunCommand(commandOrOpts as never, args, opts);
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("suspended-resume-ordering");
+      const phases = handle.commands
+        .filter((command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH)
+        .map((command) => command.args?.[2]);
+      assert.deepEqual(phases, ["kill", "start"]);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent resume never starts a replacement Gateway when the lease CAS fails after kill", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-suspended-cas-failure";
+      meta.gatewayToken = "test-gw-token";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = preRegisterResumeHandle(fake);
+    const originalRunCommand = handle.runCommand.bind(handle);
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      const result = await originalRunCommand(commandOrOpts as never, args, opts);
+      if (
+        (typeof commandOrOpts === "string" ? commandOrOpts : commandOrOpts.cmd) === "bash"
+        && commandArgs?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
+        && commandArgs[2] === "kill"
+      ) {
+        await getStore().setValue(
+          hostSuspensionOperationKey(),
+          hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+            operationId: "replacement-operation",
+            requestId: "replacement-operation",
+            phase: "stopped",
+            stopRequestDeadlineAtMs: null,
+            stoppedAtMs: Date.now(),
+          }),
+        );
+      }
+      return result;
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("suspended-resume-cas-failure");
+      const phases = handle.commands
+        .filter((command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH)
+        .map((command) => command.args?.[2]);
+      assert.deepEqual(phases, ["kill"]);
+      assert.equal((await getInitializedMeta()).status, "setup");
+      assert.equal(
+        (await readHostSuspensionState())?.operationId,
+        "replacement-operation",
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test("guarded cron readiness preserves a stopped snapshot restore", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
@@ -1665,6 +1900,18 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
         (c) => c.cmd === "bash" && c.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
       );
       assert.ok(fastRestoreCommand, "bundle runtime marker should route to fast restore");
+      const verificationIndex = handle.commands.findIndex(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-c"
+          && command.args[1]?.includes(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH),
+      );
+      const fastRestoreIndex = handle.commands.indexOf(fastRestoreCommand);
+      assert.ok(verificationIndex >= 0, "resume must verify persisted bundle bytes");
+      assert.ok(
+        fastRestoreIndex > verificationIndex,
+        "persisted bundle verification must finish before fast restore launches Gateway",
+      );
       assert.deepEqual(
         fake.getCalls.slice(0, 2).map((call) => call.resume),
         [false, true],
@@ -1672,9 +1919,15 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
       );
 
       const fullBootstrapCommand = handle.commands.find(
-        (c) => c.cmd === "bash" && c.args?.[1]?.includes("curl -fsSL"),
+        (c) =>
+          c.cmd === "bash"
+          && c.args?.[1]?.includes("/tmp/openclaw-bundle-assets"),
       );
-      assert.equal(fullBootstrapCommand, undefined, "resume must not re-download the bundle");
+      assert.equal(
+        fullBootstrapCommand,
+        undefined,
+        "resume must not run the full bundle installation path",
+      );
 
       const meta = await getInitializedMeta();
       assert.equal(meta.status, "running");
@@ -1682,6 +1935,78 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent bundle corruption fails before fast restore launches Gateway", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.setStatus("stopped");
+    handle.responders.push(...fake.defaultResponders);
+    handle.responders.push((cmd, args) => {
+      if (
+        cmd === "bash"
+        && args?.[0] === "-c"
+        && args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH)
+      ) {
+        return {
+          exitCode: 0,
+          output: async (stream?: "stdout" | "stderr" | "both") =>
+            stream === "stderr"
+              ? ""
+              : `${JSON.stringify(BUNDLE_ADMISSION.identity)}\n`,
+        };
+      }
+      if (
+        cmd === "bash"
+        && args?.[0] === "-c"
+        && args[1]?.includes(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)
+      ) {
+        return {
+          exitCode: 1,
+          output: async () =>
+            "verified bundle runtime tree mismatch: external-plugin:slack",
+        };
+      }
+      return undefined;
+    });
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (params) => {
+      const found = await originalGet(params);
+      if (params.resume === true) handle.setStatus("running");
+      return found;
+    };
+
+    _setAiGatewayTokenOverrideForTesting("test-ai-key");
+    try {
+      await runScheduledEnsure("bundle-corruption-no-launch");
+      assert.match(
+        (await getInitializedMeta()).lastError ?? "",
+        /verify persisted bundle runtime/,
+      );
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+        ),
+        false,
+        "corrupt persisted bytes must never reach Gateway launch",
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
     }
   });
 });
@@ -4423,6 +4748,54 @@ test("[lifecycle] ensureUsableAiGatewayCredential: null lastTokenExpiresAt proce
   });
 });
 
+test("[lifecycle] token refresh cannot mutate a replaced lifecycle generation", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const oldSandboxId = "sbx-token-old";
+    const replacementSandboxId = "sbx-token-replacement";
+    const oldHandle = new FakeSandboxHandle(oldSandboxId, fake.events);
+    fake.handlesByIds.set(oldSandboxId, oldHandle);
+    _setAiGatewayTokenOverrideForTesting("fresh-oidc-token");
+    try {
+      await mutateMeta((meta) => {
+        meta.status = "running";
+        meta.sandboxId = oldSandboxId;
+        meta.lifecycleAttemptId = "attempt-token-old";
+        meta.lastTokenRefreshAt = null;
+        meta.lastTokenExpiresAt = null;
+        meta.lastTokenSource = null;
+      });
+      let lookup: { sandboxId: string; resume?: boolean } | undefined;
+      fake.get = async (input) => {
+        lookup = input;
+        await mutateMeta((meta) => {
+          meta.status = "running";
+          meta.sandboxId = replacementSandboxId;
+          meta.lifecycleAttemptId = "attempt-token-replacement";
+          meta.lastTokenRefreshAt = 123;
+          meta.lastTokenExpiresAt = 456;
+          meta.lastTokenSource = "oidc";
+        });
+        return oldHandle;
+      };
+
+      const result = await ensureUsableAiGatewayCredential({ force: true });
+      const meta = await getInitializedMeta();
+
+      assert.deepEqual(lookup, { sandboxId: oldSandboxId, resume: false });
+      assert.equal(result.refreshed, false);
+      assert.equal(result.reason, "sandbox-changed");
+      assert.deepEqual(oldHandle.networkPolicies, []);
+      assert.equal(meta.sandboxId, replacementSandboxId);
+      assert.equal(meta.lifecycleAttemptId, "attempt-token-replacement");
+      assert.equal(meta.lastTokenRefreshAt, 123);
+      assert.equal(meta.lastTokenExpiresAt, 456);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
 test("[lifecycle] ensureUsableAiGatewayCredential: api-key source returns no-refresh-needed", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
@@ -4801,7 +5174,10 @@ test("[failure] gone sandbox clears orphaned suspension and deadline state", asy
         stoppedAtMs: Date.now(),
       }),
     );
-    await getStore().setValue(sandboxDeadlineKey(), { sandboxId });
+    await getStore().setValue(
+      sandboxDeadlineV2Key(),
+      sandboxDeadlineState(sandboxId),
+    );
     fake.get = async () => {
       throw new Error("404 sandbox not found");
     };
@@ -4813,7 +5189,7 @@ test("[failure] gone sandbox clears orphaned suspension and deadline state", asy
       await getStore().getValue(hostSuspensionOperationKey()),
       null,
     );
-    assert.equal(await getStore().getValue(sandboxDeadlineKey()), null);
+    assert.equal(await getStore().getValue(sandboxDeadlineV2Key()), null);
   });
 });
 
@@ -5329,6 +5705,40 @@ test("touchRunningSandbox returns current lifecycle state when deadline stop win
     const result = await touch;
     assert.equal(result.status, "snapshotting");
     assert.equal(result.sandboxId, sandboxId);
+  });
+});
+
+test("touchRunningSandbox cannot extend or retire a replaced lifecycle generation", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const oldSandboxId = "sbx-touch-old";
+    const replacementSandboxId = "sbx-touch-replacement";
+    const oldHandle = new FakeSandboxHandle(oldSandboxId, fake.events, 120_000);
+    fake.handlesByIds.set(oldSandboxId, oldHandle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = oldSandboxId;
+      meta.lifecycleAttemptId = "attempt-touch-old";
+      meta.lastAccessedAt = null;
+    });
+    let lookup: { sandboxId: string; resume?: boolean } | undefined;
+    fake.get = async (input) => {
+      lookup = input;
+      await mutateMeta((meta) => {
+        meta.status = "running";
+        meta.sandboxId = replacementSandboxId;
+        meta.lifecycleAttemptId = "attempt-touch-replacement";
+      });
+      return oldHandle;
+    };
+
+    const result = await touchRunningSandbox();
+
+    assert.deepEqual(lookup, { sandboxId: oldSandboxId, resume: false });
+    assert.equal(result.status, "running");
+    assert.equal(result.sandboxId, replacementSandboxId);
+    assert.equal(result.lifecycleAttemptId, "attempt-touch-replacement");
+    assert.deepEqual(oldHandle.extendedTimeouts, []);
   });
 });
 
@@ -6730,7 +7140,7 @@ test("resetSandbox clears metadata and suspension when deadline cleanup fails af
     const deleteValue = store.deleteValue.bind(store);
     let injected = false;
     store.deleteValue = async (key) => {
-      if (key === sandboxDeadlineKey() && !injected) {
+      if (key === sandboxDeadlineV2Key() && !injected) {
         injected = true;
         throw new Error("deadline cleanup unavailable");
       }
@@ -7704,6 +8114,60 @@ test("terminal SDK status projects even when monitor repair is unavailable", asy
   });
 });
 
+test("firewall fail-closed monitor stops the exact fenced generation", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-firewall-fail-closed", fake.events);
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "firewall-attempt";
+      meta.portUrls = { "3000": handle.domain(3000) };
+      meta.lastGatewayProbeReady = true;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        lifecycleAttemptId: "firewall-attempt",
+        reason: FIREWALL_FAIL_CLOSED_REASON,
+      }),
+    );
+
+    const reconciled = await reconcileSnapshottingStatus();
+
+    assert.equal(reconciled.status, "stopped");
+    assert.equal(reconciled.portUrls, null);
+    assert.equal(reconciled.lastGatewayProbeReady, false);
+    assert.equal(handle.stopCalled, true);
+    assert.equal(handle.lastStopOptions?.blocking, true);
+    assert.deepEqual(handle.networkPolicies, ["deny-all"]);
+    assert.equal((await readHostSuspensionState())?.phase, "stopped");
+  });
+});
+
+test("firewall fail-closed metadata repairs a missing durable stop handoff", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-firewall-handoff-repair", fake.events);
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "firewall-repair-attempt";
+      meta.lastError = FIREWALL_FAIL_CLOSED_LAST_ERROR;
+    });
+    const reconciled = await reconcileSnapshottingStatus();
+    const suspension = await readHostSuspensionState();
+
+    assert.equal(reconciled.status, "error");
+    assert.equal(suspension?.sandboxId, handle.sandboxId);
+    assert.equal(suspension?.lifecycleAttemptId, "firewall-repair-attempt");
+    assert.equal(suspension?.reason, FIREWALL_FAIL_CLOSED_REASON);
+    assert.equal(suspension?.phase, "stop-requesting");
+  });
+});
+
 test("missing sandbox during stop is deleted state, not a reusable stop", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
@@ -7723,7 +8187,10 @@ test("missing sandbox during stop is deleted state, not a reusable stop", async 
         stopRequestDeadlineAtMs: null,
       }),
     );
-    await getStore().setValue(sandboxDeadlineKey(), { sandboxId });
+    await getStore().setValue(
+      sandboxDeadlineV2Key(),
+      sandboxDeadlineState(sandboxId),
+    );
     fake.get = async () => {
       throw new Error("404 sandbox not found");
     };
@@ -7737,7 +8204,7 @@ test("missing sandbox during stop is deleted state, not a reusable stop", async 
     assert.equal(reconciled.restorePreparedStatus, "failed");
     assert.equal(reconciled.restorePreparedReason, "prepare-failed");
     assert.equal(await getStore().getValue(hostSuspensionOperationKey()), null);
-    assert.equal(await getStore().getValue(sandboxDeadlineKey()), null);
+    assert.equal(await getStore().getValue(sandboxDeadlineV2Key()), null);
   });
 });
 
@@ -7777,7 +8244,7 @@ test("reconcileSnapshottingStatus rolls back when accepted stop remains running"
     assert.equal(rolledBack?.phase, "failed");
     assert.equal(rolledBack?.ingressFenced, false);
     const deadline = await getStore().getValue<{ sandboxId?: string }>(
-      sandboxDeadlineKey(),
+      sandboxDeadlineV2Key(),
     );
     assert.equal(deadline?.sandboxId, handle.sandboxId);
   });

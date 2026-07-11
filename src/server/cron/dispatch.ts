@@ -16,10 +16,16 @@ import { getStore } from "@/server/store/store";
 const DISPATCH_START_LEASE_MS = 60_000;
 const DISPATCH_ACTIVE_HARD_CEILING_MS = 2 * 60 * 60_000;
 const DISPATCH_RETRY_MS = 60_000;
+const DISPATCH_CLOCK_ROLLBACK_TOLERANCE_MS = 60_000;
 export const CRON_PREWAKE_MAX_LEAD_MS = 5 * 60_000;
 
 export type StartCronWakeWorkflow = (
   envelope: CronWakeWorkflowEnvelopeV1,
+) => Promise<{ runId: string }>;
+
+export type StartCronDispatchRepairWorkflow = (
+  envelope: CronWakeWorkflowEnvelopeV1,
+  repairAtMs: number,
 ) => Promise<{ runId: string }>;
 
 export type CronWorkflowRunStatus =
@@ -53,6 +59,14 @@ export type CronWakeHandoffResult =
   | "stale";
 
 export const cronDispatchWorkflowRuntime = {
+  async startRepair(
+    _envelope: CronWakeWorkflowEnvelopeV1,
+    _repairAtMs: number,
+  ): Promise<{ runId: string }> {
+    // Production callers inject the Workflow entry point. Keeping dispatch
+    // free of a back-edge to the workflow module prevents bundle cycles.
+    throw new Error("cron_dispatch_repair_workflow_not_configured");
+  },
   async cancel(runId: string): Promise<void> {
     const { getRun } = await import("workflow/api");
     await getRun(runId).cancel();
@@ -102,29 +116,39 @@ function shouldRearm(
 ): boolean {
   const matchingRun =
     workflowRunLoss !== null &&
-    (dispatch.status === "scheduled" || dispatch.status === "running") &&
+    (dispatch.status === "scheduled" ||
+      dispatch.status === "running" ||
+      dispatch.status === "completed") &&
     dispatch.workflowRunId === workflowRunLoss.runId;
   const matchingRunLost = matchingRun && workflowRunLoss.status === "lost";
   switch (dispatch.status) {
     case "failed":
       return dispatch.retryAtMs <= now;
     case "starting":
-      return dispatch.startLeaseExpiresAtMs <= now;
+      return (
+        dispatch.startLeaseExpiresAtMs <= now ||
+        dispatch.startLeaseExpiresAtMs >
+          now + DISPATCH_START_LEASE_MS + DISPATCH_CLOCK_ROLLBACK_TOLERANCE_MS
+      );
     case "scheduled":
       return (
         matchingRunLost ||
+        dispatch.scheduledAtMs > now + DISPATCH_CLOCK_ROLLBACK_TOLERANCE_MS ||
         dispatch.scheduledAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS <=
           now
       );
     case "running":
       return (
         matchingRunLost ||
+        dispatch.claimedAtMs > now + DISPATCH_CLOCK_ROLLBACK_TOLERANCE_MS ||
         dispatch.claimedAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS <= now
       );
     case "completed":
-      // A completed projection contains only the old due time. Wait for the
-      // scheduler's next authoritative snapshot; replaying it loops forever.
-      return false;
+      if (dispatch.legacyWorkflowOwner) return false;
+      return (
+        matchingRunLost ||
+        dispatch.completedAtMs > now + DISPATCH_CLOCK_ROLLBACK_TOLERANCE_MS
+      );
     default:
       return false;
   }
@@ -140,7 +164,9 @@ async function rearmStaleDispatch(
     return record;
   }
   const supersededWorkflowRunId =
-    record.dispatch.status === "scheduled" || record.dispatch.status === "running"
+    record.dispatch.status === "scheduled" ||
+    record.dispatch.status === "running" ||
+    record.dispatch.status === "completed"
       ? record.dispatch.workflowRunId
       : null;
   const rearmed =
@@ -176,6 +202,8 @@ async function rearmStaleDispatch(
 async function claimDispatchStart(
   record: CronProjectionRecordV1,
   now: number,
+  repairWorkflowRunId: string,
+  repairAtMs: number,
 ): Promise<CronProjectionRecordV1 | null> {
   if (record.dispatch.status !== "pending") return null;
   const store = getStore();
@@ -197,7 +225,8 @@ async function claimDispatchStart(
         ...latest.dispatch,
         status: "starting",
         wakeAtMs: resolveCronWakeAtMs(latest.dispatch.runAtMs, now),
-        startLeaseExpiresAtMs: now + DISPATCH_START_LEASE_MS,
+        startLeaseExpiresAtMs: repairAtMs,
+        repairWorkflowRunId,
       },
     };
     if (
@@ -216,6 +245,7 @@ async function claimDispatchStart(
 export async function startCronProjectionDispatch(options: {
   origin: string;
   startWorkflow: StartCronWakeWorkflow;
+  startRepairWorkflow?: StartCronDispatchRepairWorkflow;
   getWorkflowRunStatus?: (runId: string) => Promise<CronWorkflowRunStatus>;
   now?: () => number;
 }): Promise<CronProjectionReconcileResult> {
@@ -233,7 +263,8 @@ export async function startCronProjectionDispatch(options: {
   let workflowRunLoss: WorkflowRunLossEvidence = null;
   if (
     (record.dispatch.status === "scheduled" ||
-      record.dispatch.status === "running") &&
+      record.dispatch.status === "running" ||
+      record.dispatch.status === "completed") &&
     options.getWorkflowRunStatus
   ) {
     try {
@@ -285,8 +316,42 @@ export async function startCronProjectionDispatch(options: {
     };
   }
 
-  const claimed = await claimDispatchStart(record, now);
+  const repairAtMs = now + DISPATCH_START_LEASE_MS;
+  const prospectiveEnvelope: CronWakeWorkflowEnvelopeV1 = {
+    version: 1,
+    projectionRevision: record.projectionRevision,
+    token: record.dispatch.token,
+    runAtMs: record.dispatch.runAtMs,
+    wakeAtMs: resolveCronWakeAtMs(record.dispatch.runAtMs, now),
+    origin: options.origin,
+  };
+  let repairWorkflow: { runId: string };
+  try {
+    repairWorkflow = await (
+      options.startRepairWorkflow ?? cronDispatchWorkflowRuntime.startRepair
+    )(prospectiveEnvelope, repairAtMs);
+  } catch (error) {
+    logWarn("cron.projection_repair_workflow_start_failed", {
+      projectionRevision: record.projectionRevision,
+      runAtMs: record.dispatch.runAtMs,
+      error: error instanceof Error ? error.name : "unknown",
+    });
+    return {
+      status: "failed",
+      projectionRevision: record.projectionRevision,
+      nextRunAtMs: record.nextRunAtMs,
+      workflowRunId: null,
+      repaired: false,
+    };
+  }
+  const claimed = await claimDispatchStart(
+    record,
+    now,
+    repairWorkflow.runId,
+    repairAtMs,
+  );
   if (!claimed || claimed.dispatch.status !== "starting") {
+    await cancelSupersededCronWake(repairWorkflow.runId);
     return {
       status: "starting",
       projectionRevision: record.projectionRevision,
@@ -324,6 +389,7 @@ export async function startCronProjectionDispatch(options: {
         wakeAtMs: envelope.wakeAtMs,
         attempt: latest.dispatch.attempt,
         workflowRunId: workflow.runId,
+        executionWorkflowRunId: null,
         scheduledAtMs: now,
       };
       return latest;
@@ -338,15 +404,18 @@ export async function startCronProjectionDispatch(options: {
       const handedOff = Boolean(
         current?.projectionRevision === envelope.projectionRevision &&
           ((current.dispatch.status === "completed" &&
-            current.dispatch.token === envelope.token) ||
+            current.dispatch.token === envelope.token &&
+            current.dispatch.workflowRunId === workflow.runId) ||
             ((current.dispatch.status === "scheduled" ||
               current.dispatch.status === "running") &&
               current.dispatch.token === envelope.token &&
-              current.dispatch.workflowRunId !== workflow.runId)),
+              current.dispatch.workflowRunId === workflow.runId &&
+              current.dispatch.executionWorkflowRunId !== null)),
       );
       if (!handedOff) {
         await cancelSupersededCronWake(workflow.runId);
       }
+      await cancelSupersededCronWake(repairWorkflow.runId);
       startedRunId = null;
       if (!current) {
         return {
@@ -380,6 +449,7 @@ export async function startCronProjectionDispatch(options: {
       };
     }
     startedRunId = null;
+    await cancelSupersededCronWake(repairWorkflow.runId);
     logInfo("cron.projection_workflow_started", {
       projectionRevision: envelope.projectionRevision,
       runAtMs: envelope.runAtMs,
@@ -418,6 +488,7 @@ export async function startCronProjectionDispatch(options: {
       }
     }
     if (durableDispatch) {
+      await cancelSupersededCronWake(repairWorkflow.runId);
       const workflowRunId =
         durableDispatch.dispatch.status === "scheduled" ||
         durableDispatch.dispatch.status === "running"
@@ -469,6 +540,7 @@ export async function startCronProjectionDispatch(options: {
 export async function reconcileCronProjection(options: {
   origin: string;
   startWorkflow: StartCronWakeWorkflow;
+  startRepairWorkflow?: StartCronDispatchRepairWorkflow;
   getWorkflowRunStatus?: (runId: string) => Promise<CronWorkflowRunStatus>;
   now?: () => number;
   enabled: boolean;
@@ -514,7 +586,7 @@ export async function claimCronWake(
       latest.dispatch.status === "running" &&
       latest.dispatch.token === envelope.token
     ) {
-      return latest.dispatch.workflowRunId === workflowRunId;
+      return latest.dispatch.executionWorkflowRunId === workflowRunId;
     }
     if (
       latest.dispatch.status === "none" ||
@@ -529,13 +601,19 @@ export async function claimCronWake(
     }
     if (
       latest.dispatch.status === "scheduled" &&
-      latest.dispatch.workflowRunId !== workflowRunId &&
-      latest.dispatch.workflowRunId !== parentWorkflowRunId
+      (latest.dispatch.workflowRunId !== parentWorkflowRunId ||
+        (latest.dispatch.executionWorkflowRunId !== null &&
+          latest.dispatch.executionWorkflowRunId !== workflowRunId))
     ) {
       // Before handoff persistence, the timer parent is authoritative. After
       // handoff, only its recorded child may claim this wake.
       return false;
     }
+    const monitorWorkflowRunId =
+      latest.dispatch.status === "scheduled"
+        ? latest.dispatch.workflowRunId
+        : parentWorkflowRunId;
+    if (!monitorWorkflowRunId) return false;
     const next: CronProjectionRecordV1 = {
       ...latest,
       revision: latest.revision + 1,
@@ -546,7 +624,8 @@ export async function claimCronWake(
         wakeAtMs: envelope.wakeAtMs,
         attempt: latest.dispatch.attempt,
         claimedAtMs: now,
-        workflowRunId,
+        workflowRunId: monitorWorkflowRunId,
+        executionWorkflowRunId: workflowRunId,
       },
     };
     if (
@@ -575,7 +654,7 @@ export async function isCronWakeClaimCurrent(
     latest.dispatch.token === envelope.token &&
     latest.dispatch.runAtMs === envelope.runAtMs &&
     latest.dispatch.wakeAtMs === envelope.wakeAtMs &&
-    latest.dispatch.workflowRunId === workflowRunId
+    latest.dispatch.executionWorkflowRunId === workflowRunId
   );
 }
 
@@ -604,7 +683,7 @@ export async function completeCronWake(
       latest.projectionRevision !== envelope.projectionRevision ||
       latest.dispatch.status !== "running" ||
       latest.dispatch.token !== envelope.token ||
-      latest.dispatch.workflowRunId !== workflowRunId
+      latest.dispatch.executionWorkflowRunId !== workflowRunId
     ) {
       return null;
     }
@@ -615,7 +694,8 @@ export async function completeCronWake(
       wakeAtMs: envelope.wakeAtMs,
       attempt: latest.dispatch.attempt,
       completedAtMs: now,
-      workflowRunId,
+      workflowRunId: latest.dispatch.workflowRunId,
+      executionWorkflowRunId: workflowRunId,
     };
     return latest;
   });
@@ -635,14 +715,16 @@ export async function recordCronWakeHandoff(
   const recorded = await mutateCronProjection((latest) => {
     if (
       latest.projectionRevision !== envelope.projectionRevision ||
-      (latest.dispatch.status !== "starting" &&
+      (latest.dispatch.status !== "pending" &&
+        latest.dispatch.status !== "starting" &&
         latest.dispatch.status !== "scheduled") ||
       latest.dispatch.token !== envelope.token ||
       latest.dispatch.runAtMs !== envelope.runAtMs ||
       latest.dispatch.wakeAtMs !== envelope.wakeAtMs ||
       (latest.dispatch.status === "scheduled" &&
-        latest.dispatch.workflowRunId !== parentWorkflowRunId &&
-        latest.dispatch.workflowRunId !== workflowRunId)
+        (latest.dispatch.workflowRunId !== parentWorkflowRunId ||
+          (latest.dispatch.executionWorkflowRunId !== null &&
+            latest.dispatch.executionWorkflowRunId !== workflowRunId)))
     ) {
       return null;
     }
@@ -652,7 +734,8 @@ export async function recordCronWakeHandoff(
       runAtMs: envelope.runAtMs,
       wakeAtMs: envelope.wakeAtMs,
       attempt: latest.dispatch.attempt,
-      workflowRunId,
+      workflowRunId: parentWorkflowRunId,
+      executionWorkflowRunId: workflowRunId,
       scheduledAtMs: now,
     };
     return latest;
@@ -662,7 +745,7 @@ export async function recordCronWakeHandoff(
     (recorded.dispatch.status === "scheduled" ||
       recorded.dispatch.status === "running") &&
     recorded.dispatch.token === envelope.token &&
-    recorded.dispatch.workflowRunId === workflowRunId
+    recorded.dispatch.executionWorkflowRunId === workflowRunId
   ) {
     return "installed";
   }
@@ -670,7 +753,7 @@ export async function recordCronWakeHandoff(
     recorded?.projectionRevision === envelope.projectionRevision &&
     recorded.dispatch.status === "completed" &&
     recorded.dispatch.token === envelope.token &&
-    recorded.dispatch.workflowRunId === workflowRunId
+    recorded.dispatch.executionWorkflowRunId === workflowRunId
   ) {
     return "owned";
   }
@@ -680,7 +763,7 @@ export async function recordCronWakeHandoff(
       recorded.dispatch.status === "running" ||
       recorded.dispatch.status === "completed") &&
     recorded.dispatch.token === envelope.token &&
-    recorded.dispatch.workflowRunId !== parentWorkflowRunId
+    recorded.dispatch.executionWorkflowRunId !== workflowRunId
   ) {
     return "occupied";
   }
@@ -701,9 +784,12 @@ export async function getCronWakeHandoffState(
   ) {
     return "stale";
   }
-  if (latest.dispatch.status === "starting") return "ready";
+  if (latest.dispatch.status === "pending" || latest.dispatch.status === "starting") {
+    return "ready";
+  }
   if (latest.dispatch.status === "scheduled") {
-    return latest.dispatch.workflowRunId === parentWorkflowRunId
+    return latest.dispatch.workflowRunId === parentWorkflowRunId &&
+      latest.dispatch.executionWorkflowRunId === null
       ? "ready"
       : "already";
   }

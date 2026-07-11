@@ -172,6 +172,10 @@ export type FirewallSyncOutcome = {
   reason: string;
 };
 
+export const FIREWALL_FAIL_CLOSED_LAST_ERROR =
+  "Firewall policy application failed; sandbox execution was fenced.";
+export const FIREWALL_FAIL_CLOSED_REASON = "firewall-policy-apply-failed";
+
 export type FirewallState = {
   mode: FirewallMode;
   allowlist: string[];
@@ -181,6 +185,8 @@ export type FirewallState = {
   lastIngestedAt: number | null;
   /** Timestamp when learning mode was last activated, or null if never. */
   learningStartedAt: number | null;
+  /** Random identity for one learning activation, independent of wall clock. */
+  learningEpochId?: string | null;
   /** Total number of shell log lines processed since learning started. */
   commandsObserved: number;
   /** Learned domains that are NOT in the allowlist — only populated in learning mode. */
@@ -197,6 +203,8 @@ export type FirewallState = {
   ingestionSkipCount: number;
   /** Structured outcome of the last ingest operation, or null if none yet. */
   lastIngestOutcome: FirewallIngestOutcome | null;
+  /** Digest of the last durably committed learning-log batch. */
+  lastCommittedLearningBatchId?: string | null;
   /** Structured outcome of the last sync operation, or null if none yet. */
   lastSyncOutcome: FirewallSyncOutcome | null;
 };
@@ -563,6 +571,7 @@ export function createDefaultMeta(
       updatedAt: now,
       lastIngestedAt: null,
       learningStartedAt: null,
+      learningEpochId: null,
       commandsObserved: 0,
       wouldBlock: [],
       lastSyncAppliedAt: null,
@@ -571,6 +580,7 @@ export function createDefaultMeta(
       lastIngestionSkipReason: null,
       ingestionSkipCount: 0,
       lastIngestOutcome: null,
+      lastCommittedLearningBatchId: null,
       lastSyncOutcome: null,
     },
     lastTokenRefreshAt: null,
@@ -864,6 +874,11 @@ export function ensureMetaShape(
         typeof (raw.firewall as Record<string, unknown>)?.learningStartedAt === "number"
           ? (raw.firewall as Record<string, unknown>).learningStartedAt as number
           : null,
+      learningEpochId:
+        typeof (raw.firewall as Record<string, unknown>)?.learningEpochId
+          === "string"
+          ? (raw.firewall as Record<string, unknown>).learningEpochId as string
+          : null,
       commandsObserved:
         typeof (raw.firewall as Record<string, unknown>)?.commandsObserved === "number"
           ? (raw.firewall as Record<string, unknown>).commandsObserved as number
@@ -894,6 +909,12 @@ export function ensureMetaShape(
       )
         ? ((raw.firewall as Record<string, unknown>).lastIngestOutcome as FirewallIngestOutcome)
         : null,
+      lastCommittedLearningBatchId:
+        typeof (raw.firewall as Record<string, unknown>)
+          ?.lastCommittedLearningBatchId === "string"
+          ? (raw.firewall as Record<string, unknown>)
+              .lastCommittedLearningBatchId as string
+          : null,
       lastSyncOutcome: isFirewallSyncOutcome(
         (raw.firewall as Record<string, unknown>)?.lastSyncOutcome,
       )

@@ -178,6 +178,17 @@ export class MemoryStore {
     return true;
   }
 
+  async deleteValuesIfValueToken(
+    ownerKey: string,
+    expectedToken: string,
+    keys: readonly string[],
+  ): Promise<boolean> {
+    this.gc();
+    if (this.values.get(ownerKey)?.value !== expectedToken) return false;
+    for (const key of keys) this.values.delete(key);
+    return true;
+  }
+
   async deleteValue(key: string): Promise<void> {
     this.values.delete(key);
   }

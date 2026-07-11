@@ -353,7 +353,7 @@ test("Slack webhook: duplicate event_id is deduplicated", async () => {
   });
 });
 
-test("Slack webhook: stopped sandbox posts boot message and starts wake workflow with signed handoff", async () => {
+test("Slack webhook: stopped sandbox defers boot message to durable workflow", async () => {
   await withHarness(async (h) => {
     await configureSlack(h);
     _resetLogBuffer();
@@ -363,16 +363,10 @@ test("Slack webhook: stopped sandbox posts boot message and starts wake workflow
       meta.snapshotId = "snap-slack-wake";
     });
 
-    h.fakeFetch.onPost(/slack\.com\/api\/chat\.postMessage$/, (_url, init) => {
-      const body = JSON.parse(String(init?.body ?? "{}")) as {
-        channel?: string;
-        thread_ts?: string;
-        text?: string;
-      };
-      assert.equal(body.channel, "C-wake");
-      assert.equal(body.thread_ts, "1710000000.000100");
-      assert.match(body.text ?? "", /Waking the sandbox/);
-      return Response.json({ ok: true, ts: "boot-wake-ts" });
+    let routeBootPostCalls = 0;
+    h.fakeFetch.onPost(/slack\.com\/api\/chat\.postMessage$/, () => {
+      routeBootPostCalls += 1;
+      return Response.json({ ok: true, ts: "unexpected-route-boot" });
     });
 
     const payload = {
@@ -410,6 +404,7 @@ test("Slack webhook: stopped sandbox posts boot message and starts wake workflow
         bootMessageId?: string | null;
         workflowHandoff?: {
           slackCleanupConfig?: { configuredAt?: number };
+          slackBootTarget?: { channel?: string; threadTs?: string | null };
           slackForwardHeaders?: Record<string, string>;
           slackRawBody?: string;
         };
@@ -417,7 +412,12 @@ test("Slack webhook: stopped sandbox posts boot message and starts wake workflow
       assert.equal(envelope.version, 1);
       assert.equal(envelope.channel, "slack");
       assert.deepEqual(envelope.payload, payload);
-      assert.equal(envelope.bootMessageId, "boot-wake-ts");
+      assert.equal(envelope.bootMessageId, null);
+      assert.deepEqual(envelope.workflowHandoff?.slackBootTarget, {
+        channel: "C-wake",
+        threadTs: "1710000000.000100",
+      });
+      assert.equal(routeBootPostCalls, 0);
       assert.equal(
         typeof envelope.workflowHandoff?.slackCleanupConfig?.configuredAt,
         "number",
@@ -434,7 +434,7 @@ test("Slack webhook: stopped sandbox posts boot message and starts wake workflow
 
       const logs = getServerLogs().map((entry) => entry.message);
       assert.ok(logs.includes("channels.slack_fast_path_skipped"));
-      assert.ok(logs.includes("channels.slack_boot_message_sent"));
+      assert.equal(logs.includes("channels.slack_boot_message_sent"), false);
       assert.ok(logs.includes("channels.slack_workflow_started"));
       resetAfterCallbacks();
     } finally {
@@ -443,7 +443,7 @@ test("Slack webhook: stopped sandbox posts boot message and starts wake workflow
   });
 });
 
-test("Slack webhook: top-level stopped sandbox wake posts boot message in the user thread", async () => {
+test("Slack webhook: top-level wake hands its thread target to workflow", async () => {
   await withHarness(async (h) => {
     await configureSlack(h);
     await h.mutateMeta((meta) => {
@@ -452,17 +452,6 @@ test("Slack webhook: top-level stopped sandbox wake posts boot message in the us
       meta.snapshotId = "snap-slack-top-level-wake";
     });
 
-    h.fakeFetch.onPost(/slack\.com\/api\/chat\.postMessage$/, (_url, init) => {
-      const body = JSON.parse(String(init?.body ?? "{}")) as {
-        channel?: string;
-        thread_ts?: string;
-        text?: string;
-      };
-      assert.equal(body.channel, "C-top-level-wake");
-      assert.equal(body.thread_ts, "1710000000.000333");
-      assert.match(body.text ?? "", /Waking the sandbox/);
-      return Response.json({ ok: true, ts: "boot-top-level-wake-ts" });
-    });
 
     const payload = {
       type: "event_callback",
@@ -492,8 +481,15 @@ test("Slack webhook: top-level stopped sandbox wake posts boot message in the us
       assert.equal(args.length, 1);
       const envelope = args[0] as {
         bootMessageId?: string | null;
+        workflowHandoff?: {
+          slackBootTarget?: { channel?: string; threadTs?: string | null };
+        };
       };
-      assert.equal(envelope.bootMessageId, "boot-top-level-wake-ts");
+      assert.equal(envelope.bootMessageId, null);
+      assert.deepEqual(envelope.workflowHandoff?.slackBootTarget, {
+        channel: "C-top-level-wake",
+        threadTs: "1710000000.000333",
+      });
       resetAfterCallbacks();
     } finally {
       startMock.mock.restore();
@@ -1058,12 +1054,11 @@ test("Slack webhook: releases dedup lock and returns 500 when workflow start fai
       meta.status = "stopped";
       meta.sandboxId = null;
     });
-    h.fakeFetch.onPost(/slack\.com\/api\/chat\.postMessage$/, () =>
-      Response.json({ ok: true, ts: "boot-start-failed" }),
-    );
-    h.fakeFetch.onPost(/slack\.com\/api\/chat\.delete$/, () =>
-      Response.json({ ok: false, error: "not_authed" }),
-    );
+    let slackMessageMutationCalls = 0;
+    h.fakeFetch.onPost(/slack\.com\/api\/chat\.(postMessage|delete)$/, () => {
+      slackMessageMutationCalls += 1;
+      return Response.json({ ok: true });
+    });
     const route = getSlackWebhookRoute();
     const payload = {
       type: "event_callback",
@@ -1111,17 +1106,19 @@ test("Slack webhook: releases dedup lock and returns 500 when workflow start fai
       await getStore().releaseLock(userMessageDedupKey, reacquiredUserMessageToken!);
 
       assert.equal(startMock.mock.callCount(), 1);
-      const cleanupFailure = getServerLogs().find(
-        (entry) =>
-          entry.message ===
-          "channels.slack_boot_message_cleanup_after_handoff_failed",
-      );
-      assert.ok(cleanupFailure);
       const handoffFailure = getServerLogs().find(
         (entry) => entry.message === "channels.slack_workflow_start_failed",
       );
-      assert.equal(handoffFailure?.data?.bootMessageCleanupAttempted, true);
-      assert.equal(handoffFailure?.data?.bootMessageCleanupSucceeded, false);
+      assert.equal(handoffFailure?.data?.bootMessageCleanupAttempted, false);
+      assert.equal(
+        handoffFailure?.data?.bootMessageCleanupSucceeded ?? null,
+        null,
+      );
+      assert.equal(
+        slackMessageMutationCalls,
+        0,
+        "workflow start must become durable before posting a placeholder",
+      );
     } finally {
       startMock.mock.restore();
     }

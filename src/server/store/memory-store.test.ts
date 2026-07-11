@@ -196,6 +196,21 @@ test("memory-store: value-state tokens make exact replacement atomic", async () 
   });
 });
 
+test("memory-store: token-owned cleanup cannot delete after owner replacement", async () => {
+  const store = new MemoryStore();
+  await store.setValue("owner", { revision: 1 });
+  await store.setValue("legacy", { private: true });
+  const state = await store.getValueState("owner");
+  assert.equal(state.status, "present");
+  if (state.status !== "present") return;
+  await store.setValue("owner", { revision: 2 });
+  assert.equal(
+    await store.deleteValuesIfValueToken("owner", state.token, ["legacy"]),
+    false,
+  );
+  assert.equal(await store.hasValue("legacy"), true);
+});
+
 test("memory-store: unscoped keys remain allowed for local development", async () => {
   const store = makeStore();
   await store.setValue("plain-key", "value");

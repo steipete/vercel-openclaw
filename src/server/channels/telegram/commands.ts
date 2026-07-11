@@ -17,8 +17,11 @@ export function getTelegramBotCommands(): TelegramBotCommand[] {
   return toTelegramBotCommands(getChannelCommandDefinitions());
 }
 
-export async function syncTelegramCommands(botToken: string): Promise<TelegramBotCommand[]> {
+export async function syncTelegramCommands(
+  botToken: string,
+  options?: { signal?: AbortSignal },
+): Promise<TelegramBotCommand[]> {
   const commands = getTelegramBotCommands();
-  await setMyCommands(botToken, commands);
+  await setMyCommands(botToken, commands, options);
   return commands;
 }

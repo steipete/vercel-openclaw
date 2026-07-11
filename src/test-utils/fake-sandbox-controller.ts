@@ -20,6 +20,7 @@ import type {
 import {
   OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
   OPENCLAW_BIN,
+  OPENCLAW_BUNDLE_PATH,
   OPENCLAW_INSTALL_PATCH_SCRIPT_PATH,
 } from "@/server/openclaw/config";
 
@@ -262,6 +263,26 @@ export class FakeSandboxHandle implements SandboxHandle {
           if (stream === "stderr") return "";
           return "openclaw 0.0.0-test";
         },
+      };
+    }
+    if (
+      cmd === "node"
+      && cmdArgs?.[0] === OPENCLAW_BUNDLE_PATH
+      && cmdArgs[1] === "--version"
+    ) {
+      const configuredVersion =
+        process.env.OPENCLAW_PACKAGE_SPEC?.match(/^openclaw@(.+)$/)?.[1]
+        ?? process.env.OPENCLAW_BUNDLE_URL?.match(
+          /\/releases\/download\/v([^/]+)\//,
+        )?.[1]
+        ?? "0.0.0-test";
+      const output = `OpenClaw ${configuredVersion}`;
+      writeToStream(stdout, output);
+      writeToStream(stderr, "");
+      return {
+        exitCode: 0,
+        output: async (stream?: "stdout" | "stderr" | "both") =>
+          stream === "stderr" ? "" : output,
       };
     }
     // Default: recognize the curl readiness probe used by waitForGatewayReady

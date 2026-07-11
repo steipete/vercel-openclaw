@@ -6,13 +6,17 @@ import {
   getCronWakeCredentialRetry,
   getCronWakeDurableRetryMs,
   handoffCronWakeStep,
+  isCronDispatchRepairNeededStep,
   processCronWakeStep,
+  settleCronWakeStep,
   shouldCancelCronWakeHandoff,
 } from "@/server/workflows/cron/cron-wake-workflow";
 
 test("cron wake step retry budget reaches the explicit terminal attempt", () => {
   assert.equal(processCronWakeStep.maxRetries, 4);
   assert.equal(handoffCronWakeStep.maxRetries, 4);
+  assert.equal(settleCronWakeStep.maxRetries, 4);
+  assert.equal(isCronDispatchRepairNeededStep.maxRetries, 4);
 });
 
 test("cron wake covers the default command timeout after the due time", () => {

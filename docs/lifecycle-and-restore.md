@@ -22,6 +22,7 @@ Calling ensure does not always mean "create from scratch." The app picks the che
 
 - If no sandbox exists yet, it creates one from scratch with `{ name: "oc-xxx", persistent: true }` (full bootstrap).
 - If the persistent sandbox exists, npm mode uses `Sandbox.get({ name, resume: true })` for the normal wake path. Bundle mode always discovers with `resume: false` and explicitly resumes only after the stored exact identity is admitted for the current deployment.
+- Before bundle-mode fast restore launches Gateway, the host verifies the retained canonical release archive against its admitted digest and compares every executable bundle-owned runtime and plugin tree with that archive. Missing archives are fetched only from the same digest-pinned release URL; byte or version drift fails closed.
 - A definitive not-found result falls back to `Sandbox.create({ name, persistent: true, ... })`. Name-conflict and interrupted-candidate recovery also discover with `resume: false`, so identity or ownership checks happen before any wake.
 - If the sandbox is already running and healthy, it does nothing.
 

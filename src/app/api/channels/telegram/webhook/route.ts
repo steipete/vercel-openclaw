@@ -1,4 +1,5 @@
 import * as workflowApi from "workflow/api";
+import type { TelegramChannelConfig } from "@/shared/channels";
 
 import {
   CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS,
@@ -30,11 +31,12 @@ import {
 import { planWebhookAfterFastPath } from "@/server/channels/core/webhook-planner";
 import { getPublicOrigin } from "@/server/public-url";
 import { channelDedupKey } from "@/server/channels/keys";
+import { deriveChannelDeliveryId } from "@/server/channels/delivery-id";
 import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-workflow";
 import {
   extractTelegramChatId,
   extractTelegramThreadId,
-  isTelegramWebhookSecretValid,
+  matchTelegramWebhookSecret,
 } from "@/server/channels/telegram/adapter";
 import { deleteMessage, sendMessage } from "@/server/channels/telegram/bot-api";
 import { extractRequestId, logError, logInfo, logWarn } from "@/server/log";
@@ -53,6 +55,7 @@ import {
   buildHostIngressFencedResponse,
   getHostIngressFence,
 } from "@/server/sandbox/host-suspension";
+import { acquireChannelConfigLease } from "@/server/channels/config-lock";
 
 const TELEGRAM_FAST_PATH_POLICY: FastPathClassifierPolicy = {
   channel: "telegram",
@@ -91,6 +94,13 @@ type TelegramFastPathForwardResult = {
   forwardDurationMs: number;
 };
 
+class TelegramFastPathPreDispatchError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "TelegramFastPathPreDispatchError";
+  }
+}
+
 function pickDiagnosticHeaders(headers: Headers): DiagnosticHeaders {
   return {
     server: headers.get("server"),
@@ -111,40 +121,75 @@ async function forwardTelegramFastPath(input: {
   sandboxId: string | null;
   durableAcceptanceAdmitted: boolean;
   gatewayAdmissionRejectionAdmitted: boolean;
+  expectedConfig: TelegramChannelConfig;
 }): Promise<TelegramFastPathForwardResult> {
-  const startedAt = Date.now();
-  const response = await fetch(input.url, {
-    method: "POST",
-    headers: input.headers,
-    body: JSON.stringify(input.payload),
-    signal: AbortSignal.timeout(TELEGRAM_FAST_PATH_FORWARD_TIMEOUT_MS),
-  });
-  const body = await response.text().catch(() => "");
-  const forwardDurationMs = Date.now() - startedAt;
-  return {
-    outcome: classifyFastPathHttpResult({
-      policy: TELEGRAM_FAST_PATH_POLICY,
-      status: response.status,
-      ok: response.ok,
-      bodyHead: body.slice(0, 200),
-      bodyLength: body.length,
-      durationMs: forwardDurationMs,
-      transport: "public",
-      sandboxUrl: input.sandboxUrl,
-      sandboxId: input.sandboxId,
-      explicitlyAccepted:
-        isAdmittedTelegramDurableAcceptance(
-          input.durableAcceptanceAdmitted,
-          response.headers.get(OPENCLAW_DELIVERY_ACCEPTED_HEADER),
-        ),
-      gatewayAdmissionRejectionAdmitted:
-        input.gatewayAdmissionRejectionAdmitted,
-    }),
-    url: input.url,
-    body,
-    headers: pickDiagnosticHeaders(response.headers),
-    forwardDurationMs,
-  };
+  const lease = await acquireChannelConfigLease("telegram", { waitMs: 1_000 })
+    .catch((cause) => {
+      throw new TelegramFastPathPreDispatchError(
+        "telegram_config_lease_unavailable_before_dispatch",
+        { cause },
+      );
+    });
+  try {
+    const current = await getInitializedMeta()
+      .then((meta) => meta.channels.telegram)
+      .catch((cause) => {
+        throw new TelegramFastPathPreDispatchError(
+          "telegram_config_read_failed_before_dispatch",
+          { cause },
+        );
+      });
+    if (
+      !current ||
+      current.configuredAt !== input.expectedConfig.configuredAt ||
+      current.botToken !== input.expectedConfig.botToken ||
+      current.webhookSecret !== input.expectedConfig.webhookSecret
+    ) {
+      throw new TelegramFastPathPreDispatchError(
+        "telegram_config_stale_before_dispatch",
+      );
+    }
+
+    const startedAt = Date.now();
+    const response = await fetch(input.url, {
+      method: "POST",
+      headers: input.headers,
+      body: JSON.stringify(input.payload),
+      signal: AbortSignal.any([
+        lease.signal,
+        AbortSignal.timeout(TELEGRAM_FAST_PATH_FORWARD_TIMEOUT_MS),
+      ]),
+    });
+    const body = await response.text().catch(() => "");
+    await lease.assertOwned();
+    const forwardDurationMs = Date.now() - startedAt;
+    return {
+      outcome: classifyFastPathHttpResult({
+        policy: TELEGRAM_FAST_PATH_POLICY,
+        status: response.status,
+        ok: response.ok,
+        bodyHead: body.slice(0, 200),
+        bodyLength: body.length,
+        durationMs: forwardDurationMs,
+        transport: "public",
+        sandboxUrl: input.sandboxUrl,
+        sandboxId: input.sandboxId,
+        explicitlyAccepted:
+          isAdmittedTelegramDurableAcceptance(
+            input.durableAcceptanceAdmitted,
+            response.headers.get(OPENCLAW_DELIVERY_ACCEPTED_HEADER),
+          ),
+        gatewayAdmissionRejectionAdmitted:
+          input.gatewayAdmissionRejectionAdmitted,
+      }),
+      url: input.url,
+      body,
+      headers: pickDiagnosticHeaders(response.headers),
+      forwardDurationMs,
+    };
+  } finally {
+    await lease.release();
+  }
 }
 
 function canRetryAfterStaleTelegramPort(outcome: FastPathOutcome): boolean {
@@ -217,7 +262,10 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const secretHeader = request.headers.get("x-telegram-bot-api-secret-token") ?? "";
-  if (!secretHeader || !isTelegramWebhookSecretValid(config, secretHeader)) {
+  const secretMatch = secretHeader
+    ? matchTelegramWebhookSecret(config, secretHeader)
+    : null;
+  if (!secretMatch) {
     logWarn("channels.telegram_webhook_rejected", {
       reason: "missing_or_invalid_secret",
       requestId,
@@ -293,16 +341,26 @@ export async function POST(request: Request): Promise<Response> {
   let dedupLock: TelegramWebhookDedupLock | null = null;
   try {
     const updateId = extractUpdateId(payload);
+    const telegramDeliveryId = deriveChannelDeliveryId({
+      channel: "telegram",
+      payload,
+      requestId: requestId ?? null,
+      receivedAtMs,
+      telegramConfig: {
+        botUsername: secretMatch.botUsername,
+        configuredAt: secretMatch.configuredAt,
+      },
+    });
     const chatId = extractTelegramChatId(payload);
     const threadId = extractTelegramThreadId(payload);
     if (updateId) {
-      const dedupKey = channelDedupKey("telegram", updateId);
+      const dedupKey = channelDedupKey("telegram", telegramDeliveryId);
       const dedupResult = await tryAcquireChannelDedupLock({
         channel: "telegram",
         key: dedupKey,
         ttlSeconds: CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS,
         requestId: requestId ?? null,
-        dedupId: updateId,
+        dedupId: telegramDeliveryId,
       });
       if (dedupResult.kind === "duplicate") {
         logInfo("channels.telegram_webhook_dedup_skip", {
@@ -400,10 +458,7 @@ export async function POST(request: Request): Promise<Response> {
         | "started"
         | "response-received" = "not-started";
       const fastPathStartedAt = Date.now();
-      const fastPathUpdateIdForRecord = extractUpdateId(payload);
-      const fastPathDeliveryIdForRecord = fastPathUpdateIdForRecord
-        ? `telegram:${fastPathUpdateIdForRecord}`
-        : null;
+      const fastPathDeliveryIdForRecord = telegramDeliveryId;
       try {
         const sandboxWebhookUrl = await getSandboxDomain(OPENCLAW_TELEGRAM_WEBHOOK_PORT);
         fastPathSandboxWebhookUrl = sandboxWebhookUrl;
@@ -424,12 +479,9 @@ export async function POST(request: Request): Promise<Response> {
         });
         const fastPathHeaders: Record<string, string> = {
           "content-type": "application/json",
-          "x-telegram-bot-api-secret-token": secretHeader,
+          "x-telegram-bot-api-secret-token": config.webhookSecret,
         };
-        const fastPathUpdateId = fastPathUpdateIdForRecord;
-        if (fastPathUpdateId) {
-          fastPathHeaders["x-openclaw-delivery-id"] = `telegram:${fastPathUpdateId}`;
-        }
+        fastPathHeaders["x-openclaw-delivery-id"] = telegramDeliveryId;
         fastPathAttemptCount = 1;
         fastPathDispatchState = "started";
         const firstForward = await forwardTelegramFastPath({
@@ -441,6 +493,7 @@ export async function POST(request: Request): Promise<Response> {
           durableAcceptanceAdmitted:
             telegramDurableAcceptanceAdmitted,
           gatewayAdmissionRejectionAdmitted,
+          expectedConfig: config,
         });
         fastPathDispatchState = "response-received";
         let forwardBody = firstForward.body;
@@ -487,7 +540,7 @@ export async function POST(request: Request): Promise<Response> {
             finalReasonHead: fastPathOutcome.bodyHead,
             startedAt: fastPathStartedAt,
             completedAt: Date.now(),
-            deliveryId: `telegram:${fastPathUpdateId ?? "?"}`,
+            deliveryId: telegramDeliveryId,
           });
           logInfo("channels.telegram_fast_path_ok", withOperationContext(op, {
             sandboxId: effectiveMeta.sandboxId,
@@ -655,6 +708,7 @@ export async function POST(request: Request): Promise<Response> {
                 durableAcceptanceAdmitted:
                   telegramDurableAcceptanceAdmitted,
                 gatewayAdmissionRejectionAdmitted,
+                expectedConfig: config,
               });
               fastPathDispatchState = "response-received";
               const repairTotalMs = Date.now() - repairStartedAt;
@@ -796,7 +850,8 @@ export async function POST(request: Request): Promise<Response> {
           error instanceof Error ? error.message : String(error);
         const definiteTransportRejection =
           fastPathDispatchState === "started" &&
-          isDefiniteNativePreAdmissionError(error);
+          (isDefiniteNativePreAdmissionError(error) ||
+            error instanceof TelegramFastPathPreDispatchError);
         if (
           fastPathDispatchState === "started" &&
           !definiteTransportRejection
@@ -1021,6 +1076,7 @@ export async function POST(request: Request): Promise<Response> {
           workflowHandoff: {
             fallbackTelegramConfig: config,
             telegramConfigGeneration: config.configuredAt,
+            telegramDeliveryId,
             revalidateSandboxBeforeForward:
               routePlan.fastPath?.kind ===
                 FastPathOutcomeKind.FallbackToWorkflow &&
@@ -1092,9 +1148,7 @@ export async function POST(request: Request): Promise<Response> {
         dedupLockReleaseError: dedupRelease.releaseError,
         outcome: "workflow-start-failed",
       });
-      const tgDeliveryId = updateId
-        ? `telegram:${updateId}`
-        : `telegram:request:${requestId ?? receivedAtMs}`;
+      const tgDeliveryId = telegramDeliveryId;
       await recordChannelDlqFailure({
         channel: "telegram",
         deliveryId: tgDeliveryId,

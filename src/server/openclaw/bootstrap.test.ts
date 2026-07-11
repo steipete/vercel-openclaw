@@ -1,11 +1,24 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readlinkSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test, { afterEach, mock } from "node:test";
 
 import {
   OPENCLAW_BIN,
   OPENCLAW_BUILTIN_IMAGE_GEN_SCRIPT_PATH,
   OPENCLAW_BUILTIN_IMAGE_GEN_SKILL_PATH,
+  OPENCLAW_BUNDLE_PATH,
   OPENCLAW_CONFIG_PATH,
   OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
   OPENCLAW_FORCE_PAIR_SCRIPT_PATH,
@@ -38,7 +51,10 @@ import {
   OPENCLAW_STATE_DIR,
 } from "@/server/openclaw/config";
 import {
+  buildNpmBinLinksVerificationScript,
   buildVerifiedBundleInstallScript,
+  buildVerifiedBundleRuntimeVerificationScript,
+  OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH,
   setupOpenClaw,
   waitForGatewayReady,
   detectDrift,
@@ -69,6 +85,27 @@ afterEach(() => {
 async function createHandle(h: ReturnType<typeof createScenarioHarness>) {
   await h.controller.create({ ports: [3000] });
   return h.controller.lastCreated()!;
+}
+
+function parseNpmPackFilename(value: unknown): string {
+  const records = Array.isArray(value)
+    ? value
+    : typeof value === "object" && value !== null
+      ? Object.hasOwn(value, "filename")
+        ? [value]
+        : Object.values(value)
+      : [];
+  const filenames = records.flatMap((record) => {
+    if (typeof record !== "object" || record === null) return [];
+    const filename = Reflect.get(record, "filename");
+    return typeof filename === "string" && filename.length > 0 ? [filename] : [];
+  });
+  assert.equal(
+    filenames.length,
+    1,
+    `npm pack must report exactly one filename: ${JSON.stringify(value)}`,
+  );
+  return filenames[0]!;
 }
 
 async function withEnv<T>(
@@ -198,10 +235,153 @@ test("verified bundle install checks the canonical archive and every contained a
     "Slack must use the supported npm-pack installer instead of bundled extraction",
   );
   assert.match(script, /type != "-" && type != "d"/);
+  assert.match(script, new RegExp(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH));
   for (const assetName of assetNames) {
     if (assetName === canonicalTarball) continue;
     assert.match(script, new RegExp(assetName.replaceAll(".", "\\.")));
   }
+
+  const verificationScript =
+    buildVerifiedBundleRuntimeVerificationScript(admission);
+  const verificationSyntax = spawnSync("bash", ["-n"], {
+    input: verificationScript,
+    encoding: "utf8",
+  });
+  assert.equal(verificationSyntax.status, 0, verificationSyntax.stderr);
+  assert.match(verificationScript, /verify_tree .*node_modules/);
+  assert.match(verificationScript, /verify_tree .*bundled-plugins/);
+  assert.match(verificationScript, /external-plugin:slack/);
+  assert.match(verificationScript, /verified bundle npm bin mismatch/);
+  assert.match(
+    verificationScript,
+    /peer_target" = \/home\/vercel-sandbox\/node_modules\/openclaw/,
+  );
+  assert.match(verificationScript, /sha256sum -c/);
+});
+
+test("npm pack filename parsing accepts supported JSON result shapes", () => {
+  assert.equal(parseNpmPackFilename([{ filename: "array.tgz" }]), "array.tgz");
+  assert.equal(parseNpmPackFilename({ filename: "direct.tgz" }), "direct.tgz");
+  assert.equal(
+    parseNpmPackFilename({ "fixture-plugin": { filename: "map.tgz" } }),
+    "map.tgz",
+  );
+  assert.throws(
+    () =>
+      parseNpmPackFilename({
+        first: { filename: "first.tgz" },
+        second: { filename: "second.tgz" },
+      }),
+    /exactly one filename/,
+  );
+});
+
+test("npm bin verification accepts only links generated from pinned bundled dependency manifests", (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "openclaw-npm-bin-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const source = path.join(root, "source");
+  const bundledDependency = path.join(
+    source,
+    "node_modules",
+    "fixture-tool",
+  );
+  mkdirSync(path.join(bundledDependency, "bin"), { recursive: true });
+  writeFileSync(
+    path.join(source, "package.json"),
+    JSON.stringify({
+      name: "fixture-plugin",
+      version: "1.0.0",
+      dependencies: { "fixture-tool": "file:fixture-tool" },
+      bundleDependencies: ["fixture-tool"],
+    }),
+  );
+  writeFileSync(
+    path.join(bundledDependency, "package.json"),
+    JSON.stringify({
+      name: "fixture-tool",
+      version: "1.0.0",
+      bin: { "fixture-tool": "bin/cli.js" },
+    }),
+  );
+  writeFileSync(
+    path.join(source, "npm-shrinkwrap.json"),
+    JSON.stringify({
+      name: "fixture-plugin",
+      version: "1.0.0",
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        "": {
+          name: "fixture-plugin",
+          version: "1.0.0",
+          dependencies: { "fixture-tool": "file:fixture-tool" },
+        },
+        "node_modules/fixture-tool": {
+          version: "1.0.0",
+          resolved: "fixture-tool",
+          inBundle: true,
+          bin: { "fixture-tool": "bin/cli.js" },
+        },
+      },
+    }),
+  );
+  writeFileSync(path.join(bundledDependency, "bin", "cli.js"), "#!/usr/bin/env node\n");
+  cpSync(bundledDependency, path.join(source, "fixture-tool"), { recursive: true });
+
+  const packed = spawnSync("npm", ["pack", "--json", "--ignore-scripts"], {
+    cwd: source,
+    encoding: "utf8",
+  });
+  assert.equal(packed.status, 0, packed.stderr);
+  const filename = parseNpmPackFilename(JSON.parse(packed.stdout) as unknown);
+  const expectedRoot = path.join(root, "expected");
+  mkdirSync(expectedRoot);
+  const extracted = spawnSync(
+    "tar",
+    ["xzf", path.join(source, filename), "-C", expectedRoot],
+    { encoding: "utf8" },
+  );
+  assert.equal(extracted.status, 0, extracted.stderr);
+  const expected = path.join(expectedRoot, "package");
+  assert.equal(
+    existsSync(path.join(expected, "node_modules", "fixture-tool", "package.json")),
+    true,
+    "npm pack must retain the declared bundled dependency",
+  );
+  const actual = path.join(root, "actual");
+  cpSync(expected, actual, { recursive: true });
+  const installed = spawnSync(
+    "npm",
+    [
+      "install",
+      "--ignore-scripts",
+      "--omit=dev",
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+      "--package-lock=false",
+    ],
+    { cwd: actual, encoding: "utf8" },
+  );
+  assert.equal(installed.status, 0, installed.stderr);
+
+  const verifier = buildNpmBinLinksVerificationScript();
+  const clean = spawnSync("node", ["-e", verifier, "--", expected, actual, "fixture"], {
+    encoding: "utf8",
+  });
+  assert.equal(clean.status, 0, clean.stderr);
+
+  const binLink = path.join(actual, "node_modules", ".bin", "fixture-tool");
+  assert.equal(readlinkSync(binLink), "../fixture-tool/bin/cli.js");
+  rmSync(binLink);
+  symlinkSync("../fixture-tool/bin/missing.js", binLink);
+  const mutated = spawnSync(
+    "node",
+    ["-e", verifier, "--", expected, actual, "fixture"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(mutated.status, 0);
+  assert.match(mutated.stderr, /wrong \.bin target fixture-tool/);
 });
 
 test("setupOpenClaw installs the exact external Slack package before writing the final receipt and starting the gateway", async () => {
@@ -290,11 +470,27 @@ test("setupOpenClaw installs the exact external Slack package before writing the
         const startupIndex = handle.commands.findIndex(
           (command) => command.args?.includes(OPENCLAW_STARTUP_SCRIPT_PATH),
         );
+        const versionIndex = handle.commands.findIndex(
+          (command) =>
+            command.cmd === "node"
+            && command.args?.[0] === OPENCLAW_BUNDLE_PATH
+            && command.args[1] === "--version",
+        );
+        const peerLinkIndex = handle.commands.findIndex(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[1]?.includes(
+              "ln -s /home/vercel-sandbox/node_modules/openclaw",
+            ),
+        );
         assert.ok(pluginInstallIndex >= 0, "expected exact npm-pack Slack install");
-        assert.ok(receiptIndex > pluginInstallIndex, "receipt must follow plugin install");
+        assert.ok(peerLinkIndex > pluginInstallIndex, "verified SDK peer must follow install");
+        assert.ok(versionIndex > peerLinkIndex, "version probe must follow peer pinning");
+        assert.ok(receiptIndex > versionIndex, "receipt must follow exact version admission");
         assert.ok(startupIndex > receiptIndex, "gateway must start after receipt");
         assert.deepEqual(result.bundleIdentity, admission.identity);
         assert.equal(result.runtime.packageSpec, admission.identity.packageSpec);
+        assert.equal(result.runtime.drift, false);
 
         const configFile = handle.writtenFiles.find(
           (file) => file.path === OPENCLAW_CONFIG_PATH,
@@ -348,6 +544,47 @@ test("setupOpenClaw installs the exact external Slack package before writing the
         );
       } finally {
         failing.teardown();
+      }
+
+      const mismatched = createScenarioHarness({ preserveBundleEnv: true });
+      try {
+        _setBundleAdmissionForTesting(admission);
+        const handle = await createHandle(mismatched);
+        handle.responders.push((command, args) => {
+          if (
+            command === "node"
+            && args?.[0] === OPENCLAW_BUNDLE_PATH
+            && args[1] === "--version"
+          ) {
+            return {
+              exitCode: 0,
+              output: async (stream?: "stdout" | "stderr" | "both") =>
+                stream === "stderr" ? "" : "OpenClaw 2026.7.3 (ffffffff)",
+            };
+          }
+          return undefined;
+        });
+        await assert.rejects(
+          setupOpenClaw(handle, {
+            gatewayToken: "tok-version-mismatch",
+            proxyOrigin: "https://example.com",
+          }),
+          /OPENCLAW_BUNDLE_COMPATIBILITY_MISMATCH: reported OpenClaw version 2026\.7\.3 does not match admitted bundle version 2026\.7\.2/,
+        );
+        assert.equal(
+          handle.commands.some((command) =>
+            command.args?.[1]?.includes("identity.json.tmp")),
+          false,
+          "mismatched runtime must not receive a verified identity receipt",
+        );
+        assert.equal(
+          handle.commands.some((command) =>
+            command.args?.includes(OPENCLAW_STARTUP_SCRIPT_PATH)),
+          false,
+          "mismatched runtime must not start the gateway",
+        );
+      } finally {
+        mismatched.teardown();
       }
     },
   );

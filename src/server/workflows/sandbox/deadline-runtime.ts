@@ -5,12 +5,15 @@ import { sandboxDeadlineWorkflow } from "@/server/workflows/sandbox/deadline-wor
 type WorkflowStarter = typeof workflowApi.start;
 let testStartOverride: WorkflowStarter | null = null;
 
-export async function startSandboxDeadlineWorkflow(generationId: string): Promise<string> {
+export async function startSandboxDeadlineWorkflow(
+  generationId: string,
+  workflowAttemptId: string,
+): Promise<string> {
   const testRuntime = process.env.NODE_ENV === "test"
     || process.env.NODE_TEST_CONTEXT !== undefined;
   if (testRuntime && !testStartOverride) return `test-deadline-${generationId}`;
   const start = testStartOverride ?? workflowApi.start;
-  const run = await start(sandboxDeadlineWorkflow, [generationId]);
+  const run = await start(sandboxDeadlineWorkflow, [generationId, workflowAttemptId]);
   return run.runId;
 }
 

@@ -25,10 +25,15 @@ import {
 import { toNetworkPolicy } from "@/server/firewall/policy";
 import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
 import type { SandboxController, SandboxHandle } from "@/server/sandbox/controller";
-import { learningLockKey } from "@/server/store/keyspace";
+import {
+  hostSuspensionOperationKey,
+  learningLockKey,
+  lifecycleLockKey,
+} from "@/server/store/keyspace";
 import {
   _resetStoreForTesting,
   getInitializedMeta,
+  getStore,
   mutateMeta,
 } from "@/server/store/store";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
@@ -127,11 +132,17 @@ async function prepareRunningSandbox(
   });
 }
 
-function installFailingSandboxSync(): {
+function installFailingSandboxSync(options?: { stopFails?: boolean }): {
   readonly updateCalls: number;
+  readonly stopCalls: number;
+  readonly attemptedPolicies: NetworkPolicy[];
+  readonly stopBlocking: boolean[];
   restore(): void;
 } {
   let updateCalls = 0;
+  let stopCalls = 0;
+  const attemptedPolicies: NetworkPolicy[] = [];
+  const stopBlocking: boolean[] = [];
 
   const fakeController: SandboxController = {
     async create() {
@@ -154,12 +165,19 @@ function installFailingSandboxSync(): {
           return { snapshotId: "snap-123" };
         },
         async extendTimeout() {},
-        async updateNetworkPolicy() {
+        async updateNetworkPolicy(policy) {
           updateCalls += 1;
+          attemptedPolicies.push(policy);
           throw new Error("sandbox policy update failed");
         },
         async readFileToBuffer() { return null; },
-        async stop() {},
+        async stop(stopOptions) {
+          stopCalls += 1;
+          stopBlocking.push(stopOptions?.blocking ?? true);
+          if (options?.stopFails) {
+            throw new Error("sandbox stop failed");
+          }
+        },
         async delete() {},
         async runDetachedCommand() { return { cmdId: "fake-cmd" }; },
         async getCommand() { return { async kill() {} }; },
@@ -172,6 +190,15 @@ function installFailingSandboxSync(): {
   return {
     get updateCalls() {
       return updateCalls;
+    },
+    get stopCalls() {
+      return stopCalls;
+    },
+    get attemptedPolicies() {
+      return attemptedPolicies;
+    },
+    get stopBlocking() {
+      return stopBlocking;
     },
     restore() {
       _setSandboxControllerForTesting(null);
@@ -205,13 +232,68 @@ test(
 
         const firewall = await getFirewallState();
         assert.equal(firewall.mode, "learning");
-        assert.equal(sandbox.updateCalls, 1);
+        assert.equal(sandbox.updateCalls, 2);
+        assert.equal(sandbox.stopCalls, 1);
+        assert.deepEqual(sandbox.stopBlocking, [true]);
+        assert.equal(sandbox.attemptedPolicies.at(-1), "deny-all");
+        const meta = await getInitializedMeta();
+        assert.equal(meta.status, "error");
+        assert.equal(meta.portUrls, null);
       } finally {
         sandbox.restore();
       }
     });
   },
 );
+
+test("same-mode retry reconciles a previously failed policy apply", async () => {
+  await withFirewallTestStore(async () => {
+    const failing = installFailingSandboxSync();
+    try {
+      await prepareRunningSandbox();
+      await assertFirewallSyncFailed(setFirewallMode("learning"));
+    } finally {
+      failing.restore();
+    }
+
+    const succeeding = installSucceedingSandboxController();
+    try {
+      await mutateMeta((meta) => {
+        meta.status = "running";
+      });
+      await getStore().deleteValue(hostSuspensionOperationKey());
+      const firewall = await setFirewallMode("learning");
+
+      assert.equal(firewall.mode, "learning");
+      assert.equal(succeeding.appliedPolicies.length, 1);
+      assert.equal(firewall.lastSyncOutcome?.applied, true);
+      assert.equal(firewall.lastSyncOutcome?.reason, "policy-applied");
+    } finally {
+      succeeding.restore();
+    }
+  });
+});
+
+test("firewall failure does not claim completion when deny-all and stop both fail", async () => {
+  await withFirewallTestStore(async () => {
+    const sandbox = installFailingSandboxSync({ stopFails: true });
+    try {
+      await prepareRunningSandbox();
+      _resetLogBuffer();
+
+      await assertFirewallSyncFailed(setFirewallMode("learning"));
+
+      const meta = await getInitializedMeta();
+      const messages = getServerLogs().map((entry) => entry.message);
+      assert.equal(meta.status, "error");
+      assert.deepEqual(sandbox.stopBlocking, [true]);
+      assert.ok(messages.includes("firewall.fail_closed_incomplete"));
+      assert.ok(!messages.includes("firewall.fail_closed"));
+    } finally {
+      sandbox.restore();
+    }
+  });
+});
 
 test(
   "approveDomains throws FIREWALL_SYNC_FAILED when sandbox sync fails after persisting allowlist update",
@@ -226,7 +308,8 @@ test(
 
         const firewall = await getFirewallState();
         assert.deepEqual(firewall.allowlist, ["ai-gateway.vercel.sh", "api.openai.com"]);
-        assert.equal(sandbox.updateCalls, 1);
+        assert.equal(sandbox.updateCalls, 2);
+        assert.equal(sandbox.stopCalls, 1);
       } finally {
         sandbox.restore();
       }
@@ -249,7 +332,8 @@ test(
 
         const firewall = await getFirewallState();
         assert.deepEqual(firewall.allowlist, ["vercel.com"]);
-        assert.equal(sandbox.updateCalls, 1);
+        assert.equal(sandbox.updateCalls, 2);
+        assert.equal(sandbox.stopCalls, 1);
       } finally {
         sandbox.restore();
       }
@@ -282,7 +366,8 @@ test(
         assert.equal(firewall.mode, "enforcing");
         assert.deepEqual(firewall.allowlist, ["ai-gateway.vercel.sh", "api.openai.com"]);
         assert.deepEqual(firewall.learned, []);
-        assert.equal(sandbox.updateCalls, 1);
+        assert.equal(sandbox.updateCalls, 2);
+        assert.equal(sandbox.stopCalls, 1);
       } finally {
         sandbox.restore();
       }
@@ -297,13 +382,18 @@ test(
 function installSucceedingSandboxController(opts?: {
   /** Shell command log content returned by `cat /tmp/shell-commands-for-learning.log` */
   shellLog?: string;
+  onLearningRead?: () => void | Promise<void>;
+  onLearningCleanup?: () => void | Promise<void>;
   onUpdateNetworkPolicy?: () => void | Promise<void>;
 }): {
   readonly appliedPolicies: NetworkPolicy[];
+  readonly commands: Array<{ command: string; args: string[] }>;
   restore(): void;
 } {
   const appliedPolicies: NetworkPolicy[] = [];
+  const commands: Array<{ command: string; args: string[] }> = [];
   const shellLog = opts?.shellLog ?? "";
+  let pendingBatchId: string | null = null;
 
   const fakeController: SandboxController = {
     async create() {
@@ -316,10 +406,21 @@ function installSucceedingSandboxController(opts?: {
         get timeoutRemaining() { return 1800000; },
         get status() { return "running" as const; },
         async runCommand(_cmd: string, args?: string[]) {
+          commands.push({ command: _cmd, args: args ?? [] });
           const cmdStr = [_cmd, ...(args ?? [])].join(" ");
           // If reading the learning log, return the configured content
-          if (cmdStr.includes("shell-commands-for-learning.log")) {
-            return { exitCode: 0, output: async () => shellLog };
+          if (cmdStr.includes('cat -- "$pending"')) {
+            await opts?.onLearningRead?.();
+            pendingBatchId ??= args?.[6] ?? "test-batch";
+            return {
+              exitCode: 0,
+              output: async () =>
+                `OPENCLAW_BATCH_ID=${pendingBatchId}\n${shellLog}`,
+            };
+          }
+          if (cmdStr.includes("rm -f")) {
+            await opts?.onLearningCleanup?.();
+            pendingBatchId = null;
           }
           return { exitCode: 0, output: async () => "" };
         },
@@ -350,6 +451,9 @@ function installSucceedingSandboxController(opts?: {
   return {
     get appliedPolicies() {
       return appliedPolicies;
+    },
+    get commands() {
+      return commands;
     },
     restore() {
       _setSandboxControllerForTesting(null);
@@ -546,6 +650,205 @@ test("learning ingestion: extracts domains from shell command log and stores in 
         fw.events.some((e) => e.action === "domain_observed"),
         "Expected at least one domain_observed event",
       );
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("learning ingestion leaves a generation-specific batch when the sandbox changes after read", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-old";
+      meta.firewall.mode = "learning";
+      meta.firewall.learningStartedAt = 100;
+    });
+    const ctrl = installSucceedingSandboxController({
+      shellLog: "curl https://api.openai.com/v1/models\n",
+      onLearningRead: async () => {
+        await mutateMeta((meta) => {
+          meta.sandboxId = "sandbox-new";
+          meta.lifecycleAttemptId = "attempt-new";
+        });
+      },
+    });
+
+    try {
+      const result = await ingestLearningFromSandbox(true);
+      const meta = await getInitializedMeta();
+
+      assert.equal(result.ingested, false);
+      assert.equal(result.reason, "sandbox-generation-changed");
+      assert.deepEqual(meta.firewall.learned, []);
+      assert.equal(meta.firewall.commandsObserved, 0);
+      assert.equal(meta.firewall.lastIngestOutcome, null);
+      assert.equal(
+        ctrl.commands.filter((command) => command.args[1]?.includes("rm -f"))
+          .length,
+        0,
+      );
+      const read = ctrl.commands.find((command) =>
+        command.args[1]?.includes('cat -- "$pending"'));
+      assert.ok(read);
+      assert.equal(read.args[3], "/tmp/shell-commands-for-learning.log");
+      assert.match(read.args[4] ?? "", /\.pending$/);
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("learning ingestion clears draft acceptance when CAS retries against a replacement", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-old";
+      meta.firewall.mode = "learning";
+      meta.firewall.learningStartedAt = 100;
+    });
+    const store = getStore();
+    const originalCompareAndSetMeta = store.compareAndSetMeta.bind(store);
+    let replaceOnFirstCommit = true;
+    store.compareAndSetMeta = async (expectedVersion, next) => {
+      if (replaceOnFirstCommit) {
+        replaceOnFirstCommit = false;
+        const current = await getInitializedMeta();
+        const replacement = structuredClone(current);
+        replacement.sandboxId = "sandbox-new";
+        replacement.lifecycleAttemptId = "attempt-new";
+        replacement.version = current.version + 1;
+        assert.equal(
+          await originalCompareAndSetMeta(current.version, replacement),
+          true,
+        );
+        return false;
+      }
+      return originalCompareAndSetMeta(expectedVersion, next);
+    };
+    const ctrl = installSucceedingSandboxController({
+      shellLog: "curl https://api.openai.com/v1/models\n",
+    });
+
+    try {
+      const result = await ingestLearningFromSandbox(true);
+      const meta = await getInitializedMeta();
+
+      assert.equal(result.reason, "sandbox-generation-changed");
+      assert.equal(meta.sandboxId, "sandbox-new");
+      assert.equal(meta.lifecycleAttemptId, "attempt-new");
+      assert.deepEqual(meta.firewall.learned, []);
+      assert.equal(meta.firewall.commandsObserved, 0);
+      assert.equal(meta.firewall.lastIngestOutcome, null);
+      assert.equal(
+        ctrl.commands.filter((command) => command.args[1]?.includes("rm -f"))
+          .length,
+        0,
+      );
+    } finally {
+      store.compareAndSetMeta = originalCompareAndSetMeta;
+      ctrl.restore();
+    }
+  });
+});
+
+test("learning ingestion does not commit or delete its batch after leaving learning mode", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-1";
+      meta.firewall.mode = "learning";
+      meta.firewall.learningStartedAt = 100;
+    });
+    const ctrl = installSucceedingSandboxController({
+      shellLog: "curl https://api.openai.com/v1/models\n",
+      onLearningRead: async () => {
+        await mutateMeta((meta) => {
+          meta.firewall.mode = "enforcing";
+        });
+      },
+    });
+
+    try {
+      const result = await ingestLearningFromSandbox(true);
+      const meta = await getInitializedMeta();
+
+      assert.equal(result.reason, "sandbox-generation-changed");
+      assert.equal(meta.firewall.mode, "enforcing");
+      assert.deepEqual(meta.firewall.learned, []);
+      assert.equal(meta.firewall.commandsObserved, 0);
+      assert.equal(meta.firewall.lastIngestOutcome, null);
+      assert.equal(
+        ctrl.commands.filter((command) => command.args[1]?.includes("rm -f"))
+          .length,
+        0,
+      );
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("learning ingestion deletes the pending batch only after an accepted commit", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-1";
+      meta.firewall.mode = "learning";
+      meta.firewall.learningStartedAt = 100;
+    });
+    const ctrl = installSucceedingSandboxController({
+      shellLog: "curl https://api.openai.com/v1/models\n",
+    });
+
+    try {
+      const result = await ingestLearningFromSandbox(true);
+      const meta = await getInitializedMeta();
+      const read = ctrl.commands.find((command) =>
+        command.args[1]?.includes('cat -- "$pending"'));
+      const cleanup = ctrl.commands.find((command) =>
+        command.args[1]?.includes("rm -f"));
+
+      assert.equal(result.reason, "updated");
+      assert.deepEqual(meta.firewall.learned.map((entry) => entry.domain), [
+        "api.openai.com",
+      ]);
+      assert.equal(meta.firewall.lastIngestOutcome?.skipReason, null);
+      assert.ok(read);
+      assert.ok(cleanup);
+      assert.equal(cleanup.args[3], read.args[4]);
+      assert.equal(
+        read.args[1]?.includes("/tmp/shell-commands-for-learning.log"),
+        false,
+      );
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("learning ingestion does not replay a committed batch after cleanup failure", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-1";
+      meta.firewall.mode = "learning";
+      meta.firewall.learningStartedAt = 100;
+    });
+    let cleanupCalls = 0;
+    const ctrl = installSucceedingSandboxController({
+      shellLog: "curl https://api.openai.com/v1/models\n",
+      onLearningCleanup: () => {
+        cleanupCalls += 1;
+        if (cleanupCalls === 1) throw new Error("cleanup failed");
+      },
+    });
+
+    try {
+      assert.equal((await ingestLearningFromSandbox(true)).reason, "updated");
+      assert.equal(
+        (await ingestLearningFromSandbox(true)).reason,
+        "already-committed",
+      );
+      const meta = await getInitializedMeta();
+      assert.equal(meta.firewall.commandsObserved, 1);
+      assert.equal(meta.firewall.learned[0]?.hitCount, 1);
+      assert.equal(cleanupCalls, 2);
     } finally {
       ctrl.restore();
     }
@@ -913,6 +1216,18 @@ test("setFirewallMode('learning') sets learningStartedAt and resets commandsObse
   });
 });
 
+test("each learning activation receives a distinct random epoch", async () => {
+  await withFirewallTestStore(async () => {
+    const first = await setFirewallMode("learning");
+    await setFirewallMode("disabled");
+    const second = await setFirewallMode("learning");
+
+    assert.ok(first.learningEpochId);
+    assert.ok(second.learningEpochId);
+    assert.notEqual(first.learningEpochId, second.learningEpochId);
+  });
+});
+
 test("setFirewallMode('disabled') does not reset learningStartedAt", async () => {
   await withFirewallTestStore(async () => {
     const ctrl = installSucceedingSandboxController();
@@ -1049,7 +1364,7 @@ test("ensureMetaShape: migrates metadata missing learningStartedAt and commandsO
 // Same-mode idempotency tests
 // ===========================================================================
 
-test("setFirewallMode is a no-op when requested mode equals current mode", async () => {
+test("setFirewallMode preserves same-mode state while reconciling policy", async () => {
   await withFirewallTestStore(async () => {
     const ctrl = installSucceedingSandboxController();
     try {
@@ -1067,8 +1382,7 @@ test("setFirewallMode is a no-op when requested mode equals current mode", async
       assert.equal(fw.learningStartedAt, 5000);
       assert.equal(fw.commandsObserved, 42);
 
-      // No sync should have been triggered
-      assert.equal(ctrl.appliedPolicies.length, 0);
+      assert.equal(ctrl.appliedPolicies.length, 1);
     } finally {
       ctrl.restore();
     }
@@ -1083,7 +1397,7 @@ test("setFirewallMode is a no-op for disabled → disabled", async () => {
 
       const fw = await setFirewallMode("disabled");
       assert.equal(fw.mode, "disabled");
-      assert.equal(ctrl.appliedPolicies.length, 0);
+      assert.equal(ctrl.appliedPolicies.length, 1);
     } finally {
       ctrl.restore();
     }
@@ -1103,9 +1417,10 @@ test("setFirewallMode syncs sandbox policy exactly once per mode change", async 
       await setFirewallMode("learning");
       assert.equal(ctrl.appliedPolicies.length, 1, "Expected exactly 1 sync for mode change");
 
-      // Same mode again — no additional sync
+      // Same mode reconciles again in case a prior SDK apply failed after the
+      // desired metadata was persisted.
       await setFirewallMode("learning");
-      assert.equal(ctrl.appliedPolicies.length, 1, "Expected no additional sync for same-mode no-op");
+      assert.equal(ctrl.appliedPolicies.length, 2);
     } finally {
       ctrl.restore();
     }
@@ -1409,8 +1724,8 @@ test("ingestLearningFromSandbox acquires the learning lock with the active insta
           store.releaseLock = originalReleaseLock;
         }
 
-        assert.deepEqual(acquiredKeys, [learningLockKey()]);
-        assert.deepEqual(releasedKeys, [learningLockKey()]);
+        assert.deepEqual(acquiredKeys, [lifecycleLockKey(), learningLockKey()]);
+        assert.deepEqual(releasedKeys, [learningLockKey(), lifecycleLockKey()]);
       } finally {
         ctrl.restore();
       }
@@ -1538,7 +1853,7 @@ test("syncFirewallPolicyIfRunning cannot attribute an old apply to a replacement
   });
 });
 
-test("firewall mutations retry policy sync against a replacement generation", async () => {
+test("firewall mutations never retry a stale worker against a replacement generation", async () => {
   await withFirewallTestStore(async () => {
     await prepareRunningSandbox((meta) => {
       meta.lifecycleAttemptId = "attempt-old";
@@ -1559,19 +1874,113 @@ test("firewall mutations retry policy sync against a replacement generation", as
     });
 
     try {
-      await approveDomains(["vercel.com"]);
+      await assertFirewallSyncFailed(approveDomains(["vercel.com"]));
       const meta = await getInitializedMeta();
 
-      assert.equal(updateCount, 2);
+      assert.equal(updateCount, 1);
       assert.equal(meta.sandboxId, "sandbox-replacement");
       assert.equal(meta.lifecycleAttemptId, "attempt-new");
-      assert.equal(meta.firewall.lastSyncOutcome?.applied, true);
-      assert.equal(meta.firewall.lastSyncOutcome?.reason, "policy-applied");
+      assert.equal(meta.firewall.lastSyncOutcome, null);
       assert.deepEqual(ctrl.appliedPolicies, [
-        { allow: ["api.openai.com", "vercel.com"] },
         { allow: ["api.openai.com", "vercel.com"] },
       ]);
     } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("firewall sync fails after losing lifecycle ownership during SDK apply", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-old";
+      meta.firewall.mode = "enforcing";
+      meta.firewall.allowlist = ["api.openai.com"];
+    });
+    const store = getStore();
+    const originalRenewLock = store.renewLock.bind(store);
+    let loseOwnership = false;
+    let updateCount = 0;
+    store.renewLock = async (key, token, ttlSeconds) => {
+      if (!loseOwnership) {
+        return originalRenewLock(key, token, ttlSeconds);
+      }
+      await store.releaseLock(key, token);
+      return false;
+    };
+    const ctrl = installSucceedingSandboxController({
+      onUpdateNetworkPolicy: () => {
+        updateCount += 1;
+        loseOwnership = true;
+      },
+    });
+
+    try {
+      await assert.rejects(
+        syncFirewallPolicyIfRunning(),
+        /Sandbox lifecycle lock ownership was lost/,
+      );
+      const meta = await getInitializedMeta();
+      assert.equal(updateCount, 1);
+      assert.equal(meta.firewall.lastSyncOutcome, null);
+    } finally {
+      store.renewLock = originalRenewLock;
+      ctrl.restore();
+    }
+  });
+});
+
+test("firewall mutation durably fences its generation after lifecycle ownership loss", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-old";
+      meta.firewall.mode = "learning";
+      meta.firewall.allowlist = ["api.openai.com"];
+    });
+    const store = getStore();
+    const originalRenewLock = store.renewLock.bind(store);
+    let loseOwnership = false;
+    let updateCount = 0;
+    store.renewLock = async (key, token, ttlSeconds) => {
+      if (!loseOwnership) {
+        return originalRenewLock(key, token, ttlSeconds);
+      }
+      await store.releaseLock(key, token);
+      return false;
+    };
+    const ctrl = installSucceedingSandboxController({
+      onUpdateNetworkPolicy: () => {
+        updateCount += 1;
+        loseOwnership = true;
+      },
+    });
+
+    try {
+      _resetLogBuffer();
+      await assertFirewallSyncFailed(setFirewallMode("enforcing"));
+
+      const meta = await getInitializedMeta();
+      assert.equal(updateCount, 1);
+      assert.equal(meta.firewall.mode, "enforcing");
+      assert.equal(meta.status, "error");
+      assert.equal(meta.portUrls, null);
+      const stopOperation = await getStore().getValue<{
+        sandboxId: string;
+        lifecycleAttemptId: string | null;
+        reason: string;
+        ingressFenced: boolean;
+      }>(hostSuspensionOperationKey());
+      assert.equal(stopOperation?.sandboxId, "sandbox-123");
+      assert.equal(stopOperation?.lifecycleAttemptId, "attempt-old");
+      assert.equal(stopOperation?.reason, "firewall-policy-apply-failed");
+      assert.equal(stopOperation?.ingressFenced, true);
+      assert.ok(
+        getServerLogs().some(
+          (entry) => entry.message === "firewall.fail_closed_deferred",
+        ),
+      );
+    } finally {
+      store.renewLock = originalRenewLock;
       ctrl.restore();
     }
   });

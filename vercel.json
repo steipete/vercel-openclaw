@@ -1,6 +1,6 @@
 {
   "crons": [
-    { "path": "/api/cron/watchdog", "schedule": "0 8 * * *" }
+    { "path": "/api/cron/watchdog", "schedule": "*/5 * * * *" }
   ],
   "functions": {
     "src/app/api/admin/ssh/route.ts": {

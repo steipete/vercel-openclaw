@@ -45,6 +45,11 @@ export type Store = {
     expectedToken: string,
     next: T,
   ): Promise<boolean>;
+  deleteValuesIfValueToken(
+    ownerKey: string,
+    expectedToken: string,
+    keys: readonly string[],
+  ): Promise<boolean>;
   deleteValue(key: string): Promise<void>;
   acquireLock(key: string, ttlSeconds: number): Promise<string | null>;
   renewLock(key: string, token: string, ttlSeconds: number): Promise<boolean>;

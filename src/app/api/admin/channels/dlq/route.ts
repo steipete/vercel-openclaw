@@ -10,7 +10,7 @@ import { isChannelName } from "@/shared/channels";
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 
-function jsonWithAuth(
+export function jsonWithAuth(
   body: unknown,
   status: number,
   auth: { setCookieHeader: string | null },
@@ -127,15 +127,19 @@ export async function GET(request: Request): Promise<Response> {
     .filter((item) => !includeTerminalOnly || item.terminal)
     .slice(0, limit);
 
-  return Response.json({
-    items,
-    count: items.length,
-    indexSize: scopedIndex.length,
-    staleIndexCount: scopedIndex.length - liveItems.length,
-    limit,
-    channel,
-    includeTerminalOnly,
-  });
+  return jsonWithAuth(
+    {
+      items,
+      count: items.length,
+      indexSize: scopedIndex.length,
+      staleIndexCount: scopedIndex.length - liveItems.length,
+      limit,
+      channel,
+      includeTerminalOnly,
+    },
+    200,
+    auth,
+  );
 }
 
 export async function POST(request: Request): Promise<Response> {

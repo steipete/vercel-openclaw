@@ -9,6 +9,7 @@ import {
   TELEGRAM_RECONCILE_KEY,
 } from "@/server/channels/telegram/reconcile";
 import { withHarness } from "@/test-utils/harness";
+import { channelConfigLockKey } from "@/server/store/keyspace";
 
 const ORIGINAL_ENV = { ...process.env };
 afterEach(() => {
@@ -35,8 +36,19 @@ test("reconcileTelegramIntegration sets webhook, syncs commands, and records tim
 
     const originalFetch = globalThis.fetch;
     globalThis.fetch = h.fakeFetch.fetch;
-    h.fakeFetch.onPost(/api\.telegram\.org\/bottg-bot-token\/setWebhook/, () =>
-      Response.json({ ok: true, result: true }),
+    h.fakeFetch.onPost(
+      /api\.telegram\.org\/bottg-bot-token\/setWebhook/,
+      async () => {
+        assert.equal(
+          await h.getStore().acquireLock(
+            channelConfigLockKey("telegram"),
+            90,
+          ),
+          null,
+          "reconcile must retain the Telegram config lease",
+        );
+        return Response.json({ ok: true, result: true });
+      },
     );
     h.fakeFetch.onPost(/api\.telegram\.org\/bottg-bot-token\/getMyCommands/, () =>
       Response.json({ ok: true, result: [] }),

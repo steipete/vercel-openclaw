@@ -34,6 +34,7 @@ function input(
     schemaVersion: 1 as const,
     gatewayGeneration: "1".repeat(32),
     sourceId: "gateway-source-1",
+    sourceLeaseToken: null,
     sourceStartedAtMs: 1_800_000_000_000,
     sourceRevision: revision,
     reason: revision === 1 ? ("startup" as const) : ("changed" as const),
@@ -51,6 +52,13 @@ function input(
 test("cron projection validates the bounded earliest-wake snapshot shape", () => {
   const options = { now: () => 1_800_000_000_000 };
   assert.equal(parseCronProjectionInput(input(1, []), options).ok, true);
+  const legacyInput: Record<string, unknown> = { ...input(1, []) };
+  delete legacyInput.sourceLeaseToken;
+  const parsedLegacy = parseCronProjectionInput(legacyInput, options);
+  assert.equal(parsedLegacy.ok, true);
+  if (parsedLegacy.ok) {
+    assert.equal(parsedLegacy.value.sourceLeaseTokenProvided, false);
+  }
   assert.deepEqual(parseCronProjectionInput({ schemaVersion: 2 }), {
     ok: false,
     message: "schemaVersion must be 1",
@@ -152,12 +160,114 @@ test("corrupt projection state is explicit rather than treated as absent", async
   await assert.rejects(readCronProjection(store), /cron_projection_state_corrupt/);
 });
 
+test("schema-v1 records atomically migrate newly required ownership fields", async () => {
+  const store = new MemoryStore();
+  const accepted = await acceptCronProjection(
+    input(1, [{ jobId: "legacy", runAtMs: 100 }]),
+    { store },
+  );
+  assert.ok(accepted.record.source);
+  const legacySource: Record<string, unknown> = {
+    ...accepted.record.source,
+  };
+  delete legacySource.epoch;
+  delete legacySource.leaseToken;
+  await store.setValue(cronProjectionKey(), {
+    ...accepted.record,
+    source: legacySource,
+    dispatch: {
+      ...accepted.record.dispatch,
+      status: "scheduled",
+      workflowRunId: "wrun-legacy-parent",
+      scheduledAtMs: 200,
+    },
+  });
+
+  const migrated = await readCronProjectionState(store);
+  assert.equal(migrated.status, "valid");
+  if (migrated.status !== "valid") return;
+  assert.equal(migrated.record.source?.epoch, 1);
+  assert.ok(migrated.record.source?.leaseToken);
+  assert.equal(migrated.record.revision, accepted.record.revision + 1);
+  assert.equal(migrated.record.dispatch.status, "scheduled");
+  if (migrated.record.dispatch.status === "scheduled") {
+    assert.equal(migrated.record.dispatch.executionWorkflowRunId, null);
+    assert.equal(migrated.record.dispatch.legacyWorkflowOwner, true);
+  }
+  assert.equal(
+    await store.compareAndSetValue(
+      cronProjectionKey(),
+      accepted.record.revision,
+      { ...migrated.record, revision: migrated.record.revision + 1 },
+    ),
+    false,
+  );
+});
+
+test("schema-v1 migration rearms ownerless starts and preserves old execution ids", async () => {
+  const store = new MemoryStore();
+  const accepted = await acceptCronProjection(
+    input(1, [{ jobId: "legacy", runAtMs: 100 }]),
+    { store },
+  );
+  assert.notEqual(accepted.record.dispatch.status, "none");
+  if (accepted.record.dispatch.status === "none") return;
+  const oldToken = accepted.record.dispatch.token;
+  await store.setValue(cronProjectionKey(), {
+    ...accepted.record,
+    dispatch: {
+      ...accepted.record.dispatch,
+      status: "starting",
+      startLeaseExpiresAtMs: 200,
+    },
+  });
+  const rearmed = await readCronProjection(store);
+  assert.equal(rearmed?.dispatch.status, "pending");
+  assert.notEqual(
+    rearmed?.dispatch.status === "pending" ? rearmed.dispatch.token : null,
+    oldToken,
+  );
+
+  for (const status of ["running", "completed"] as const) {
+    const timestamp = status === "running"
+      ? { claimedAtMs: 300 }
+      : { completedAtMs: 300 };
+    await store.setValue(cronProjectionKey(), {
+      ...accepted.record,
+      dispatch: {
+        ...accepted.record.dispatch,
+        status,
+        workflowRunId: `wrun-legacy-${status}`,
+        ...timestamp,
+      },
+    });
+    const migrated = await readCronProjection(store);
+    assert.equal(migrated?.dispatch.status, status);
+    if (
+      migrated?.dispatch.status === "running" ||
+      migrated?.dispatch.status === "completed"
+    ) {
+      assert.equal(
+        migrated.dispatch.executionWorkflowRunId,
+        `wrun-legacy-${status}`,
+      );
+      assert.equal(migrated.dispatch.legacyWorkflowOwner, true);
+    }
+  }
+});
+
 test("a silent projection source yields its bounded lease without clock or UUID ordering", async () => {
   const store = new MemoryStore();
-  const first = input(1, [{ jobId: "first", runAtMs: 100 }]);
+  const first = {
+    ...input(1, [{ jobId: "first", runAtMs: 100 }]),
+    sourceLeaseTokenProvided: false,
+  };
   first.sourceId = "gateway-source-old";
   first.sourceStartedAtMs = 2_000;
-  await acceptCronProjection(first, { store, now: () => 1_000 });
+  await acceptCronProjection(first, {
+    store,
+    now: () => 1_000,
+  });
 
   const replacement = input(1, [{ jobId: "replacement", runAtMs: 200 }]);
   replacement.sourceId = "gateway-source-new";
@@ -180,15 +290,32 @@ test("a silent projection source yields its bounded lease without clock or UUID 
   assert.equal(adopted.record.nextRunAtMs, 200);
 
   const oldRetry = await acceptCronProjection(
-    { ...first, sourceRevision: 2 },
-    { store, now: () => 1_001 + CRON_PROJECTION_SOURCE_LEASE_MS },
+    {
+      ...first,
+      sourceLeaseToken: null,
+      sourceLeaseTokenProvided: false,
+      sourceRevision: 2,
+    },
+    { store, now: () => 1_000 + 10 * CRON_PROJECTION_SOURCE_LEASE_MS },
   );
   assert.equal(oldRetry.status, "stale");
-  assert.ok(
-    oldRetry.status === "stale" &&
-      oldRetry.retryAfterMs !== null &&
-      oldRetry.retryAfterMs > 0,
-  );
+  assert.equal(oldRetry.status === "stale" ? oldRetry.retryAfterMs : 0, null);
+});
+
+test("host clock rollback expires source ownership instead of wedging takeover", async () => {
+  const store = new MemoryStore();
+  await acceptCronProjection(input(1, [{ jobId: "old", runAtMs: 100 }]), {
+    store,
+    now: () => 10_000,
+  });
+  const replacement = input(1, [{ jobId: "new", runAtMs: 200 }]);
+  replacement.sourceId = "gateway-source-after-rollback";
+  const adopted = await acceptCronProjection(replacement, {
+    store,
+    now: () => 5_000,
+  });
+  assert.equal(adopted.status, "accepted");
+  assert.equal(adopted.record.nextRunAtMs, 200);
 });
 
 test("cron projection is idempotent, rejects stale revisions, and atomically replaces all", async () => {
@@ -384,6 +511,7 @@ test("reset fence returns the obsolete sleeping Workflow for cancellation", asyn
       ...record.dispatch,
       status: "scheduled",
       workflowRunId: "wrun-reset",
+      executionWorkflowRunId: null,
       scheduledAtMs: 1_600,
     };
     return record;
@@ -412,6 +540,7 @@ test("reset fence returns the active wake Workflow for cancellation", async () =
       ...record.dispatch,
       status: "running",
       workflowRunId: "wrun-running-reset",
+      executionWorkflowRunId: "wrun-running-execution-reset",
       claimedAtMs: 1_600,
     };
     return record;
@@ -441,9 +570,43 @@ test("reset fence leaves legacy cleanup to the post-destroy commit", async () =>
 
   assert.equal(await store.hasValue(cronNextWakeKey()), true);
   assert.equal(await store.hasValue(cronJobsKey()), true);
-  await clearLegacyCronStateForReset(store);
+  const fence = await readCronProjection(store);
+  assert.ok(fence?.gatewayGeneration);
+  assert.equal(
+    await clearLegacyCronStateForReset({
+      gatewayGeneration: fence.gatewayGeneration,
+      projectionRevision: fence.projectionRevision,
+      store,
+    }),
+    true,
+  );
   assert.equal(await store.hasValue(cronNextWakeKey()), false);
   assert.equal(await store.hasValue(cronJobsKey()), false);
+});
+
+test("legacy reset cleanup refuses a successor projection", async () => {
+  const store = new MemoryStore();
+  await store.setValue(cronJobsKey(), { jobs: ["private"] });
+  const fenced = await fenceCronProjectionStateForReset({
+    gatewayGeneration: "2".repeat(32),
+    expectedGatewayGeneration: null,
+    store,
+    now: () => 2_000,
+  });
+  const successor = input(1, []);
+  successor.gatewayGeneration = "2".repeat(32);
+  successor.sourceId = "gateway-successor";
+  await acceptCronProjection(successor, { store, now: () => 2_001 });
+
+  assert.equal(
+    await clearLegacyCronStateForReset({
+      gatewayGeneration: fenced.record.gatewayGeneration!,
+      projectionRevision: fenced.record.projectionRevision,
+      store,
+    }),
+    false,
+  );
+  assert.equal(await store.hasValue(cronJobsKey()), true);
 });
 
 test("reset refuses a concurrent replacement after corrupt-state CAS loss", async () => {

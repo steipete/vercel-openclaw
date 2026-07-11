@@ -11,7 +11,10 @@ import type { SingleMeta } from "@/shared/types";
 import {
   buildChannelConnectabilityMap,
 } from "@/server/channels/connectability";
-import { withChannelConfigLease } from "@/server/channels/config-lock";
+import {
+  withChannelConfigLease,
+  type ChannelConfigLease,
+} from "@/server/channels/config-lock";
 import {
   isPublicUrl,
 } from "@/server/channels/discord/application";
@@ -121,19 +124,38 @@ export async function getPublicChannelState(
 export async function setSlackChannelConfig(
   config: SlackChannelConfig | null,
 ): Promise<SingleMeta> {
-  return mutateMeta((meta) => {
-    meta.channels.slack = config;
+  return withChannelConfigLease("slack", async (lease) => {
+    await lease.assertOwned();
+    return mutateMeta((meta) => {
+      if (!config) {
+        meta.channels.slack = null;
+        return;
+      }
+      const previousGeneration = meta.channels.slack?.configuredAt ?? 0;
+      meta.channels.slack = {
+        ...config,
+        configuredAt: Math.max(config.configuredAt, previousGeneration + 1),
+      };
+    });
   });
 }
 
 export async function setTelegramChannelConfig(
   config: TelegramChannelConfig | null,
 ): Promise<SingleMeta> {
-  return withChannelConfigLease("telegram", () =>
-    mutateMeta((meta) => {
-      meta.channels.telegram = config;
-    }),
+  return withChannelConfigLease("telegram", (lease) =>
+    setTelegramChannelConfigUnderLease(lease, config),
   );
+}
+
+export async function setTelegramChannelConfigUnderLease(
+  lease: ChannelConfigLease,
+  config: TelegramChannelConfig | null,
+): Promise<SingleMeta> {
+  await lease.assertOwned();
+  return mutateMeta((meta) => {
+    meta.channels.telegram = config;
+  });
 }
 
 export async function setDiscordChannelConfig(

@@ -312,6 +312,29 @@ test("setWebhook: sends correct payload", async () => {
   }
 });
 
+test("Telegram config API calls honor an aborted lease signal before fetch", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json({ ok: true, result: true });
+  };
+  const controller = new AbortController();
+  controller.abort(new Error("config lease lost"));
+
+  try {
+    await assert.rejects(
+      setWebhook("token", "https://example.test/hook", "secret", {
+        signal: controller.signal,
+      }),
+      /config lease lost/,
+    );
+    assert.equal(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("deleteWebhook: sends correct payload", async () => {
   const originalFetch = globalThis.fetch;
   let capturedBody = "";

@@ -21,7 +21,6 @@ import {
 } from "@/server/channels/keys";
 import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-workflow";
 import {
-  deleteSlackMessage,
   getSlackUrlVerificationChallenge,
   isValidSlackSignature,
 } from "@/server/channels/slack/adapter";
@@ -34,8 +33,6 @@ import {
   buildHostIngressFencedResponse,
   getHostIngressFence,
 } from "@/server/sandbox/host-suspension";
-const SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage";
-const SLACK_BOOT_MESSAGE_TIMEOUT_MS = 5_000;
 // The fast path intentionally awaits the native handler's full turn
 // (including long AI work like image generation). Keep this generous
 // enough to cover real long turns but short enough to avoid burning
@@ -774,45 +771,16 @@ export async function POST(request: Request): Promise<Response> {
     // emitted channels.dedup_lock_acquire_failed_degraded.
   }
 
-  // Send a wake boot message from the webhook route (before workflow)
-  // so the user gets immediate feedback. The message ts is passed to the
-  // workflow so the step can update/delete it during processing.
-  let bootMessageTs: string | null = null;
-  if (effectiveMeta.status !== "running" && eventInfo.channel) {
-    try {
-      const resp = await fetch(SLACK_POST_MESSAGE_URL, {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${config.botToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
+  // External placeholder creation belongs to the durable Workflow step. The
+  // webhook route only hands off the target, so process death or a hung start
+  // cannot strand a message with no durable cleanup owner.
+  const slackBootTarget =
+    effectiveMeta.status !== "running" && eventInfo.channel
+      ? {
           channel: eventInfo.channel,
-          ...(eventInfo.threadTs ?? eventInfo.ts
-            ? { thread_ts: eventInfo.threadTs ?? eventInfo.ts }
-            : {}),
-          text: "🦞 Waking the sandbox. First reply after idle may be slow.",
-        }),
-        signal: AbortSignal.timeout(SLACK_BOOT_MESSAGE_TIMEOUT_MS),
-      });
-      if (resp.ok) {
-        const body = await resp.json() as { ok?: boolean; ts?: string };
-        if (body.ok && body.ts) {
-          bootMessageTs = body.ts;
+          threadTs: eventInfo.threadTs ?? eventInfo.ts ?? null,
         }
-      }
-      if (bootMessageTs) {
-        logInfo("channels.slack_boot_message_sent", withOperationContext(op, {
-          channel: eventInfo.channel,
-          bootMessageTs,
-        }));
-      }
-    } catch (err) {
-      logWarn("channels.slack_boot_message_failed", withOperationContext(op, {
-        error: err instanceof Error ? err.message : String(err),
-      }));
-    }
-  }
+      : null;
 
   // Capture Slack signature headers so the workflow wake path can replay the
   // forward with signatures intact. OpenClaw's Slack Bolt HTTPReceiver
@@ -832,13 +800,15 @@ export async function POST(request: Request): Promise<Response> {
         payload,
         origin,
         requestId: requestId ?? null,
-        bootMessageId: bootMessageTs,
+        bootMessageId: null,
         receivedAtMs,
         workflowHandoff: {
           slackCleanupConfig: {
             botToken: config.botToken,
             configuredAt: config.configuredAt,
           },
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget,
           revalidateSandboxBeforeForward,
           slackForwardHeaders,
           slackRawBody: rawBody,
@@ -850,34 +820,6 @@ export async function POST(request: Request): Promise<Response> {
       slackForwardHeaderKeys: Object.keys(slackForwardHeaders),
     }));
   } catch (error) {
-    // Best-effort delete the boot message we posted just before this failed
-    // workflow start. Slack will not auto-retry the webhook (we return 5xx),
-    // and the user will eventually retry manually — leaving a dangling
-    // boot placeholder looks broken. Symmetric to the Telegram path.
-    let bootMessageCleanupSucceeded: boolean | null = null;
-    if (bootMessageTs && eventInfo.channel) {
-      try {
-        await deleteSlackMessage({
-          botToken: config.botToken,
-          channel: eventInfo.channel,
-          ts: bootMessageTs,
-          timeoutMs: SLACK_BOOT_MESSAGE_TIMEOUT_MS,
-        });
-        bootMessageCleanupSucceeded = true;
-      } catch (cleanupError) {
-        bootMessageCleanupSucceeded = false;
-        logWarn("channels.slack_boot_message_cleanup_after_handoff_failed", {
-          requestId,
-          channel: eventInfo.channel,
-          bootMessageTs,
-          error:
-            cleanupError instanceof Error
-              ? cleanupError.message
-              : String(cleanupError),
-        });
-        // Don't let cleanup failure mask the real error response.
-      }
-    }
     const [dedupRelease, userMessageRelease] =
       await releaseSlackWebhookDedupLocksForRetry([
         dedupLock,
@@ -894,8 +836,8 @@ export async function POST(request: Request): Promise<Response> {
       userMessageDedupLockReleaseAttempted: userMessageRelease.attempted,
       userMessageDedupLockReleased: userMessageRelease.released,
       userMessageDedupLockReleaseError: userMessageRelease.releaseError,
-      bootMessageCleanupAttempted: Boolean(bootMessageTs && eventInfo.channel),
-      bootMessageCleanupSucceeded,
+      bootMessageCleanupAttempted: false,
+      bootMessageCleanupSucceeded: null,
       retryable: true,
       ...eventInfo,
     }));
@@ -914,7 +856,7 @@ export async function POST(request: Request): Promise<Response> {
       error,
       diag: {
         dedupId,
-        bootMessageTs,
+        bootMessageDeferredToWorkflow: slackBootTarget !== null,
         dedupLockReleased: dedupRelease.released,
         userMessageDedupLockReleased: userMessageRelease.released,
         eventInfo,

@@ -26,6 +26,11 @@ import {
   TELEGRAM_MAX_CAPTION_LEN,
 } from "@/server/channels/telegram/bot-api";
 import type { TelegramUpload } from "@/server/channels/telegram/bot-api";
+import { extractTelegramChatId } from "@/server/channels/telegram/payload";
+export {
+  extractTelegramChatId,
+  extractTelegramThreadId,
+} from "@/server/channels/telegram/payload";
 
 export interface TelegramExtractedMessage {
   text: string;
@@ -65,59 +70,50 @@ function timingSafeEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(left, right);
 }
 
+export type TelegramWebhookSecretMatch = {
+  generation: "current" | "previous";
+  botUsername: string;
+  configuredAt: number;
+};
+
+export function matchTelegramWebhookSecret(
+  config: TelegramChannelConfig,
+  secretHeader: string,
+  nowMs = Date.now(),
+): TelegramWebhookSecretMatch | null {
+  if (timingSafeEqual(secretHeader, config.webhookSecret)) {
+    return {
+      generation: "current",
+      botUsername: config.botUsername,
+      configuredAt: config.configuredAt,
+    };
+  }
+
+  if (
+    config.previousWebhookSecret &&
+      typeof config.previousSecretExpiresAt === "number" &&
+      config.previousSecretExpiresAt > nowMs &&
+      typeof config.previousBotUsername === "string" &&
+      typeof config.previousConfiguredAt === "number" &&
+      timingSafeEqual(secretHeader, config.previousWebhookSecret)
+  ) {
+    return {
+      generation: "previous",
+      botUsername: config.previousBotUsername,
+      configuredAt: config.previousConfiguredAt,
+    };
+  }
+  return null;
+}
+
 export function isTelegramWebhookSecretValid(
   config: TelegramChannelConfig,
   secretHeader: string,
   nowMs = Date.now(),
 ): boolean {
-  if (timingSafeEqual(secretHeader, config.webhookSecret)) {
-    return true;
-  }
-
-  return Boolean(
-    config.previousWebhookSecret &&
-      typeof config.previousSecretExpiresAt === "number" &&
-      config.previousSecretExpiresAt > nowMs &&
-      timingSafeEqual(secretHeader, config.previousWebhookSecret),
-  );
+  return matchTelegramWebhookSecret(config, secretHeader, nowMs) !== null;
 }
 
-export function extractTelegramChatId(update: unknown): string | null {
-  if (!update || typeof update !== "object") {
-    return null;
-  }
-
-  const payload = update as Record<string, unknown>;
-  const message = payload.message ?? payload.edited_message ?? payload.channel_post;
-  if (message && typeof message === "object") {
-    const chat = (message as Record<string, unknown>).chat;
-    if (chat && typeof chat === "object") {
-      const chatId = (chat as Record<string, unknown>).id;
-      if (typeof chatId === "number") {
-        return String(chatId);
-      }
-    }
-  }
-
-  return null;
-}
-
-export function extractTelegramThreadId(update: unknown): number | null {
-  if (!update || typeof update !== "object") {
-    return null;
-  }
-  const payload = update as Record<string, unknown>;
-  const message =
-    payload.message ?? payload.edited_message ?? payload.channel_post;
-  if (!message || typeof message !== "object") {
-    return null;
-  }
-  const threadId = (message as Record<string, unknown>).message_thread_id;
-  if (typeof threadId === "number") {
-    return threadId;
-  }
-  return null;
-}
 
 function extractTelegramText(update: unknown): string | null {
   if (!update || typeof update !== "object") {

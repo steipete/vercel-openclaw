@@ -1,7 +1,11 @@
 import { setWebhook, getMyCommands } from "@/server/channels/telegram/bot-api";
 import type { TelegramBotCommand } from "@/server/channels/telegram/bot-api";
 import { getTelegramBotCommands, syncTelegramCommands } from "@/server/channels/telegram/commands";
-import { buildTelegramWebhookUrl, setTelegramChannelConfig } from "@/server/channels/state";
+import {
+  buildTelegramWebhookUrl,
+  setTelegramChannelConfigUnderLease,
+} from "@/server/channels/state";
+import { withChannelConfigLease } from "@/server/channels/config-lock";
 import { logInfo, logWarn } from "@/server/log";
 import { getInitializedMeta, getStore } from "@/server/store/store";
 
@@ -37,23 +41,24 @@ export async function reconcileTelegramIntegration(options?: {
   force?: boolean;
   ensureCommands?: boolean;
 }): Promise<TelegramReconcileResult | null> {
-  const meta = await getInitializedMeta();
-  const config = meta.channels.telegram;
-  if (!config) {
-    return null;
-  }
-
-  if (!options?.force) {
-    const lastReconciledAt = await getStore().getValue<number>(
-      TELEGRAM_RECONCILE_KEY,
-    );
-    if (
-      lastReconciledAt &&
-      Date.now() - lastReconciledAt < TELEGRAM_RECONCILE_INTERVAL_MS
-    ) {
+  return withChannelConfigLease("telegram", async (lease) => {
+    const meta = await getInitializedMeta();
+    const config = meta.channels.telegram;
+    if (!config) {
       return null;
     }
-  }
+
+    if (!options?.force) {
+      const lastReconciledAt = await getStore().getValue<number>(
+        TELEGRAM_RECONCILE_KEY,
+      );
+      if (
+        lastReconciledAt &&
+        Date.now() - lastReconciledAt < TELEGRAM_RECONCILE_INTERVAL_MS
+      ) {
+        return null;
+      }
+    }
 
   // Prefer the dynamically-built URL (includes bypass param when configured).
   // Fall back to stored config.webhookUrl when the origin cannot be resolved
@@ -64,7 +69,9 @@ export async function reconcileTelegramIntegration(options?: {
   } catch {
     webhookUrl = config.webhookUrl;
   }
-  await setWebhook(config.botToken, webhookUrl, config.webhookSecret);
+  await setWebhook(config.botToken, webhookUrl, config.webhookSecret, {
+    signal: lease.signal,
+  });
 
   let commandsSynced = false;
   let commandCount = 0;
@@ -73,15 +80,17 @@ export async function reconcileTelegramIntegration(options?: {
   if (ensureCommands) {
     try {
       const desired = getTelegramBotCommands();
-      const actual = await getMyCommands(config.botToken);
+      const actual = await getMyCommands(config.botToken, {
+        signal: lease.signal,
+      });
 
       if (!commandsMatch(actual, desired)) {
-        await syncTelegramCommands(config.botToken);
+        await syncTelegramCommands(config.botToken, { signal: lease.signal });
         commandsSynced = true;
       }
       commandCount = desired.length;
 
-      await setTelegramChannelConfig({
+      await setTelegramChannelConfigUnderLease(lease, {
         ...config,
         commandSyncStatus: "synced",
         commandsRegisteredAt: commandsSynced
@@ -94,7 +103,7 @@ export async function reconcileTelegramIntegration(options?: {
       logWarn("channels.telegram_command_reconcile_failed", {
         error: message,
       });
-      await setTelegramChannelConfig({
+      await setTelegramChannelConfigUnderLease(lease, {
         ...config,
         commandSyncStatus: "error",
         commandSyncError: message,
@@ -111,12 +120,13 @@ export async function reconcileTelegramIntegration(options?: {
     commandCount,
   });
 
-  return {
-    checkedAt,
-    webhookReconciled: true,
-    commandsSynced,
-    commandCount,
-  };
+    return {
+      checkedAt,
+      webhookReconciled: true,
+      commandsSynced,
+      commandCount,
+    };
+  });
 }
 
 export async function reconcileTelegramWebhook(options?: {

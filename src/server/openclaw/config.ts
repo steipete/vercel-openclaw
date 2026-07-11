@@ -1025,6 +1025,10 @@ fi
 export function buildFastRestoreScript(): string {
   return `#!/bin/bash
 set -euo pipefail
+case "\${2:-all}" in
+  all|kill|start) _restore_phase="\${2:-all}" ;;
+  *) echo '{"event":"fast_restore.error","reason":"invalid_phase"}' >&2; exit 2 ;;
+esac
 # Write config + credentials from env (sub-ms local write instead of
 # 5-9s writeFiles API call).  Falls back to snapshot files if env is empty.
 install -d -m 700 "${OPENCLAW_STATE_DIR}"
@@ -1098,7 +1102,7 @@ _sleep_ms=0
 # comm via -x as the second pass to catch the post-init form. See
 # buildGatewayKillShell() above for the full rationale.
 _gateway_process_pattern='openclaw.gateway|openclaw.bundle.mjs gateway'
-if pkill -f "$_gateway_process_pattern" 2>/dev/null || pkill -x openclaw 2>/dev/null; then
+if [ "$_restore_phase" != "start" ] && (pkill -f "$_gateway_process_pattern" 2>/dev/null || pkill -x openclaw 2>/dev/null); then
   _killed_existing_gateway=1
   # Poll for process death instead of fixed 1-second sleep.
   # pgrep exits non-zero when no matching process exists.
@@ -1111,6 +1115,10 @@ if pkill -f "$_gateway_process_pattern" 2>/dev/null || pkill -x openclaw 2>/dev/
     sleep 0.05
     _sleep_ms=\$(( _sleep_ms + 50 ))
   done
+fi
+if [ "$_restore_phase" != "start" ] && (pgrep -f "$_gateway_process_pattern" > /dev/null 2>&1 || pgrep -x openclaw > /dev/null 2>&1); then
+  echo '{"event":"fast_restore.gateway_kill_failed","reason":"process_still_running"}' >&2
+  exit 1
 fi
 _kill_finished=\$(date +%s%N 2>/dev/null || echo 0)
 _kill_ms=0
@@ -1142,6 +1150,11 @@ const gt = process.env.OPENCLAW_GATEWAY_TOKEN;
 if (gt) { const dap = path.join(identityDir, "device-auth.json"); fs.writeFileSync(dap, JSON.stringify({ version: 1, deviceId, tokens: { operator: { token: gt, role: "operator", scopes: ["operator.admin","operator.read","operator.write","operator.approvals","operator.pairing"], updatedAtMs: Date.now() } } }, null, 2) + "\\n", { mode: 0o600 }); }
 console.error(JSON.stringify({ event: "fast_restore.pre_gateway_auth", deviceId }));
 ' 2>&1 || echo '{"event":"fast_restore.pre_gateway_auth_failed"}' >&2
+if [ "$_restore_phase" = "kill" ]; then
+  echo '{"ready":false,"phase":"kill"}'
+  echo '{"event":"fast_restore.kill_complete"}' >&2
+  exit 0
+fi
 echo '{"event":"fast_restore.start_gateway"}' >&2
 # Always use Node for the gateway — Bun's WebSocket implementation does not
 # expose socket._socket.remoteAddress, which causes isLocalClient to return

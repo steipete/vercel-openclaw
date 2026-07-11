@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import type { TelegramChannelConfig } from "@/shared/channels";
 import { extractWhatsAppMessageId } from "@/server/channels/whatsapp/adapter";
 
 /** Platform-owned identity shared by webhook diagnostics and workflow delivery. */
@@ -42,12 +43,22 @@ export function deriveChannelDeliveryId(input: {
   payload: unknown;
   requestId: string | null;
   receivedAtMs: number | null;
+  telegramConfig?: Pick<
+    TelegramChannelConfig,
+    "botUsername" | "configuredAt"
+  > | null;
 }): string {
   const platformId = extractChannelPlatformDeliveryId(
     input.channel,
     input.payload,
   );
-  if (platformId) return platformId;
+  if (platformId) {
+    if (input.channel === "telegram" && input.telegramConfig) {
+      const generation = `${input.telegramConfig.botUsername || "unknown"}:${input.telegramConfig.configuredAt}`;
+      return `telegram:${generation}:${platformId.slice("telegram:".length)}`;
+    }
+    return platformId;
+  }
 
   const fallbackBody = `${input.requestId ?? ""}:${input.receivedAtMs ?? ""}:${JSON.stringify(input.payload ?? {})}`;
   const hash = createHash("sha256")

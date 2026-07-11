@@ -84,6 +84,17 @@ redis.call("set", KEYS[1], ARGV[2])
 return 1
 `;
 
+const DELETE_VALUES_IF_TOKEN_LUA = `
+if redis.call("get", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+
+if #KEYS > 1 then
+  redis.call("del", unpack(KEYS, 2))
+end
+return 1
+`;
+
 function toNumber(value: unknown): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -270,6 +281,23 @@ export class RedisStore {
       key,
       expectedToken,
       JSON.stringify(next),
+    );
+    return toNumber(result) === 1;
+  }
+
+  async deleteValuesIfValueToken(
+    ownerKey: string,
+    expectedToken: string,
+    keys: readonly string[],
+  ): Promise<boolean> {
+    assertScopedRedisKey(ownerKey);
+    for (const key of keys) assertScopedRedisKey(key);
+    const result = await this.redis.eval(
+      DELETE_VALUES_IF_TOKEN_LUA,
+      1 + keys.length,
+      ownerKey,
+      ...keys,
+      expectedToken,
     );
     return toNumber(result) === 1;
   }

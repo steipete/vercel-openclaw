@@ -17,10 +17,14 @@ import { logInfo, logWarn } from "@/server/log";
 import { matchesConfiguredBundleIdentity } from "@/server/openclaw/bundle-identity";
 import { getPublicOrigin } from "@/server/public-url";
 import { getInitializedMeta } from "@/server/store/store";
-import { cronWakeWorkflow } from "@/server/workflows/cron/cron-wake-workflow";
+import {
+  cronDispatchRepairWorkflow,
+  cronWakeWorkflow,
+} from "@/server/workflows/cron/cron-wake-workflow";
 
 export const cronProjectionRouteRuntime = {
   start: workflowApi.start,
+  startRepair: workflowApi.start,
   async getRunStatus(runId: string) {
     const run = workflowApi.getRun(runId);
     if (!(await run.exists)) return "missing" as const;
@@ -129,6 +133,14 @@ export async function POST(request: Request): Promise<Response> {
         );
         return { runId: run.runId };
       },
+      startRepairWorkflow: async (envelope, repairAtMs) => {
+        const run = await cronProjectionRouteRuntime.startRepair(
+          cronDispatchRepairWorkflow,
+          [envelope, repairAtMs],
+          { deploymentId: "latest" },
+        );
+        return { runId: run.runId };
+      },
     });
   } catch (error) {
     logWarn("cron.projection_accept_failed", {
@@ -178,6 +190,7 @@ export async function POST(request: Request): Promise<Response> {
     {
       ok: true,
       status: accepted.status,
+      sourceLeaseToken: accepted.sourceLeaseToken,
       projectionRevision: accepted.record.projectionRevision,
       dispatch: dispatch.status,
     },

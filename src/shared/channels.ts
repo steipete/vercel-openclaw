@@ -51,6 +51,8 @@ export type TelegramChannelConfig = {
   webhookSecret: string;
   previousWebhookSecret?: string;
   previousSecretExpiresAt?: number;
+  previousBotUsername?: string;
+  previousConfiguredAt?: number;
   webhookUrl: string;
   botUsername: string;
   configuredAt: number;
@@ -366,6 +368,8 @@ function isTelegramChannelConfig(value: unknown): value is TelegramChannelConfig
     typeof raw.configuredAt === "number" &&
     (raw.previousWebhookSecret === undefined || typeof raw.previousWebhookSecret === "string") &&
     (raw.previousSecretExpiresAt === undefined || typeof raw.previousSecretExpiresAt === "number") &&
+    (raw.previousBotUsername === undefined || typeof raw.previousBotUsername === "string") &&
+    (raw.previousConfiguredAt === undefined || typeof raw.previousConfiguredAt === "number") &&
     (raw.commandSyncStatus === undefined ||
       raw.commandSyncStatus === "synced" ||
       raw.commandSyncStatus === "unsynced" ||

@@ -6,6 +6,8 @@ import { pollUntil } from "@/server/async/poll";
 import { ApiError } from "@/shared/http";
 import {
   computePolicyHash,
+  FIREWALL_FAIL_CLOSED_LAST_ERROR,
+  FIREWALL_FAIL_CLOSED_REASON,
   type OperationContext,
   type RestorePhaseMetrics,
   type RestorePreparedReason,
@@ -30,6 +32,7 @@ import {
   setupOpenClaw,
   CommandFailedError,
   OPENCLAW_BUNDLE_IDENTITY_PATH,
+  verifyPersistedVerifiedBundleRuntime,
 } from "@/server/openclaw/bootstrap";
 import {
   admitConfiguredOpenClawBundle,
@@ -81,7 +84,9 @@ import {
 } from "@/server/openclaw/admin-rpc";
 import {
   clearInactiveHostSuspension,
+  clearHostSuspensionAfterGatewayReplacement,
   clearHostSuspensionAfterDelete,
+  enqueueHostStopOperation,
   ensureHostStopMonitor,
   getHostMutationFence,
   HostSuspensionBusyError,
@@ -118,6 +123,7 @@ import {
   tokenRefreshLockKey,
 } from "@/server/store/keyspace";
 import {
+  clearLegacyCronStateForReset,
   fenceCronProjectionStateForReset,
   normalizeResetCronProjectionGeneration,
 } from "@/server/cron/projection";
@@ -995,6 +1001,90 @@ export type EnsureUsableCredentialOptions = {
 // Public API
 // ---------------------------------------------------------------------------
 
+async function recoverRollbackPendingSandbox(
+  expected: SingleMeta,
+): Promise<SingleMeta> {
+  const expectedStatus = expected.status;
+  if (
+    (expectedStatus !== "error" && expectedStatus !== "running")
+    || !expected.sandboxId
+  ) return expected;
+  const sandboxId = expected.sandboxId;
+  const lifecycleAttemptId = expected.lifecycleAttemptId ?? null;
+  try {
+    return await withSandboxLifecycleMutationLock(async (assertOwned) => {
+      const [current, suspension] = await Promise.all([
+        getInitializedMeta(),
+        readHostSuspensionState(),
+      ]);
+      if (
+        current.status !== expectedStatus
+        || current.sandboxId !== sandboxId
+        || (current.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+        || suspension?.phase !== "rollback-pending"
+        || suspension.sandboxId !== sandboxId
+        || suspension.lifecycleAttemptId !== lifecycleAttemptId
+      ) return current;
+      await assertOwned();
+      let sandbox: SandboxHandle;
+      try {
+        sandbox = await getSandboxController().get({
+          sandboxId,
+          resume: false,
+        });
+      } catch (error) {
+        if (!isSandboxGoneError(error)) throw error;
+        const deleted = await mutateMeta((meta) => {
+          if (
+            meta.status !== expectedStatus
+            || meta.sandboxId !== sandboxId
+            || (meta.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+          ) return;
+          failPendingPersistentAutoSave(meta);
+          meta.status = "uninitialized";
+          meta.sandboxId = null;
+          meta.portUrls = null;
+          meta.lifecycleAttemptId = null;
+          meta.lastError = null;
+          meta.lastGatewayProbeReady = false;
+        });
+        if (deleted.status !== "uninitialized" || deleted.sandboxId !== null) {
+          return deleted;
+        }
+        await clearHostSuspensionAfterDelete({
+          sandboxId,
+          operationId: suspension.operationId,
+        });
+        await clearSandboxDeadline(sandboxId, { lifecycleAttemptId });
+        return deleted;
+      }
+      await assertOwned();
+      if (sandbox.status !== "running") return current;
+      if (!await thawHostSuspensionIfNeeded({ sandbox, lifecycleAttemptId })) {
+        return getInitializedMeta();
+      }
+      await assertOwned();
+      return mutateMeta((meta) => {
+        if (
+          meta.status !== expectedStatus
+          || meta.sandboxId !== sandboxId
+          || (meta.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+        ) return;
+        meta.status = "running";
+        meta.portUrls = resolvePortUrls(sandbox);
+        meta.lastAccessedAt = Date.now();
+        meta.lastError = null;
+        meta.lastGatewayProbeReady = false;
+      });
+    });
+  } catch (error) {
+    if (error instanceof SandboxLifecycleLockContendedError) {
+      return getInitializedMeta();
+    }
+    throw error;
+  }
+}
+
 export async function ensureSandboxRunning(options: {
   origin: string;
   reason: string;
@@ -1007,6 +1097,12 @@ export async function ensureSandboxRunning(options: {
   // the restore path can run instead of bouncing through "waiting" again.
   if (meta.status === "snapshotting") {
     meta = await reconcileSnapshottingStatus();
+  }
+  if (
+    (meta.status === "error" || meta.status === "running")
+    && meta.sandboxId
+  ) {
+    meta = await recoverRollbackPendingSandbox(meta);
   }
   // Bundle migration failures are operator-actionable terminal states. Keep
   // them stable instead of letting a waiter erase the code and start again.
@@ -1034,7 +1130,10 @@ export async function ensureSandboxRunning(options: {
       ) {
         return { state: "waiting", meta };
       }
-      const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
+      const sandbox = await getSandboxController().get({
+        sandboxId: meta.sandboxId,
+        resume: false,
+      });
       const thawed = await thawHostSuspensionIfNeeded({
         sandbox,
         lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
@@ -1311,12 +1410,15 @@ export async function ensureSandboxReadyForCron(options: {
     await assertLifecycleGuardCurrent(options.lifecycleGuard);
     await ensureSandboxAliveThrough(options.aliveThroughMs);
     await assertLifecycleGuardCurrent(options.lifecycleGuard);
-    const credential = await ensureUsableAiGatewayCredential({
-      force: true,
-      required: true,
-      reason: options.reason,
-      controlPlaneOrigin: options.origin,
-    });
+    const credential = await ensureUsableAiGatewayCredentialWithinLifecycleLock(
+      {
+        force: true,
+        required: true,
+        reason: options.reason,
+        controlPlaneOrigin: options.origin,
+      },
+      () => lease.assertOwned(),
+    );
     await assertLifecycleGuardCurrent(options.lifecycleGuard);
     return { meta, credential };
   });
@@ -1372,10 +1474,14 @@ async function ensureSandboxReadyWithinLifecycleLock(options: {
     if (probe.ready) {
       await assertLifecycleGuardCurrent(options.lifecycleGuard);
       if (options.refreshGatewayToken !== false) {
-        await ensureFreshGatewayToken({
-          force: true,
-          controlPlaneOrigin: options.origin,
-        });
+        await ensureUsableAiGatewayCredentialWithinLifecycleLock(
+          {
+            force: true,
+            reason: "guarded-sandbox-ready",
+            controlPlaneOrigin: options.origin,
+          },
+          () => options.lease.assertOwned(),
+        );
       }
       await assertLifecycleGuardCurrent(options.lifecycleGuard);
       return mutateMeta((meta) => {
@@ -1681,7 +1787,14 @@ async function stopSandboxWithOptions(
       await assertLifecycleGuardCurrent(options.lifecycleGuard);
       const meta = await getInitializedMeta();
       if (meta.status === "stopped") {
-        await markHostSuspensionStopped();
+        const operation = await readHostSuspensionState();
+        if (
+          operation
+          && operation.sandboxId === meta.sandboxId
+          && operation.lifecycleAttemptId === (meta.lifecycleAttemptId ?? null)
+        ) {
+          await markHostSuspensionStopped(operation);
+        }
         logInfo("sandbox.already_stopped", { sandboxId: meta.sandboxId });
         return meta;
       }
@@ -3016,6 +3129,20 @@ export async function prepareHotSpareFromPreparedRestore(options?: {
 }
 
 export async function touchRunningSandbox(): Promise<SingleMeta> {
+  try {
+    return await withSandboxLifecycleMutationLock((assertOwned) =>
+      touchRunningSandboxWithinLifecycleLock(assertOwned));
+  } catch (error) {
+    if (error instanceof SandboxLifecycleLockContendedError) {
+      return getInitializedMeta();
+    }
+    throw error;
+  }
+}
+
+async function touchRunningSandboxWithinLifecycleLock(
+  assertOwned: () => Promise<void>,
+): Promise<SingleMeta> {
   const meta = await getInitializedMeta();
   if (!meta.sandboxId || meta.status !== "running") {
     return meta;
@@ -3030,6 +3157,23 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
     return meta;
   }
   const sandboxId = meta.sandboxId;
+  const lifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+  const readOwnedRunningMeta = async (): Promise<SingleMeta | null> => {
+    const [latest, suspension] = await Promise.all([
+      getInitializedMeta(),
+      readHostSuspensionState(),
+    ]);
+    return latest.status === "running"
+      && latest.sandboxId === sandboxId
+      && (latest.lifecycleAttemptId ?? null) === lifecycleAttemptId
+      && !suspension?.ingressFenced
+      ? latest
+      : null;
+  };
+  const markCapturedUnavailable = async (reason: string): Promise<SingleMeta> => {
+    if (!await readOwnedRunningMeta()) return getInitializedMeta();
+    return markSandboxUnavailable(reason, sandboxId, lifecycleAttemptId);
+  };
 
   const now = Date.now();
   const throttleMs = getSandboxTouchThrottleMs();
@@ -3039,11 +3183,15 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
 
   let sandbox: SandboxHandle;
   try {
-    sandbox = await getSandboxController().get({ sandboxId });
+    await assertOwned();
+    sandbox = await getSandboxController().get({ sandboxId, resume: false });
+    await assertOwned();
   } catch (error) {
+    if (error instanceof LifecycleLockOwnershipLostError) throw error;
     const message = error instanceof Error ? error.message : String(error);
-    return markSandboxUnavailable(`sandbox lookup failed: ${message}`, sandboxId);
+    return markCapturedUnavailable(`sandbox lookup failed: ${message}`);
   }
+  if (!await readOwnedRunningMeta()) return getInitializedMeta();
 
   // If the SDK says the sandbox is no longer running (e.g. platform timeout),
   // reconcile metadata immediately instead of attempting timeout extension.
@@ -3053,15 +3201,15 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
       sdkStatus: sandbox.status,
       metaStatus: meta.status,
     });
-    return markSandboxUnavailable(
+    return markCapturedUnavailable(
       `heartbeat detected sandbox status: ${sandbox.status}`,
-      sandboxId,
     );
   }
 
   const targetSleepAfterMs = getSandboxPlatformTimeoutMs();
 
   try {
+    if (!await readOwnedRunningMeta()) return getInitializedMeta();
     const remainingMs = sandbox.timeoutRemaining;
     const extendByMs = getSandboxTimeoutExtensionMs({
       currentTotalMs: sandbox.timeout,
@@ -3070,7 +3218,10 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
     });
 
     if (extendByMs > 0) {
+      await assertOwned();
       await sandbox.extendTimeout(extendByMs);
+      await assertOwned();
+      if (!await readOwnedRunningMeta()) return getInitializedMeta();
       logInfo("sandbox.timeout_topped_up", {
         sandboxId: meta.sandboxId,
         remainingMs,
@@ -3086,6 +3237,7 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
       });
     }
   } catch (error) {
+    if (error instanceof LifecycleLockOwnershipLostError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes("sandbox_timeout_invalid")) {
       // Timeout already at max — sandbox is fine, ignore.
@@ -3094,9 +3246,8 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
         sandboxId,
         error: message,
       });
-      return markSandboxUnavailable(
+      return markCapturedUnavailable(
         `extend timeout failed: ${message}`,
-        sandboxId,
       );
     }
   }
@@ -3120,9 +3271,8 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
           exitCode: liveness.exitCode,
           httpCode,
         });
-        return markSandboxUnavailable(
+        return markCapturedUnavailable(
           `heartbeat gateway liveness failed (exit ${liveness.exitCode}, http ${httpCode})`,
-          sandboxId,
         );
       }
     } catch (error) {
@@ -3134,7 +3284,9 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
     }
   }
 
-  await armSandboxDeadline(meta, undefined, {
+  const current = await readOwnedRunningMeta();
+  if (!current) return getInitializedMeta();
+  await armSandboxDeadline(current, undefined, {
     activityAtMs: Date.now(),
     nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
   });
@@ -3458,6 +3610,104 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
     // fail-closed fence instead of losing diagnostics to a 500 response.
     return meta;
   }
+  if (
+    meta.status === "error"
+    && meta.lastError === FIREWALL_FAIL_CLOSED_LAST_ERROR
+    && meta.sandboxId
+    && (
+      !hostSuspension
+      || hostSuspension.sandboxId !== meta.sandboxId
+      || hostSuspension.lifecycleAttemptId !== (meta.lifecycleAttemptId ?? null)
+      || hostSuspension.reason !== FIREWALL_FAIL_CLOSED_REASON
+    )
+  ) {
+    const sandboxId = meta.sandboxId;
+    const lifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+    return withLifecycleLock(async (lease) => {
+      await lease.assertOwned();
+      const current = await getInitializedMeta();
+      if (
+        current.status !== "error"
+        || current.lastError !== FIREWALL_FAIL_CLOSED_LAST_ERROR
+        || current.sandboxId !== sandboxId
+        || (current.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+      ) return current;
+      const latest = await readHostSuspensionState();
+      if (latest?.ingressFenced) return current;
+      await enqueueHostStopOperation({
+        sandboxId,
+        lifecycleAttemptId,
+        reason: FIREWALL_FAIL_CLOSED_REASON,
+        assertOwned: () => lease.assertOwned(),
+      });
+      return current;
+    });
+  }
+  if (
+    meta.sandboxId
+    && hostSuspension?.ingressFenced
+    && hostSuspension.sandboxId === meta.sandboxId
+    && hostSuspension.lifecycleAttemptId === (meta.lifecycleAttemptId ?? null)
+    && hostSuspension.reason === FIREWALL_FAIL_CLOSED_REASON
+    && ["stop-requesting", "stopping"].includes(hostSuspension.phase)
+  ) {
+    const firewallSandboxId = meta.sandboxId;
+    const firewallLifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+    return withLifecycleLock(async (lease) => {
+      await lease.assertOwned();
+      const current = await getInitializedMeta();
+      const currentHostSuspension = await readHostSuspensionState();
+      if (
+        current.sandboxId !== firewallSandboxId
+        || (current.lifecycleAttemptId ?? null)
+          !== firewallLifecycleAttemptId
+        || currentHostSuspension?.operationId !== hostSuspension.operationId
+        || currentHostSuspension.reason !== FIREWALL_FAIL_CLOSED_REASON
+        || !currentHostSuspension.ingressFenced
+      ) return current;
+      let sandbox: SandboxHandle;
+      try {
+        sandbox = await getSandboxController().get({
+          sandboxId: firewallSandboxId,
+          resume: false,
+        });
+      } catch (error) {
+        if (!isSandboxGoneError(error)) throw error;
+        const gone = await mutateMeta((next) => {
+          if (
+            next.sandboxId !== firewallSandboxId
+            || (next.lifecycleAttemptId ?? null)
+              !== firewallLifecycleAttemptId
+          ) return;
+          next.status = "stopped";
+          next.portUrls = null;
+          next.lastGatewayProbeReady = false;
+        });
+        await markHostSuspensionStopped(currentHostSuspension);
+        return gone;
+      }
+      await lease.assertOwned();
+      try {
+        await sandbox.updateNetworkPolicy("deny-all");
+      } catch {
+        // Confirmed termination below is the authoritative fail-closed edge.
+      }
+      await sandbox.stop({ blocking: true });
+      await lease.assertOwned();
+      const stopped = await mutateMeta((next) => {
+        if (
+          next.sandboxId !== firewallSandboxId
+          || (next.lifecycleAttemptId ?? null)
+            !== firewallLifecycleAttemptId
+        ) return;
+        next.status = "stopped";
+        next.portUrls = null;
+        next.lastGatewayProbeReady = false;
+      });
+      await markHostSuspensionStopped(currentHostSuspension);
+      return stopped;
+    });
+  }
   if (meta.status !== "snapshotting" || !meta.sandboxId) {
     if (
       meta.status !== "running"
@@ -3549,6 +3799,11 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
     }
 
     if (sandbox.status === "stopped") {
+      if (
+        hostSuspension.phase !== "stop-requesting"
+        && hostSuspension.phase !== "stopping"
+        && hostSuspension.phase !== "stopped"
+      ) return meta;
       const stoppedMeta = await mutateMeta((next) => {
         if (
           next.sandboxId !== sandboxId
@@ -3564,7 +3819,7 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
         || stoppedMeta.sandboxId !== sandboxId
         || (stoppedMeta.lifecycleAttemptId ?? null) !== runningLifecycleAttemptId
       ) return stoppedMeta;
-      await markHostSuspensionStopped(hostSuspension.operationId);
+      await markHostSuspensionStopped(hostSuspension);
       await clearSandboxDeadline(sandboxId, {
         lifecycleAttemptId: runningLifecycleAttemptId,
       });
@@ -3727,14 +3982,17 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
       || stoppedMeta.sandboxId !== capturedSandboxId
       || (stoppedMeta.lifecycleAttemptId ?? null) !== capturedLifecycleAttemptId
     ) return stoppedMeta;
-    if (capturedOperationId) await markHostSuspensionStopped(capturedOperationId);
+    if (capturedHostOperation.state) {
+      await markHostSuspensionStopped(capturedHostOperation.state);
+    }
     await clearSandboxDeadline(capturedSandboxId, {
       lifecycleAttemptId: capturedLifecycleAttemptId,
     });
     return stoppedMeta;
   }
   if (sdkStatus === "failed" || sdkStatus === "aborted") {
-    if (!(await readCapturedHostOperation()).owned) {
+    const failedHostOperation = await readCapturedHostOperation();
+    if (!failedHostOperation.owned) {
       return getInitializedMeta();
     }
     logWarn("sandbox.snapshotting_reconciled", {
@@ -3755,7 +4013,9 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
       || failedMeta.sandboxId !== capturedSandboxId
       || (failedMeta.lifecycleAttemptId ?? null) !== capturedLifecycleAttemptId
     ) return failedMeta;
-    if (capturedOperationId) await markHostSuspensionStopped(capturedOperationId);
+    if (failedHostOperation.state) {
+      await markHostSuspensionStopped(failedHostOperation.state);
+    }
     await clearSandboxDeadline(capturedSandboxId, {
       lifecycleAttemptId: capturedLifecycleAttemptId,
     });
@@ -3972,6 +4232,21 @@ function getSandboxCredentialVersion(
 export async function ensureUsableAiGatewayCredential(
   opts?: EnsureUsableCredentialOptions,
 ): Promise<TokenRefreshResult> {
+  try {
+    return await withSandboxLifecycleMutationLock((assertOwned) =>
+      ensureUsableAiGatewayCredentialWithinLifecycleLock(opts, assertOwned));
+  } catch (error) {
+    if (error instanceof SandboxLifecycleLockContendedError) {
+      return { refreshed: false, reason: "lifecycle-lock-contended" };
+    }
+    throw error;
+  }
+}
+
+async function ensureUsableAiGatewayCredentialWithinLifecycleLock(
+  opts?: EnsureUsableCredentialOptions,
+  assertOwned: () => Promise<void> = async () => {},
+): Promise<TokenRefreshResult> {
   const minRemainingMs = opts?.minRemainingMs ?? DEFAULT_MIN_REMAINING_MS;
   const force = opts?.force ?? false;
   const required = opts?.required ?? false;
@@ -3980,6 +4255,21 @@ export async function ensureUsableAiGatewayCredential(
   const meta = await getInitializedMeta();
   if (!meta.sandboxId || meta.status !== "running") {
     return { refreshed: false, reason: "sandbox-not-running" };
+  }
+  const sandboxId = meta.sandboxId;
+  const lifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+  const ownsCredentialMutation = async (): Promise<boolean> => {
+    const [latest, suspension] = await Promise.all([
+      getInitializedMeta(),
+      readHostSuspensionState(),
+    ]);
+    return latest.status === "running"
+      && latest.sandboxId === sandboxId
+      && (latest.lifecycleAttemptId ?? null) === lifecycleAttemptId
+      && !suspension?.ingressFenced;
+  };
+  if (!await ownsCredentialMutation()) {
+    return { refreshed: false, reason: "host-suspension-fenced" };
   }
 
   // Resolve current credential to check TTL / source.
@@ -4032,7 +4322,7 @@ export async function ensureUsableAiGatewayCredential(
   }
 
   // Acquire distributed lock before refreshing.
-  return withTokenRefreshLock(meta.sandboxId, reason, async (currentMeta) => {
+  return withTokenRefreshLock(sandboxId, reason, async (currentMeta) => {
     // Re-check after lock acquisition — another request may have refreshed
     // while we waited. Use persisted metadata as the only TTL authority.
     const currentCredentialVersion = getSandboxCredentialVersion(currentMeta);
@@ -4068,24 +4358,53 @@ export async function ensureUsableAiGatewayCredential(
     }
 
     // Verify sandboxId has not changed while we waited for the lock.
-    if (currentMeta.sandboxId !== meta.sandboxId) {
+    if (
+      currentMeta.status !== "running"
+      || currentMeta.sandboxId !== sandboxId
+      || (currentMeta.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+      || !await ownsCredentialMutation()
+    ) {
       return { refreshed: false, reason: "sandbox-changed" };
     }
 
-    const sandbox = await getSandboxController().get({ sandboxId: currentMeta.sandboxId! });
+    await assertOwned();
+    const sandbox = await getSandboxController().get({
+      sandboxId,
+      resume: false,
+    });
+    await assertOwned();
+    if (sandbox.status !== "running" || !await ownsCredentialMutation()) {
+      return { refreshed: false, reason: "sandbox-changed" };
+    }
     try {
-      await refreshAiGatewayToken(
+      const refreshedOwnedGeneration = await refreshAiGatewayToken(
         sandbox,
-        currentMeta.sandboxId!,
+        {
+          sandboxId,
+          lifecycleAttemptId,
+        },
+        assertOwned,
         opts?.controlPlaneOrigin,
       );
+      if (!refreshedOwnedGeneration || !await ownsCredentialMutation()) {
+        return { refreshed: false, reason: "sandbox-changed" };
+      }
 
       // Success — reset breaker state.
-      await mutateMeta((m) => {
+      const succeeded = await mutateMeta((m) => {
+        if (
+          m.status !== "running"
+          || m.sandboxId !== sandboxId
+          || (m.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+        ) return;
         m.consecutiveTokenRefreshFailures = 0;
         m.lastTokenRefreshError = null;
         m.breakerOpenUntil = null;
       });
+      if (
+        succeeded.sandboxId !== sandboxId
+        || (succeeded.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+      ) return { refreshed: false, reason: "sandbox-changed" };
 
       const postRefreshCred = await resolveAiGatewayCredentialOptional();
       return {
@@ -4096,6 +4415,10 @@ export async function ensureUsableAiGatewayCredential(
           : null,
       };
     } catch (err) {
+      if (err instanceof LifecycleLockOwnershipLostError) throw err;
+      if (!await ownsCredentialMutation()) {
+        return { refreshed: false, reason: "sandbox-changed" };
+      }
       const errorMsg = err instanceof Error ? err.message : String(err);
       logWarn("sandbox.token_refresh_failed", {
         sandboxId: currentMeta.sandboxId,
@@ -4105,6 +4428,11 @@ export async function ensureUsableAiGatewayCredential(
 
       // Record failure for circuit breaker.
       const updated = await mutateMeta((m) => {
+        if (
+          m.status !== "running"
+          || m.sandboxId !== sandboxId
+          || (m.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+        ) return;
         m.consecutiveTokenRefreshFailures = (m.consecutiveTokenRefreshFailures ?? 0) + 1;
         m.lastTokenRefreshError = errorMsg;
 
@@ -4117,6 +4445,13 @@ export async function ensureUsableAiGatewayCredential(
           });
         }
       });
+      if (
+        updated.status !== "running"
+        || updated.sandboxId !== sandboxId
+        || (updated.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+      ) {
+        return { refreshed: false, reason: "sandbox-changed" };
+      }
 
       return {
         refreshed: false,
@@ -4281,20 +4616,44 @@ function requiredControlPlaneDomains(
 
 async function refreshAiGatewayToken(
   sandbox: SandboxHandle,
-  sandboxId: string,
+  generation: {
+    sandboxId: string;
+    lifecycleAttemptId: string | null;
+  },
+  assertOwned: () => Promise<void>,
   controlPlaneOrigin?: string,
-): Promise<void> {
+): Promise<boolean> {
+  const { sandboxId, lifecycleAttemptId } = generation;
+  const readOwnedMeta = async (): Promise<SingleMeta | null> => {
+    const [meta, suspension] = await Promise.all([
+      getInitializedMeta(),
+      readHostSuspensionState(),
+    ]);
+    return meta.status === "running"
+      && meta.sandboxId === sandboxId
+      && (meta.lifecycleAttemptId ?? null) === lifecycleAttemptId
+      && !suspension?.ingressFenced
+      ? meta
+      : null;
+  };
   const credential = await resolveAiGatewayCredentialOptional();
 
   // If source is api-key, skip refresh entirely — static keys don't expire.
   if (credential?.source === "api-key") {
     logInfo("sandbox.token_refresh.skipped_api_key", { sandboxId });
-    await mutateMeta((next) => {
+    const updated = await mutateMeta((next) => {
+      if (
+        next.status !== "running"
+        || next.sandboxId !== sandboxId
+        || (next.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+      ) return;
       next.lastTokenRefreshAt = Date.now();
       next.lastTokenSource = "api-key";
       next.lastTokenExpiresAt = null;
     });
-    return;
+    return updated.status === "running"
+      && updated.sandboxId === sandboxId
+      && (updated.lifecycleAttemptId ?? null) === lifecycleAttemptId;
   }
 
   const freshToken = credential?.token;
@@ -4308,21 +4667,57 @@ async function refreshAiGatewayToken(
   // Update the network policy with the fresh token — the firewall layer
   // injects the Authorization header on outbound requests to ai-gateway.
   // No file writes or gateway restarts needed.
-  const meta = await getInitializedMeta();
-  await applyFirewallPolicyToSandbox(
-    sandbox,
-    meta,
-    freshToken,
-    requiredControlPlaneDomains(meta, controlPlaneOrigin),
-  );
+  let appliedMeta: SingleMeta | null = null;
+  for (let policyAttempt = 0; policyAttempt < 4; policyAttempt += 1) {
+    await assertOwned();
+    const meta = await readOwnedMeta();
+    if (!meta) return false;
+    const requiredDomains = requiredControlPlaneDomains(meta, controlPlaneOrigin);
+    const appliedHash = computePolicyHash(
+      meta.firewall.mode,
+      meta.firewall.allowlist,
+      requiredDomains,
+    );
+    await applyFirewallPolicyToSandbox(
+      sandbox,
+      meta,
+      freshToken,
+      requiredDomains,
+    );
+    await assertOwned();
+    const latest = await readOwnedMeta();
+    if (!latest) return false;
+    const latestHash = computePolicyHash(
+      latest.firewall.mode,
+      latest.firewall.allowlist,
+      requiredControlPlaneDomains(latest, controlPlaneOrigin),
+    );
+    if (latestHash === appliedHash) {
+      appliedMeta = latest;
+      break;
+    }
+  }
+  if (!appliedMeta) {
+    throw new Error("Firewall policy changed repeatedly during token refresh.");
+  }
 
   logInfo("sandbox.token_refresh.policy_updated", { sandboxId });
 
-  await mutateMeta((next) => {
+  const updated = await mutateMeta((next) => {
+    if (
+      next.status !== "running"
+      || next.sandboxId !== sandboxId
+      || (next.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+    ) return;
     next.lastTokenRefreshAt = Date.now();
     next.lastTokenSource = credential.source;
     next.lastTokenExpiresAt = credential.expiresAt ?? null;
   });
+  if (
+    updated.status !== "running"
+    || updated.sandboxId !== sandboxId
+    || (updated.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+  ) return false;
 
   logInfo("sandbox.token_refresh.complete", {
     sandboxId,
@@ -4330,6 +4725,7 @@ async function refreshAiGatewayToken(
     expiresAt: credential.expiresAt ?? null,
     refreshedAt: Date.now(),
   });
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -5637,9 +6033,32 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         verifiedBundleIdentitiesEqual(markerIdentity, currentIdentity),
       );
 
-      // The receipt is written last, after digest checks and external plugin
-      // installation. Existing state without the exact durable identity must
-      // be migrated or explicitly reset, never deleted as a bootstrap detail.
+      if (isResumed && currentIdentity) {
+        const admission = await admitConfiguredOpenClawBundle();
+        if (
+          !admission
+          || !verifiedBundleIdentitiesEqual(admission.identity, currentIdentity)
+        ) {
+          throw new Error(
+            "Configured bundle admission changed during persistent resume.",
+          );
+        }
+        progress.setPhase(
+          "resuming-sandbox",
+          "Verifying persisted OpenClaw bundle bytes",
+        );
+        await assertSandboxGenerationOwnership(sandbox, false);
+        await verifyPersistedVerifiedBundleRuntime(
+          sandbox,
+          admission,
+          progress,
+        );
+        await assertSandboxGenerationOwnership(sandbox, false);
+      }
+
+      // The receipt is written last, after digest checks, external plugin
+      // installation, and exact runtime version admission. Existing state
+      // without that identity must be migrated or explicitly reset.
       if (!isResumed && !sandboxIsBundleCandidate) {
         const mismatchedSandbox = sandbox;
         logWarn("sandbox.create.bundle_identity_mismatch", ctx({
@@ -5791,14 +6210,60 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         initialSandbox,
         bundleMode && sandboxIsBundleCandidate,
       );
-      const restoreResult = await sandbox.runCommand({
-        cmd: "bash",
-        args: [
-          OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
-          String(READINESS_TIMEOUT_SECONDS),
-        ],
-        env: restoreEnv,
-      });
+      const runFastRestore = (phase: "all" | "kill" | "start") =>
+        initialSandbox.runCommand({
+          cmd: "bash",
+          args: [
+            OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+            String(READINESS_TIMEOUT_SECONDS),
+            phase,
+          ],
+          env: restoreEnv,
+        });
+      const replacementSuspension = await readHostSuspensionState();
+      const replacesSuspendedGateway = Boolean(
+        replacementSuspension?.ingressFenced
+        && replacementSuspension.sandboxId === initialSandbox.sandboxId
+        && (
+          replacementSuspension.phase === "stopped"
+          || replacementSuspension.phase === "rollback-pending"
+        )
+      );
+      let retiredGatewaySuspension = false;
+      const restoreResult = await (async () => {
+        if (!replacesSuspendedGateway || !replacementSuspension) {
+          return runFastRestore("all");
+        }
+        const killResult = await runFastRestore("kill");
+        if (killResult.exitCode !== 0) {
+          const output = await killResult.output("both");
+          throw new CommandFailedError({
+            command: "fast-restore-kill",
+            exitCode: killResult.exitCode,
+            output,
+          });
+        }
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+        await assertSandboxGenerationOwnership(
+          initialSandbox,
+          bundleMode && sandboxIsBundleCandidate,
+        );
+        retiredGatewaySuspension = await clearHostSuspensionAfterGatewayReplacement({
+          expected: replacementSuspension,
+          sandboxId: initialSandbox.sandboxId,
+          lifecycleAttemptId: attemptId,
+        });
+        if (!retiredGatewaySuspension) {
+          throw new LifecycleLockOwnershipLostError();
+        }
+        await options?.lease?.assertOwned();
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+        await assertSandboxGenerationOwnership(
+          initialSandbox,
+          bundleMode && sandboxIsBundleCandidate,
+        );
+        return runFastRestore("start");
+      })();
       await assertLifecycleGuardCurrent(options?.lifecycleGuard);
       const startupScriptMs = Date.now() - fastRestoreStart;
 
@@ -5886,10 +6351,13 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         initialSandbox,
         bundleMode && sandboxIsBundleCandidate,
       );
-      if (!await thawHostSuspensionIfNeeded({
-        sandbox,
-        lifecycleAttemptId: attemptId,
-      })) {
+      if (
+        !retiredGatewaySuspension
+        && !await thawHostSuspensionIfNeeded({
+          sandbox,
+          lifecycleAttemptId: attemptId,
+        })
+      ) {
         throw new Error("Restored sandbox Gateway admission could not be resumed.");
       }
       await assertSandboxGenerationOwnership(
@@ -6805,6 +7273,14 @@ async function clearResetCronState(
     expectedGatewayGeneration: transition.previousGatewayGeneration,
   });
   await assertCurrent(nextGatewayValue);
+  const legacyCleared = await clearLegacyCronStateForReset({
+    gatewayGeneration: fenced.record.gatewayGeneration!,
+    projectionRevision: fenced.record.projectionRevision,
+  });
+  if (!legacyCleared) {
+    throw new LifecycleLockOwnershipLostError();
+  }
+  await assertCurrent(nextGatewayValue);
   await cancelSupersededCronWake(fenced.supersededWorkflowRunId);
   await assertCurrent(nextGatewayValue);
   const completed = await mutateMeta((meta) => {
@@ -6902,12 +7378,12 @@ async function withLifecycleLock<T>(
 
 /** Serialize external runtime mutations with Gateway start/stop boundaries. */
 export async function withSandboxLifecycleMutationLock<T>(
-  action: () => Promise<T>,
+  action: (assertOwned: () => Promise<void>) => Promise<T>,
 ): Promise<T> {
   try {
     return await withLifecycleLock(async (lease) => {
       await lease.assertOwned();
-      const result = await action();
+      const result = await action(() => lease.assertOwned());
       await lease.assertOwned();
       return result;
     });
@@ -6916,6 +7392,23 @@ export async function withSandboxLifecycleMutationLock<T>(
       throw new SandboxLifecycleLockContendedError();
     }
     throw error;
+  }
+}
+
+/** Short fail-close handoff after a renewable lifecycle lease was lost. */
+export async function withSandboxLifecycleRecoveryLock<T>(
+  action: () => Promise<T>,
+): Promise<T> {
+  const store = getStore();
+  const token = await store.acquireLock(
+    lifecycleLockKey(),
+    LIFECYCLE_LOCK_TTL_SECONDS,
+  );
+  if (!token) throw new SandboxLifecycleLockContendedError();
+  try {
+    return await action();
+  } finally {
+    await store.releaseLock(lifecycleLockKey(), token);
   }
 }
 

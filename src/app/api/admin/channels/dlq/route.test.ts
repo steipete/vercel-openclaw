@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { GET, POST } from "@/app/api/admin/channels/dlq/route";
+import {
+  GET,
+  POST,
+  jsonWithAuth,
+} from "@/app/api/admin/channels/dlq/route";
 import {
   CHANNEL_DLQ_RECORD_TTL_SECONDS,
   recordChannelDlqFailure,
@@ -36,6 +40,16 @@ async function seedTelegramDlq(input: {
     error: new Error("terminal native rejection"),
   });
 }
+
+test("channel DLQ: successful JSON preserves refreshed auth cookie", async () => {
+  const response = jsonWithAuth(
+    { ok: true },
+    200,
+    { setCookieHeader: "openclaw_session=refreshed; Path=/; HttpOnly" },
+  );
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("set-cookie") ?? "", /openclaw_session=refreshed/);
+});
 
 test("channel DLQ: automated redrive is explicitly unavailable", async () => {
   await withHarness(async () => {

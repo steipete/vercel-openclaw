@@ -1,15 +1,24 @@
-import { sleep } from "workflow";
+import { getWorkflowMetadata, sleep } from "workflow";
 
-import {
-  processSandboxDeadlineStep,
-  type DeadlineStepResult,
-} from "@/server/sandbox/deadline-coordinator";
+type DeadlineStepResult =
+  | { status: "done"; reason: string }
+  | { status: "sleep"; deadlineAtMs: number };
 
-export async function sandboxDeadlineWorkflow(generationId: string): Promise<void> {
+export async function sandboxDeadlineWorkflow(
+  generationId: string,
+  workflowAttemptId: string,
+): Promise<void> {
   "use workflow";
 
+  const workflowRunId = getWorkflowMetadata().workflowRunId;
+  if (!await adoptSandboxDeadlineWorkflowStep(
+    generationId,
+    workflowAttemptId,
+    workflowRunId,
+  )) return;
+
   while (true) {
-    const result = await runSandboxDeadlineStep(generationId);
+    const result = await runSandboxDeadlineStep(generationId, workflowAttemptId);
     if (result.status === "done") return;
     await sleep(new Date(result.deadlineAtMs));
   }
@@ -17,8 +26,29 @@ export async function sandboxDeadlineWorkflow(generationId: string): Promise<voi
 
 async function runSandboxDeadlineStep(
   generationId: string,
+  workflowAttemptId: string,
 ): Promise<DeadlineStepResult> {
   "use step";
 
-  return processSandboxDeadlineStep(generationId);
+  const { processSandboxDeadlineStep } = await import(
+    "@/server/sandbox/deadline-coordinator"
+  );
+  return processSandboxDeadlineStep(generationId, workflowAttemptId);
+}
+
+async function adoptSandboxDeadlineWorkflowStep(
+  generationId: string,
+  workflowAttemptId: string,
+  workflowRunId: string,
+): Promise<boolean> {
+  "use step";
+
+  const { adoptSandboxDeadlineWorkflow } = await import(
+    "@/server/sandbox/deadline-coordinator"
+  );
+  return adoptSandboxDeadlineWorkflow(
+    generationId,
+    workflowAttemptId,
+    workflowRunId,
+  );
 }

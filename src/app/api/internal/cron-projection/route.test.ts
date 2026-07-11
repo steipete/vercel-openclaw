@@ -82,6 +82,7 @@ function input(revision: number, wakes: Array<{ jobId: string; runAtMs: number }
       .digest("hex")
       .slice(0, 32),
     sourceId: "gateway-source-route",
+    sourceLeaseToken: null,
     sourceStartedAtMs,
     sourceRevision: revision,
     reason: revision === 1 ? "startup" : "changed",
@@ -109,6 +110,12 @@ test.beforeEach(async () => {
     externalPlugins: [],
   });
   _resetStoreForTesting();
+  mock.method(cronDispatchWorkflowRuntime, "startRepair", async () => ({
+    runId: "wrun-route-repair",
+  }));
+  mock.method(cronProjectionRouteRuntime, "startRepair", async () => ({
+    runId: "wrun-route-repair",
+  }) as never);
   await getInitializedMeta();
   await mutateMeta((meta) => {
     meta.gatewayToken = gatewayValue;
@@ -265,6 +272,7 @@ test("route reconciliation preserves a healthy long-running recovery Workflow", 
       ...record.dispatch,
       status: "running",
       workflowRunId: "wrun-recovery-child",
+      executionWorkflowRunId: "wrun-recovery-execution",
       claimedAtMs: Date.now() - 30 * 60_000,
     };
     return record;
@@ -275,7 +283,10 @@ test("route reconciliation preserves a healthy long-running recovery Workflow", 
   );
   assert.equal(response.status, 202);
   assert.equal(starts, 1);
-  assert.deepEqual(cancelled, []);
+  assert.deepEqual(
+    cancelled.filter((runId) => runId !== "wrun-route-repair"),
+    [],
+  );
   const record = await readCronProjection();
   assert.equal(record?.dispatch.status, "running");
   assert.equal(
@@ -295,6 +306,7 @@ test("rescheduling cancels the superseded timer after the new projection is dura
   });
   mock.method(cronDispatchWorkflowRuntime, "cancel", async (runId: string) => {
     cancelled.push(runId);
+    if (runId === "wrun-route-repair") return;
     const record = await readCronProjection();
     assert.equal(record?.source?.revision, 2);
   });
@@ -313,7 +325,10 @@ test("rescheduling cancels the superseded timer after the new projection is dura
   assert.equal(first.status, 202);
   assert.equal(second.status, 202);
   assert.equal(starts, 2);
-  assert.deepEqual(cancelled, ["wrun-1"]);
+  assert.deepEqual(
+    cancelled.filter((runId) => runId !== "wrun-route-repair"),
+    ["wrun-1"],
+  );
   const record = await readCronProjection();
   assert.equal(record?.dispatch.status, "scheduled");
   assert.equal(

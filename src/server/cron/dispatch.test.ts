@@ -15,6 +15,7 @@ import {
 import type { CronWakeWorkflowEnvelopeV1 } from "@/server/cron/workflow-contract";
 import {
   acceptCronProjection,
+  mutateCronProjection,
   readCronProjection,
 } from "@/server/cron/projection";
 import { _resetStoreForTesting, getStore } from "@/server/store/store";
@@ -26,6 +27,7 @@ function projection(revision: number, runAtMs = now + 60_000) {
     schemaVersion: 1 as const,
     gatewayGeneration: "1".repeat(32),
     sourceId: "gateway-source-1",
+    sourceLeaseToken: null,
     sourceStartedAtMs: now,
     sourceRevision: revision,
     reason: revision === 1 ? ("startup" as const) : ("changed" as const),
@@ -40,6 +42,9 @@ function projection(revision: number, runAtMs = now + 60_000) {
 test.beforeEach(() => {
   (process.env as Record<string, string | undefined>).NODE_ENV = "test";
   _resetStoreForTesting();
+  mock.method(cronDispatchWorkflowRuntime, "startRepair", async () => ({
+    runId: "wrun-repair",
+  }));
 });
 
 test.afterEach(() => {
@@ -80,6 +85,46 @@ test("cron dispatch starts once and records the Workflow run", async () => {
   assert.equal(envelopes[0]?.origin, "https://app.test");
   assert.equal(envelopes[0]?.wakeAtMs, now);
   assert.equal((await readCronProjection())?.dispatch.status, "scheduled");
+});
+
+test("a durable repair Workflow owns the start lease before the timer starts", async () => {
+  await acceptCronProjection(projection(1, now));
+  let repairEnvelope: CronWakeWorkflowEnvelopeV1 | undefined;
+  const cancelled: string[] = [];
+  mock.method(cronDispatchWorkflowRuntime, "cancel", async (runId: string) => {
+    cancelled.push(runId);
+  });
+  const first = await startCronProjectionDispatch({
+    origin: "https://app.test",
+    startRepairWorkflow: async (envelope, repairAtMs) => {
+      repairEnvelope = envelope;
+      assert.equal(repairAtMs, now + 60_000);
+      assert.equal((await readCronProjection())?.dispatch.status, "pending");
+      return { runId: "wrun-durable-repair" };
+    },
+    startWorkflow: async () => {
+      const record = await readCronProjection();
+      assert.equal(record?.dispatch.status, "starting");
+      if (record?.dispatch.status === "starting") {
+        assert.equal(record.dispatch.repairWorkflowRunId, "wrun-durable-repair");
+      }
+      throw new Error("timer start failed");
+    },
+    now: () => now,
+  });
+  assert.ok(repairEnvelope);
+  assert.equal(first.status, "failed");
+  assert.deepEqual(cancelled, []);
+
+  const repaired = await reconcileCronProjection({
+    enabled: true,
+    origin: "https://app.test",
+    startRepairWorkflow: async () => ({ runId: "wrun-retry-repair" }),
+    startWorkflow: async () => ({ runId: "wrun-recovered-parent" }),
+    now: () => now + 60_000,
+  });
+  assert.equal(repaired.status, "started");
+  assert.equal(repaired.repaired, true);
 });
 
 test("concurrent dispatch reconcilers start only one Workflow", async () => {
@@ -134,18 +179,30 @@ test("duplicate Workflow runs revalidate the token and only one claims the wake"
   });
   assert.ok(envelope);
   assert.equal(
-    await claimCronWake(envelope, "wrun-original", now, false),
+    await claimCronWake(envelope, "wrun-original", now, false, "wrun-original"),
     false,
     "queued Workflows must fail closed when bundle capability is unavailable",
   );
-  assert.equal(await claimCronWake(envelope, "wrun-original", now, true), true);
+  assert.equal(
+    await claimCronWake(envelope, "wrun-original", now, true, "wrun-original"),
+    true,
+  );
   assert.equal(
     await isCronWakeClaimCurrent(envelope, "wrun-original", true),
     true,
   );
-  assert.equal(await claimCronWake(envelope, "wrun-duplicate", now, true), false);
   assert.equal(
-    await claimCronWake(envelope, "wrun-original", now + 1, true),
+    await claimCronWake(envelope, "wrun-duplicate", now, true, "wrun-duplicate"),
+    false,
+  );
+  assert.equal(
+    await claimCronWake(
+      envelope,
+      "wrun-original",
+      now + 1,
+      true,
+      "wrun-original",
+    ),
     true,
     "a retried step in the owning Workflow remains idempotent",
   );
@@ -204,7 +261,7 @@ test("projection change during Workflow start cancels the orphaned timer", async
     now: () => now,
   });
   assert.equal(result.status, "starting");
-  assert.deepEqual(cancelled, ["wrun-orphan"]);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), ["wrun-orphan"]);
   const record = await readCronProjection();
   assert.equal(record?.projectionRevision, 2);
   assert.equal(record?.dispatch.status, "pending");
@@ -243,7 +300,7 @@ test("schedule persistence failure cancels the already-started Workflow", async 
     now: () => now,
   });
   assert.equal(result.status, "failed");
-  assert.deepEqual(cancelled, ["wrun-persist-failed"]);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), ["wrun-persist-failed"]);
   assert.equal((await readCronProjection())?.dispatch.status, "failed");
 });
 
@@ -283,7 +340,7 @@ test("lost schedule CAS acknowledgement preserves the authoritative Workflow", a
 
   assert.equal(result.status, "started");
   assert.equal(result.workflowRunId, "wrun-authoritative");
-  assert.deepEqual(cancelled, []);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), []);
   const record = await readCronProjection();
   assert.equal(record?.dispatch.status, "scheduled");
   if (record?.dispatch.status === "scheduled") {
@@ -341,7 +398,7 @@ test("anti-entropy replaces a missing or terminal scheduled Workflow", async () 
   assert.equal(repaired.status, "started");
   assert.equal(repaired.repaired, true);
   assert.equal(starts, 1);
-  assert.deepEqual(cancelled, ["wrun-lost"]);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), ["wrun-lost"]);
 });
 
 test("anti-entropy keeps a pending scheduled Workflow before its stale deadline", async () => {
@@ -394,7 +451,7 @@ test("anti-entropy preserves a pending scheduled Workflow until the hard ceiling
   assert.equal(result.status, "scheduled");
   assert.equal(result.repaired, false);
   assert.equal(starts, 0);
-  assert.deepEqual(cancelled, []);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), []);
 
   const repaired = await reconcileCronProjection({
     origin: "https://app.test",
@@ -409,7 +466,7 @@ test("anti-entropy preserves a pending scheduled Workflow until the hard ceiling
   assert.equal(repaired.status, "started");
   assert.equal(repaired.repaired, true);
   assert.equal(starts, 1);
-  assert.deepEqual(cancelled, ["wrun-pending-stale"]);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), ["wrun-pending-stale"]);
 });
 
 test("unknown Workflow status defers replacement until the hard ceiling", async () => {
@@ -440,6 +497,84 @@ test("unknown Workflow status defers replacement until the hard ceiling", async 
   assert.equal(repaired.status, "started");
   assert.equal(repaired.repaired, true);
   assert.equal(starts, 1);
+});
+
+test("clock rollback cannot wedge a starting dispatch lease", async () => {
+  await acceptCronProjection(projection(1, now));
+  await mutateCronProjection((record) => {
+    assert.notEqual(record.dispatch.status, "none");
+    if (record.dispatch.status === "none") return null;
+    record.dispatch = {
+      ...record.dispatch,
+      status: "starting",
+      startLeaseExpiresAtMs: now + 10 * 60_000,
+      repairWorkflowRunId: "wrun-future-repair",
+    };
+    return record;
+  });
+  const result = await reconcileCronProjection({
+    enabled: true,
+    origin: "https://app.test",
+    startWorkflow: async () => ({ runId: "wrun-rollback-replacement" }),
+    now: () => now,
+  });
+  assert.equal(result.status, "started");
+  assert.equal(result.repaired, true);
+});
+
+test("clock rollback cannot wedge scheduled, running, or completed dispatch", async () => {
+  for (const status of ["scheduled", "running", "completed"] as const) {
+    _resetStoreForTesting();
+    await acceptCronProjection(projection(1, now));
+    let envelope: CronWakeWorkflowEnvelopeV1 | undefined;
+    await startCronProjectionDispatch({
+      origin: "https://app.test",
+      startWorkflow: async (value) => {
+        envelope = value;
+        return { runId: `wrun-${status}-parent` };
+      },
+      now: () => now,
+    });
+    assert.ok(envelope);
+    if (status === "running" || status === "completed") {
+      assert.equal(
+        await claimCronWake(
+          envelope,
+          `wrun-${status}-execution`,
+          now,
+          true,
+          `wrun-${status}-parent`,
+        ),
+        true,
+      );
+    }
+    if (status === "completed") {
+      await completeCronWake(envelope, `wrun-${status}-execution`, now);
+    }
+    await mutateCronProjection((record) => {
+      if (record.dispatch.status !== status) return null;
+      const futureMs = now + 10 * 60_000;
+      if (record.dispatch.status === "scheduled") {
+        record.dispatch.scheduledAtMs = futureMs;
+      } else if (record.dispatch.status === "running") {
+        record.dispatch.claimedAtMs = futureMs;
+      } else {
+        record.dispatch.completedAtMs = futureMs;
+      }
+      return record;
+    });
+    const result = await reconcileCronProjection({
+      enabled: true,
+      origin: "https://app.test",
+      getWorkflowRunStatus: async () => "running",
+      startWorkflow: async () => ({
+        runId: `wrun-${status}-rollback-replacement`,
+      }),
+      now: () => now,
+    });
+    assert.equal(result.status, "started", status);
+    assert.equal(result.repaired, true, status);
+  }
 });
 
 test("anti-entropy immediately replaces a terminal running Workflow", async () => {
@@ -484,7 +619,7 @@ test("anti-entropy immediately replaces a terminal running Workflow", async () =
   assert.equal(result.status, "started");
   assert.equal(result.repaired, true);
   assert.equal(starts, 1);
-  assert.deepEqual(cancelled, ["wrun-child"]);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), ["wrun-parent"]);
 });
 
 test("active running Workflow gets a soft grace and a hard recovery ceiling", async () => {
@@ -522,7 +657,7 @@ test("active running Workflow gets a soft grace and a hard recovery ceiling", as
   });
 
   assert.equal(result.status, "scheduled");
-  assert.equal(result.workflowRunId, "wrun-child");
+  assert.equal(result.workflowRunId, "wrun-parent");
   assert.equal(starts, 0);
 
   const repaired = await reconcileCronProjection({
@@ -575,11 +710,11 @@ test("handoff records the current-deployment child before watchdog probes", asyn
     now: () => now + 2,
   });
   assert.equal(result.status, "scheduled");
-  assert.deepEqual(probed, ["wrun-current-child"]);
+  assert.deepEqual(probed, ["wrun-parent-timer"]);
   assert.equal(starts, 0);
 });
 
-test("terminal parent probe cannot rearm a concurrently installed child", async () => {
+test("terminal parent probe rearms a concurrently installed unmonitored child", async () => {
   await acceptCronProjection(projection(1, now + 10 * 60_000));
   let envelope: CronWakeWorkflowEnvelopeV1 | undefined;
   await startCronProjectionDispatch({
@@ -606,14 +741,15 @@ test("terminal parent probe cannot rearm a concurrently installed child", async 
     },
     startWorkflow: async () => {
       starts += 1;
-      return { runId: "must-not-start" };
+      return { runId: "wrun-replacement-parent" };
     },
     now: () => now + 2,
   });
 
-  assert.equal(result.status, "scheduled");
-  assert.equal(result.workflowRunId, "wrun-current-child");
-  assert.equal(starts, 0);
+  assert.equal(result.status, "started");
+  assert.equal(result.workflowRunId, "wrun-replacement-parent");
+  assert.equal(result.repaired, true);
+  assert.equal(starts, 1);
 });
 
 test("late timer handoff gives its fresh child a full claim window", async () => {
@@ -647,7 +783,7 @@ test("late timer handoff gives its fresh child a full claim window", async () =>
   });
 
   assert.equal(result.status, "scheduled");
-  assert.equal(result.workflowRunId, "wrun-fresh-child");
+  assert.equal(result.workflowRunId, "wrun-late-parent");
   assert.equal(starts, 0);
 });
 
@@ -671,13 +807,14 @@ test("due timer handoff wins the race with parent Workflow persistence", async (
     now: () => now,
   });
 
-  assert.equal(result.status, "scheduled");
-  assert.equal(result.workflowRunId, "wrun-current-child");
-  assert.deepEqual(cancelled, []);
+  assert.equal(result.status, "started");
+  assert.equal(result.workflowRunId, "wrun-parent-timer");
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), []);
   const record = await readCronProjection();
   assert.equal(record?.dispatch.status, "scheduled");
   if (record?.dispatch.status === "scheduled") {
-    assert.equal(record.dispatch.workflowRunId, "wrun-current-child");
+    assert.equal(record.dispatch.workflowRunId, "wrun-parent-timer");
+    assert.equal(record.dispatch.executionWorkflowRunId, "wrun-current-child");
   }
 });
 
@@ -725,7 +862,8 @@ test("handoff redelivery preserves the first authoritative child", async () => {
   const record = await readCronProjection();
   assert.equal(record?.dispatch.status, "scheduled");
   if (record?.dispatch.status === "scheduled") {
-    assert.equal(record.dispatch.workflowRunId, "wrun-first-child");
+    assert.equal(record.dispatch.workflowRunId, "wrun-parent-timer");
+    assert.equal(record.dispatch.executionWorkflowRunId, "wrun-first-child");
   }
 });
 
@@ -763,7 +901,8 @@ test("handoff never cancels a child that claimed before its record CAS", async (
   const record = await readCronProjection();
   assert.equal(record?.dispatch.status, "running");
   if (record?.dispatch.status === "running") {
-    assert.equal(record.dispatch.workflowRunId, "wrun-fast-child");
+    assert.equal(record.dispatch.workflowRunId, "wrun-parent-timer");
+    assert.equal(record.dispatch.executionWorkflowRunId, "wrun-fast-child");
   }
 });
 
@@ -818,7 +957,16 @@ test("completed child wins the race with parent Workflow persistence", async () 
         "wrun-parent-timer",
         now + 1,
       );
-      assert.equal(await claimCronWake(envelope, "wrun-fast-child", now + 2, true), true);
+      assert.equal(
+        await claimCronWake(
+          envelope,
+          "wrun-fast-child",
+          now + 2,
+          true,
+          "wrun-parent-timer",
+        ),
+        true,
+      );
       await completeCronWake(envelope, "wrun-fast-child", now + 3);
       return { runId: "wrun-parent-timer" };
     },
@@ -827,7 +975,7 @@ test("completed child wins the race with parent Workflow persistence", async () 
 
   assert.equal(result.status, "idle");
   assert.equal(result.workflowRunId, null);
-  assert.deepEqual(cancelled, []);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), []);
   assert.equal((await readCronProjection())?.dispatch.status, "completed");
 });
 
@@ -864,5 +1012,36 @@ test("completed projection never recursively dispatches its old due time", async
   });
   assert.equal(repaired.status, "idle");
   assert.equal(repaired.repaired, false);
+  assert.equal(starts, 0);
+
+  const healthyParent = await reconcileCronProjection({
+    origin: "https://app.test",
+    enabled: true,
+    getWorkflowRunStatus: async () => "running",
+    startWorkflow: async () => {
+      starts += 1;
+      return { runId: "must-not-replay-completed" };
+    },
+    now: () => now + 3 * 60 * 60_000,
+  });
+  assert.equal(healthyParent.status, "idle");
+  assert.equal(starts, 0);
+
+  await mutateCronProjection((record) => {
+    if (record.dispatch.status !== "completed") return null;
+    record.dispatch.legacyWorkflowOwner = true;
+    return record;
+  });
+  const legacyCompleted = await reconcileCronProjection({
+    origin: "https://app.test",
+    enabled: true,
+    getWorkflowRunStatus: async () => "completed",
+    startWorkflow: async () => {
+      starts += 1;
+      return { runId: "must-not-replay-legacy-completed" };
+    },
+    now: () => now + 4 * 60 * 60_000,
+  });
+  assert.equal(legacyCompleted.status, "idle");
   assert.equal(starts, 0);
 });

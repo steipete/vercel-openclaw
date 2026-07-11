@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { GatewayAdminRpcError } from "@/server/openclaw/admin-rpc";
+import { FIREWALL_FAIL_CLOSED_REASON } from "@/shared/types";
 import type { SandboxHandle } from "@/server/sandbox/controller";
 import {
   HostSuspensionBusyError,
   clearHostSuspensionAfterDelete,
+  enqueueHostStopOperation,
   getHostIngressFence,
   getHostMutationFence,
   heartbeatHostStopMonitor,
+  markHostSuspensionStopRequesting,
   markHostSuspensionStopped,
   markHostSuspensionStopping,
   prepareHostSuspension,
@@ -118,6 +121,24 @@ test("prepare and renew reuse one stable request id", async () => {
     { requestId: "operation-stable" },
   ]);
   assert.deepEqual(h.monitorStarts, ["operation-stable"]);
+});
+
+test("enqueueHostStopOperation durably fences and starts the exact-generation monitor", async () => {
+  const h = harness(async <T>() => ({} as T));
+
+  const queued = await enqueueHostStopOperation({
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    reason: FIREWALL_FAIL_CLOSED_REASON,
+  }, h.deps);
+
+  assert.equal(queued.intent, "stop");
+  assert.equal(queued.phase, "stop-requesting");
+  assert.equal(queued.ingressFenced, true);
+  assert.equal(queued.sandboxId, fakeSandbox().sandboxId);
+  assert.equal(queued.lifecycleAttemptId, LIFECYCLE_ATTEMPT_ID);
+  assert.equal(h.readState()?.operationId, queued.operationId);
+  assert.deepEqual(h.monitorStarts, [queued.operationId]);
 });
 
 test("a fenced operation stays bound to its lifecycle generation", async () => {
@@ -243,7 +264,7 @@ test("monitor heartbeat cannot overwrite a concurrent terminal phase", async () 
 
   const heartbeat = heartbeatHostStopMonitor(stopping.operationId, h.deps);
   await heartbeatWriteBlocked;
-  const terminal = markHostSuspensionStopped(stopping.operationId, h.deps);
+  const terminal = markHostSuspensionStopped(stopping, h.deps);
   releaseHeartbeatWrite();
   await Promise.all([heartbeat, terminal]);
 
@@ -306,7 +327,7 @@ test("persisted stop stays fenced until status and resume confirm running", asyn
     reason: "test-stop",
   }, h.deps);
   const stopping = await markHostSuspensionStopping(prepared, h.deps);
-  await markHostSuspensionStopped(stopping.operationId, h.deps);
+  await markHostSuspensionStopped(stopping, h.deps);
 
   assert.equal(await getHostIngressFence(h.deps), null, "stopped ingress may trigger wake");
   assert.equal(h.readState()?.ingressFenced, true);
@@ -336,7 +357,8 @@ test("replacement sandbox retires a stopped fence from the prior process", async
     lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
     reason: "replacement-test",
   }, h.deps);
-  await markHostSuspensionStopped(prepared.operationId, h.deps);
+  const stopping = await markHostSuspensionStopping(prepared, h.deps);
+  await markHostSuspensionStopped(stopping, h.deps);
   h.setCurrentGeneration({
     sandboxId: "sbx-replacement",
     lifecycleAttemptId: "replacement-attempt",
@@ -373,7 +395,8 @@ test("same-name persistent resume adopts a stopped fence into the new lifecycle 
     lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
     reason: "stable-name-resume-test",
   }, h.deps);
-  await markHostSuspensionStopped(prepared.operationId, h.deps);
+  const stopping = await markHostSuspensionStopping(prepared, h.deps);
+  await markHostSuspensionStopped(stopping, h.deps);
   h.setCurrentGeneration({
     sandboxId: fakeSandbox().sandboxId,
     lifecycleAttemptId: "lifecycle-attempt-2",
@@ -410,7 +433,8 @@ test("same-name replacement clears an old stopped fence when the lease is absent
     lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
     reason: "same-name-replacement-test",
   }, h.deps);
-  await markHostSuspensionStopped(prepared.operationId, h.deps);
+  const stopping = await markHostSuspensionStopping(prepared, h.deps);
+  await markHostSuspensionStopped(stopping, h.deps);
   h.setCurrentGeneration({
     sandboxId: fakeSandbox().sandboxId,
     lifecycleAttemptId: "replacement-attempt",
@@ -522,7 +546,8 @@ test("transient thaw failure stays retryable until Gateway admission resumes", a
     lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
     reason: "retry-thaw-test",
   }, h.deps);
-  await markHostSuspensionStopped(prepared.operationId, h.deps);
+  const stopping = await markHostSuspensionStopping(prepared, h.deps);
+  await markHostSuspensionStopped(stopping, h.deps);
 
   assert.equal(await thawHostSuspensionIfNeeded({
     sandbox: fakeSandbox(),
@@ -537,6 +562,111 @@ test("transient thaw failure stays retryable until Gateway admission resumes", a
   }, h.deps), true);
   assert.equal(h.readState()?.phase, "running");
   assert.equal(h.readState()?.ingressFenced, false);
+});
+
+test("a new lifecycle attempt adopts the exact rollback-pending operation", async () => {
+  let statusCalls = 0;
+  const h = harness(async <T>(input: { method: string }) => {
+    if (input.method === "gateway.suspend.prepare") {
+      return {
+        status: "ready",
+        suspensionId: "suspension-retry",
+        expiresAtMs: 10_000,
+      } as T;
+    }
+    if (input.method === "gateway.suspend.status") {
+      statusCalls += 1;
+      if (statusCalls === 1) throw new Error("control plane unavailable");
+      return { status: "ready", expiresAtMs: 10_000 } as T;
+    }
+    return { ok: true, status: "running", resumed: true } as T;
+  });
+  const prepared = await prepareHostSuspension({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    reason: "retry-after-meta-error",
+  }, h.deps);
+  const stopping = await markHostSuspensionStopping(prepared, h.deps);
+  await markHostSuspensionStopped(stopping, h.deps);
+
+  assert.equal(await thawHostSuspensionIfNeeded({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps), false);
+  assert.equal(h.readState()?.phase, "rollback-pending");
+
+  h.setCurrentGeneration({
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: "lifecycle-attempt-retry",
+  });
+  assert.equal(await thawHostSuspensionIfNeeded({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: "lifecycle-attempt-retry",
+  }, h.deps), true);
+  assert.equal(h.readState()?.lifecycleAttemptId, "lifecycle-attempt-retry");
+  assert.equal(h.readState()?.phase, "running");
+  assert.equal(h.readState()?.ingressFenced, false);
+});
+
+test("stale stopped projection cannot rewrite a completed running operation", async () => {
+  const h = harness(async <T>(input: { method: string }) => {
+    if (input.method === "gateway.suspend.prepare") {
+      return {
+        status: "ready",
+        suspensionId: "suspension-terminal-cas",
+        expiresAtMs: 10_000,
+      } as T;
+    }
+    if (input.method === "gateway.suspend.status") {
+      return { status: "ready", expiresAtMs: 10_000 } as T;
+    }
+    return { ok: true, status: "running", resumed: true } as T;
+  });
+  const prepared = await prepareHostSuspension({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    reason: "terminal-cas-test",
+  }, h.deps);
+  const stopping = await markHostSuspensionStopping(prepared, h.deps);
+  const stopped = await markHostSuspensionStopped(stopping, h.deps);
+  assert.ok(stopped);
+  assert.equal(await thawHostSuspensionIfNeeded({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps), true);
+
+  await markHostSuspensionStopped(stopping, h.deps);
+  assert.equal(h.readState()?.phase, "running");
+  await markHostSuspensionStopped({
+    ...stopping,
+    sandboxId: "sbx-forged",
+  }, h.deps);
+  assert.equal(h.readState()?.phase, "running");
+  await markHostSuspensionStopped({
+    ...stopping,
+    lifecycleAttemptId: "attempt-forged",
+  }, h.deps);
+  assert.equal(h.readState()?.phase, "running");
+});
+
+test("stopped projection accepts same-operation progress within terminal source phases", async () => {
+  const h = harness(async <T>() => ({
+    status: "ready",
+    suspensionId: "suspension-phase-progress",
+    expiresAtMs: 10_000,
+  }) as T);
+  const prepared = await prepareHostSuspension({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    reason: "terminal-phase-progress",
+  }, h.deps);
+  const requesting = await markHostSuspensionStopRequesting(prepared, h.deps);
+  await markHostSuspensionStopping(requesting, h.deps);
+
+  const stopped = await markHostSuspensionStopped(requesting, h.deps);
+
+  assert.equal(stopped?.phase, "stopped");
+  assert.equal(h.readState()?.phase, "stopped");
 });
 
 test("missing admin-http-rpc plugin fails closed for stop without wedging ingress", async () => {

@@ -15,10 +15,11 @@ import test, { mock } from "node:test";
 
 import { slackWebhookWorkflowRuntime } from "@/app/api/channels/slack/webhook/route";
 import {
+  buildExistingBootHandle,
   processChannelStep,
   type ChannelWorkflowHandoff,
   type RetryingForwardResult,
-} from "@/server/workflows/channels/drain-channel-workflow";
+} from "@/server/workflows/channels/drain-channel-step";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
 import { withHarness } from "@/test-utils/harness";
 import { callRoute, getSlackWebhookRoute, resetAfterCallbacks } from "@/test-utils/route-caller";
@@ -207,7 +208,23 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
         workflowHandoff?: ChannelWorkflowHandoff | null;
       };
       assert.deepEqual(envelope.payload, wakePayload);
-      assert.equal(envelope.bootMessageId, "boot-local-cycle-ts");
+      assert.equal(
+        envelope.bootMessageId,
+        null,
+        "webhook route must defer placeholder ownership to durable workflow",
+      );
+      assert.deepEqual(envelope.workflowHandoff?.slackBootTarget, {
+        channel: CHANNEL_ID,
+        threadTs: "1780000000.000200",
+      });
+      assert.equal(
+        h.fakeFetch
+          .requests()
+          .filter((request) => request.url.endsWith("/chat.postMessage"))
+          .length,
+        0,
+        "route must not post a placeholder before workflow start is durable",
+      );
       assert.equal(envelope.workflowHandoff?.slackRawBody, wakeRawBody);
       assert.equal(
         envelope.workflowHandoff?.slackForwardHeaders?.["x-slack-request-timestamp"],
@@ -302,7 +319,7 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
               ready: true,
               error: null,
             }),
-            buildExistingBootHandle: async () => undefined,
+            buildExistingBootHandle,
             hydrateVerifiedBundleIdentity: async () => null,
             RetryableError: TestRetryableError as never,
             FatalError: TestFatalError as never,
@@ -323,6 +340,22 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
       assert.equal(workflowForwardBody, wakeRawBody);
       assert.ok(workflowForwardHeaders?.["x-slack-signature"]);
       assert.ok(workflowForwardHeaders?.["x-slack-request-timestamp"]);
+      assert.equal(
+        h.fakeFetch
+          .requests()
+          .filter((request) => request.url.endsWith("/chat.postMessage"))
+          .length,
+        1,
+        "durable workflow should create exactly one placeholder",
+      );
+      assert.equal(
+        h.fakeFetch
+          .requests()
+          .filter((request) => request.url.endsWith("/chat.delete"))
+          .length,
+        1,
+        "accepted workflow delivery should clear its placeholder",
+      );
       assert.notEqual(
         workflowForwardHeaders?.["x-slack-request-timestamp"],
         wakeRequest.headers.get("x-slack-request-timestamp"),

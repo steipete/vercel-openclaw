@@ -5,6 +5,7 @@ export type WatchdogCheckId =
   | "probe"
   | "reconcile"
   | "token.refresh"
+  | "sandbox.deadline"
   | "cron.wake"
   | "restore.prepare";
 export type WatchdogCheckStatus = "pass" | "fail" | "skip";

@@ -20,6 +20,9 @@ export type CronProjectionInputV1 = {
   schemaVersion: 1;
   gatewayGeneration: string;
   sourceId: string;
+  sourceLeaseToken: string | null;
+  /** Internal parser marker; absent on direct trusted callers means provided. */
+  sourceLeaseTokenProvided?: boolean;
   sourceStartedAtMs: number;
   sourceRevision: number;
   reason: CronProjectionReason;
@@ -45,21 +48,28 @@ export type CronDispatchState =
   | (CronDispatchIdentity & {
       status: "starting";
       startLeaseExpiresAtMs: number;
+      repairWorkflowRunId: string;
     })
   | (CronDispatchIdentity & {
       status: "scheduled";
       workflowRunId: string;
+      executionWorkflowRunId: string | null;
+      legacyWorkflowOwner?: true;
       scheduledAtMs: number;
     })
   | (CronDispatchIdentity & {
       status: "running";
       claimedAtMs: number;
       workflowRunId: string;
+      executionWorkflowRunId: string;
+      legacyWorkflowOwner?: true;
     })
   | (CronDispatchIdentity & {
       status: "completed";
       completedAtMs: number;
       workflowRunId: string;
+      executionWorkflowRunId: string;
+      legacyWorkflowOwner?: true;
     })
   | (CronDispatchIdentity & {
       status: "failed";
@@ -78,6 +88,8 @@ export type CronProjectionRecordV1 = {
   projectionRevision: number;
   source: {
     key: string;
+    epoch: number;
+    leaseToken: string;
     startedAtMs: number;
     revision: number;
     reason: CronProjectionReason;
@@ -102,17 +114,20 @@ export type AcceptCronProjectionResult =
       status: "accepted";
       record: CronProjectionRecordV1;
       supersededWorkflowRunId: string | null;
+      sourceLeaseToken: string;
     }
   | {
       status: "idempotent";
       record: CronProjectionRecordV1;
       supersededWorkflowRunId: null;
+      sourceLeaseToken: string;
     }
   | {
       status: "stale";
       record: CronProjectionRecordV1;
       supersededWorkflowRunId: null;
       retryAfterMs: number | null;
+      sourceLeaseToken: null;
     };
 
 export type FenceCronProjectionResult = {
@@ -205,6 +220,15 @@ export function parseCronProjectionInput(
   ) {
     return { ok: false, message: "sourceId must be an 8-128 character string" };
   }
+  if (
+    value.sourceLeaseToken !== undefined &&
+    value.sourceLeaseToken !== null &&
+    (typeof value.sourceLeaseToken !== "string" ||
+      value.sourceLeaseToken.length < 16 ||
+      value.sourceLeaseToken.length > 128)
+  ) {
+    return { ok: false, message: "sourceLeaseToken is invalid" };
+  }
   if (!isPositiveSafeInteger(value.sourceStartedAtMs)) {
     return { ok: false, message: "sourceStartedAtMs must be a positive integer" };
   }
@@ -261,6 +285,11 @@ export function parseCronProjectionInput(
       schemaVersion: 1,
       gatewayGeneration: value.gatewayGeneration,
       sourceId: value.sourceId,
+      sourceLeaseToken:
+        typeof value.sourceLeaseToken === "string"
+          ? value.sourceLeaseToken
+          : null,
+      sourceLeaseTokenProvided: Object.hasOwn(value, "sourceLeaseToken"),
       sourceStartedAtMs: value.sourceStartedAtMs,
       sourceRevision: value.sourceRevision,
       reason: value.reason as CronProjectionReason,
@@ -297,8 +326,20 @@ function compareSource(
     if (input.sourceRevision === current.source.revision) {
       return digest === current.digest ? "same" : "stale";
     }
-    return "newer";
+    return input.sourceLeaseToken === null ||
+      input.sourceLeaseToken === current.source.leaseToken
+      ? "newer"
+      : "stale";
   }
+  // Pre-token plugins may renew their current source during rollout, but once
+  // superseded they can never contend for ownership again.
+  if (input.sourceLeaseTokenProvided === false) return "stale";
+  // Only a fresh source may contend for an expired lease. A superseded
+  // process keeps its old token and must never reclaim ownership later.
+  if (input.sourceLeaseToken !== null) return "stale";
+  // A host clock rollback must not extend another process's lease without
+  // bound. Treat a future acceptance timestamp as an expired lease.
+  if (current.acceptedAtMs > now) return "newer";
   // Process clocks and UUID ordering cannot establish Gateway ownership.
   // A live source renews this bounded host lease with every newer snapshot;
   // after silence, any process from the same gateway generation may take over.
@@ -320,16 +361,90 @@ export async function readCronProjection(
 export type CronProjectionReadState =
   | { status: "absent" }
   | { status: "corrupt"; token: string }
-  | { status: "valid"; record: CronProjectionRecordV1 };
+  | { status: "valid"; record: CronProjectionRecordV1; token: string };
+
+function migrateCronProjectionRecord(
+  value: unknown,
+): CronProjectionRecordV1 | null {
+  if (!isRecord(value) || value.schemaVersion !== 1) return null;
+  const candidate: Record<string, unknown> = { ...value };
+  if (isPositiveSafeInteger(value.revision)) {
+    candidate.revision = value.revision + 1;
+  }
+  if (isRecord(value.source)) {
+    candidate.source = {
+      ...value.source,
+      epoch: value.source.epoch === undefined ? 1 : value.source.epoch,
+      leaseToken:
+        value.source.leaseToken === undefined
+          ? randomUUID()
+          : value.source.leaseToken,
+    };
+  }
+  if (isRecord(value.dispatch)) {
+    switch (value.dispatch.status) {
+      case "starting":
+        if (value.dispatch.repairWorkflowRunId === undefined) {
+          candidate.dispatch = {
+            status: "pending",
+            token: randomUUID(),
+            runAtMs: value.dispatch.runAtMs,
+            wakeAtMs: value.dispatch.wakeAtMs,
+            attempt: value.dispatch.attempt,
+          };
+        }
+        break;
+      case "scheduled":
+        if (value.dispatch.executionWorkflowRunId === undefined) {
+          candidate.dispatch = {
+            ...value.dispatch,
+            executionWorkflowRunId: null,
+            legacyWorkflowOwner: true,
+          };
+        }
+        break;
+      case "running":
+      case "completed":
+        if (value.dispatch.executionWorkflowRunId === undefined) {
+          candidate.dispatch = {
+            ...value.dispatch,
+            executionWorkflowRunId: value.dispatch.workflowRunId,
+            legacyWorkflowOwner: true,
+          };
+        }
+        break;
+    }
+  }
+  return isCronProjectionRecord(candidate) ? candidate : null;
+}
 
 export async function readCronProjectionState(
   store: Store = getStore(),
 ): Promise<CronProjectionReadState> {
-  const state = await store.getValueState<unknown>(cronProjectionKey());
-  if (state.status === "absent") return { status: "absent" };
-  return isCronProjectionRecord(state.value)
-    ? { status: "valid", record: state.value }
-    : { status: "corrupt", token: state.token };
+  for (let attempt = 0; attempt < PROJECTION_CAS_ATTEMPTS; attempt += 1) {
+    const state = await store.getValueState<unknown>(cronProjectionKey());
+    if (state.status === "absent") return { status: "absent" };
+    if (isCronProjectionRecord(state.value)) {
+      return { status: "valid", record: state.value, token: state.token };
+    }
+    const migrated = migrateCronProjectionRecord(state.value);
+    if (!migrated) return { status: "corrupt", token: state.token };
+    if (
+      await store.compareAndSetValueToken(
+        cronProjectionKey(),
+        state.token,
+        migrated,
+      )
+    ) {
+      const saved = await store.getValueState<CronProjectionRecordV1>(
+        cronProjectionKey(),
+      );
+      if (saved.status === "present" && isCronProjectionRecord(saved.value)) {
+        return { status: "valid", record: saved.value, token: saved.token };
+      }
+    }
+  }
+  throw new Error("cron_projection_migration_cas_exhausted");
 }
 
 export async function getCronProjectionDiagnostics(
@@ -372,7 +487,9 @@ export async function getCronProjectionDiagnostics(
     dispatchRetryAtMs:
       dispatch.status === "failed" ? dispatch.retryAtMs : null,
     workflowRunId:
-      dispatch.status === "scheduled" || dispatch.status === "running"
+      dispatch.status === "scheduled" ||
+      dispatch.status === "running" ||
+      dispatch.status === "completed"
         ? dispatch.workflowRunId
         : null,
   };
@@ -390,7 +507,8 @@ function activeWorkflowRunId(
   record: CronProjectionRecordV1 | null,
 ): string | null {
   return record?.dispatch.status === "scheduled" ||
-    record?.dispatch.status === "running"
+    record?.dispatch.status === "running" ||
+    record?.dispatch.status === "completed"
     ? record.dispatch.workflowRunId
     : null;
 }
@@ -414,6 +532,7 @@ export async function acceptCronProjection(
           status: "idempotent",
           record: current,
           supersededWorkflowRunId: null,
+          sourceLeaseToken: current.source!.leaseToken,
         };
       }
       if (comparison === "stale") {
@@ -422,6 +541,7 @@ export async function acceptCronProjection(
           record: current,
           supersededWorkflowRunId: null,
           retryAfterMs: null,
+          sourceLeaseToken: null,
         };
       }
       if (comparison === "leased") {
@@ -429,6 +549,7 @@ export async function acceptCronProjection(
           status: "stale",
           record: current,
           supersededWorkflowRunId: null,
+          sourceLeaseToken: null,
           retryAfterMs: Math.max(
             1_000,
             current.acceptedAtMs + CRON_PROJECTION_SOURCE_LEASE_MS -
@@ -437,11 +558,17 @@ export async function acceptCronProjection(
         };
       }
       if (current.digest === digest) {
+        const sourceKey = hashSourceId(input.sourceId);
+        const sameSource = current.source?.key === sourceKey;
         const next: CronProjectionRecordV1 = {
           ...current,
           revision: current.revision + 1,
           source: {
-            key: hashSourceId(input.sourceId),
+            key: sourceKey,
+            epoch: sameSource ? current.source!.epoch : current.source!.epoch + 1,
+            leaseToken: sameSource
+              ? current.source!.leaseToken
+              : randomUUID(),
             startedAtMs: input.sourceStartedAtMs,
             revision: input.sourceRevision,
             reason: input.reason,
@@ -460,6 +587,7 @@ export async function acceptCronProjection(
             status: "idempotent",
             record: next,
             supersededWorkflowRunId: null,
+            sourceLeaseToken: next.source!.leaseToken,
           };
         }
         continue;
@@ -467,13 +595,19 @@ export async function acceptCronProjection(
     }
 
     const nextRunAtMs = wakes[0]?.runAtMs ?? null;
+    const sourceKey = hashSourceId(input.sourceId);
+    const sameSource = current?.source?.key === sourceKey;
     const next: CronProjectionRecordV1 = {
       schemaVersion: 1,
       gatewayGeneration: input.gatewayGeneration,
       revision: (current?.revision ?? 0) + 1,
       projectionRevision: (current?.projectionRevision ?? 0) + 1,
       source: {
-        key: hashSourceId(input.sourceId),
+        key: sourceKey,
+        epoch: sameSource ? current.source!.epoch : (current?.source?.epoch ?? 0) + 1,
+        leaseToken: sameSource
+          ? current.source!.leaseToken
+          : randomUUID(),
         startedAtMs: input.sourceStartedAtMs,
         revision: input.sourceRevision,
         reason: input.reason,
@@ -504,6 +638,7 @@ export async function acceptCronProjection(
         status: "accepted",
         record: next,
         supersededWorkflowRunId: scheduledWorkflowRunId(current),
+        sourceLeaseToken: next.source!.leaseToken,
       };
     }
   }
@@ -688,13 +823,28 @@ export async function fenceCronProjectionStateForReset(
   throw new Error("cron_projection_reset_fence_cas_exhausted");
 }
 
-export async function clearLegacyCronStateForReset(
-  store: Store = getStore(),
-): Promise<void> {
-  await Promise.all([
-    store.deleteValue(cronNextWakeKey()),
-    store.deleteValue(cronJobsKey()),
-  ]);
+export async function clearLegacyCronStateForReset(options: {
+  gatewayGeneration: string;
+  projectionRevision: number;
+  store?: Store;
+}): Promise<boolean> {
+  const store = options.store ?? getStore();
+  const state = await readCronProjectionState(store);
+  if (
+    state.status !== "valid" ||
+    state.record.gatewayGeneration !== options.gatewayGeneration ||
+    state.record.projectionRevision !== options.projectionRevision ||
+    state.record.source !== null ||
+    state.record.resetAtMs === null ||
+    state.record.dispatch.status !== "none"
+  ) {
+    return false;
+  }
+  return store.deleteValuesIfValueToken(
+    cronProjectionKey(),
+    state.token,
+    [cronNextWakeKey(), cronJobsKey()],
+  );
 }
 
 export async function normalizeResetCronProjectionGeneration(options: {
@@ -746,6 +896,10 @@ export function isCronProjectionRecord(value: unknown): value is CronProjectionR
       value.gatewayGeneration === null ||
       !isRecord(value.source) ||
       !isHex(value.source.key, 32) ||
+      !isPositiveSafeInteger(value.source.epoch) ||
+      typeof value.source.leaseToken !== "string" ||
+      value.source.leaseToken.length < 16 ||
+      value.source.leaseToken.length > 128 ||
       !isPositiveSafeInteger(value.source.startedAtMs) ||
       value.source.startedAtMs > MAX_DATE_MS ||
       !isPositiveSafeInteger(value.source.revision) ||
@@ -823,12 +977,23 @@ export function isCronProjectionRecord(value: unknown): value is CronProjectionR
     case "pending":
       return true;
     case "starting":
-      return isPositiveSafeInteger(dispatch.startLeaseExpiresAtMs);
+      return (
+        isPositiveSafeInteger(dispatch.startLeaseExpiresAtMs) &&
+        typeof dispatch.repairWorkflowRunId === "string" &&
+        dispatch.repairWorkflowRunId.length > 0 &&
+        dispatch.repairWorkflowRunId.length <= 256
+      );
     case "scheduled":
       return (
         typeof dispatch.workflowRunId === "string" &&
         dispatch.workflowRunId.length > 0 &&
         dispatch.workflowRunId.length <= 256 &&
+        (dispatch.executionWorkflowRunId === null ||
+          (typeof dispatch.executionWorkflowRunId === "string" &&
+            dispatch.executionWorkflowRunId.length > 0 &&
+            dispatch.executionWorkflowRunId.length <= 256)) &&
+        (dispatch.legacyWorkflowOwner === undefined ||
+          dispatch.legacyWorkflowOwner === true) &&
         isPositiveSafeInteger(dispatch.scheduledAtMs)
       );
     case "running":
@@ -836,6 +1001,11 @@ export function isCronProjectionRecord(value: unknown): value is CronProjectionR
         typeof dispatch.workflowRunId === "string" &&
         dispatch.workflowRunId.length > 0 &&
         dispatch.workflowRunId.length <= 256 &&
+        typeof dispatch.executionWorkflowRunId === "string" &&
+        dispatch.executionWorkflowRunId.length > 0 &&
+        dispatch.executionWorkflowRunId.length <= 256 &&
+        (dispatch.legacyWorkflowOwner === undefined ||
+          dispatch.legacyWorkflowOwner === true) &&
         isPositiveSafeInteger(dispatch.claimedAtMs)
       );
     case "completed":
@@ -843,6 +1013,11 @@ export function isCronProjectionRecord(value: unknown): value is CronProjectionR
         typeof dispatch.workflowRunId === "string" &&
         dispatch.workflowRunId.length > 0 &&
         dispatch.workflowRunId.length <= 256 &&
+        typeof dispatch.executionWorkflowRunId === "string" &&
+        dispatch.executionWorkflowRunId.length > 0 &&
+        dispatch.executionWorkflowRunId.length <= 256 &&
+        (dispatch.legacyWorkflowOwner === undefined ||
+          dispatch.legacyWorkflowOwner === true) &&
         isPositiveSafeInteger(dispatch.completedAtMs)
       );
     case "failed":

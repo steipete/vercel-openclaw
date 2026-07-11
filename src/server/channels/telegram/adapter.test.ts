@@ -6,6 +6,7 @@ import type { ChannelReply } from "@/server/channels/core/types";
 import {
   createTelegramAdapter,
   isTelegramWebhookSecretValid,
+  matchTelegramWebhookSecret,
   normalizeTelegramSlashCommand,
 } from "@/server/channels/telegram/adapter";
 
@@ -16,6 +17,8 @@ test("isTelegramWebhookSecretValid accepts current and unexpired previous secret
     webhookSecret: "current-secret",
     previousWebhookSecret: "previous-secret",
     previousSecretExpiresAt: now + 60_000,
+    previousBotUsername: "previous_bot",
+    previousConfiguredAt: now - 1,
     webhookUrl: "https://example.com/api/channels/telegram/webhook",
     botUsername: "openclaw_bot",
     configuredAt: now,
@@ -24,6 +27,11 @@ test("isTelegramWebhookSecretValid accepts current and unexpired previous secret
   assert.equal(isTelegramWebhookSecretValid(config, "current-secret", now), true);
   assert.equal(isTelegramWebhookSecretValid(config, "previous-secret", now), true);
   assert.equal(isTelegramWebhookSecretValid(config, "previous-secret", now + 120_000), false);
+  assert.deepEqual(matchTelegramWebhookSecret(config, "previous-secret", now), {
+    generation: "previous",
+    botUsername: "previous_bot",
+    configuredAt: now - 1,
+  });
 });
 
 test("createTelegramAdapter extracts chat text updates", async () => {

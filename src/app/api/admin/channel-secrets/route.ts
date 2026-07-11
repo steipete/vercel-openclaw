@@ -44,13 +44,20 @@ function isSmokeChannel(value: unknown): value is SmokeChannel {
   return value === "slack" || value === "telegram" || value === "discord";
 }
 
-function withTelegramConfigLeaseIfNeeded<T>(
+function withChannelConfigLeasesIfNeeded<T>(
   channels: readonly SmokeChannel[],
   operation: () => Promise<T>,
 ): Promise<T> {
-  return channels.includes("telegram")
-    ? withChannelConfigLease("telegram", operation)
-    : operation();
+  const fencedChannels = (["slack", "telegram"] as const).filter((channel) =>
+    channels.includes(channel),
+  );
+  const run = (index: number): Promise<T> => {
+    const channel = fencedChannels[index];
+    return channel
+      ? withChannelConfigLease(channel, () => run(index + 1))
+      : operation();
+  };
+  return run(0);
 }
 
 function parseSmokeSetupInput(input: unknown): {
@@ -366,7 +373,7 @@ export async function PUT(request: Request): Promise<Response> {
     );
 
     const requested = new Set(requestedChannels);
-    await withTelegramConfigLeaseIfNeeded(requestedChannels, () =>
+    await withChannelConfigLeasesIfNeeded(requestedChannels, () =>
       mutateMeta((meta) => {
       const created: SmokeChannel[] = [];
       const owned: SmokeChannel[] = [];
@@ -502,7 +509,7 @@ export async function PUT(request: Request): Promise<Response> {
     );
   } catch (error) {
     if (createdChannels.length > 0) {
-      await withTelegramConfigLeaseIfNeeded(createdChannels, () =>
+      await withChannelConfigLeasesIfNeeded(createdChannels, () =>
         mutateMeta((meta) => {
           for (const channel of createdChannels) {
             if (smokeConfigStillOwned(channel, ownerId, meta)) {
@@ -792,7 +799,7 @@ export async function DELETE(request: Request): Promise<Response> {
     const removedChannels: SmokeChannel[] = [];
     const preservedChannels: SmokeChannel[] = [];
     try {
-      await withTelegramConfigLeaseIfNeeded(ownership.channels, () =>
+      await withChannelConfigLeasesIfNeeded(ownership.channels, () =>
         mutateMeta((meta) => {
           const removed: SmokeChannel[] = [];
           const preserved: SmokeChannel[] = [];

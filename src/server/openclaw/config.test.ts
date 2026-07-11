@@ -42,6 +42,10 @@ import {
   OPENCLAW_TELEGRAM_INTERNAL_WEBHOOK_PATH,
   TELEGRAM_PUBLIC_WEBHOOK_PATH,
 } from "@/server/openclaw/config";
+import {
+  CRON_PROJECTION_CAPABILITY,
+  cronProjectionCompatibilityRuntime,
+} from "@/server/cron/compatibility";
 
 function withEnv<T>(
   overrides: Record<string, string | undefined>,
@@ -169,6 +173,59 @@ test("buildGatewayConfig explicitly enables authenticated admin HTTP RPC only fo
     computeGatewayConfigHash({}),
     computeGatewayConfigHash({ bundleCapabilities: ["admin-http-rpc-v1"] }),
   );
+});
+
+test("buildGatewayConfig enables cron projection only for a verified capable bundle", (t) => {
+  t.mock.method(
+    cronProjectionCompatibilityRuntime,
+    "getVerifiedBundleIdentity",
+    () => ({
+      packageSpec: "openclaw@2026.7.2",
+      version: "2026.7.2",
+      forkSha: "a".repeat(40),
+      upstreamSha: "b".repeat(40),
+      canonicalSha256: "c".repeat(64),
+      capabilities: [CRON_PROJECTION_CAPABILITY],
+      verified: true,
+    }),
+  );
+  withEnv(
+    {
+      OPENCLAW_PACKAGE_SPEC: "openclaw@2026.7.2",
+      VERCEL_AUTOMATION_BYPASS_SECRET: "test-bypass",
+    },
+    () => {
+      const config = JSON.parse(
+        buildGatewayConfig(undefined, "https://app.example.com"),
+      ) as {
+        plugins?: {
+          allow?: string[];
+          load?: { paths?: string[] };
+          entries?: Record<string, { enabled?: boolean; config?: { endpoint?: string } }>;
+        };
+      };
+      const entry = config.plugins?.entries?.["vercel-cron-projection"];
+      assert.ok(config.plugins?.allow?.includes("vercel-cron-projection"));
+      assert.ok(
+        config.plugins?.load?.paths?.some((path) =>
+          path.endsWith("/extensions/vercel-cron-projection"),
+        ),
+      );
+      assert.equal(entry?.enabled, true);
+      assert.equal(
+        entry?.config?.endpoint,
+        "https://app.example.com/api/internal/cron-projection?x-vercel-protection-bypass=test-bypass",
+      );
+    },
+  );
+
+  withEnv({ OPENCLAW_PACKAGE_SPEC: "openclaw@2026.7.1" }, () => {
+    const config = JSON.parse(
+      buildGatewayConfig(undefined, "https://app.example.com"),
+    ) as { plugins?: { allow?: string[]; entries?: Record<string, unknown> } };
+    assert.equal(config.plugins?.allow?.includes("vercel-cron-projection"), false);
+    assert.equal(config.plugins?.entries?.["vercel-cron-projection"], undefined);
+  });
 });
 
 test("buildGatewayConfig throws for invalid boolean env values", () => {

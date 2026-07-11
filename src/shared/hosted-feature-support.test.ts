@@ -29,7 +29,7 @@ test("hosted feature support matrix covers the expected OpenClaw feature gaps", 
   assert.equal(byId.get("voice-canvas")?.hostedStatus, "upstream-only");
   assert.equal(byId.get("plugins-skills-bundled")?.hostedStatus, "bundled-only");
   assert.equal(byId.get("mcp-browser-tools")?.hostedStatus, "bundled-only");
-  assert.equal(byId.get("cron-scheduled-jobs")?.hostedStatus, "supported");
+  assert.equal(byId.get("cron-scheduled-jobs")?.hostedStatus, "experimental");
   assert.equal(byId.get("model-provider-gateway")?.hostedStatus, "supported");
 });
 

@@ -167,6 +167,15 @@ test("memory-store: setValue + getValue round-trips", async () => {
   assert.deepEqual(value, { hello: "world" });
 });
 
+test("memory-store: hasValue checks presence without decoding payload", async () => {
+  const store = new MemoryStore();
+  assert.equal(await store.hasValue("presence"), false);
+  await store.setValue("presence", { private: "payload" });
+  assert.equal(await store.hasValue("presence"), true);
+  await store.deleteValue("presence");
+  assert.equal(await store.hasValue("presence"), false);
+});
+
 test("memory-store: unscoped keys remain allowed for local development", async () => {
   const store = makeStore();
   await store.setValue("plain-key", "value");
@@ -178,6 +187,27 @@ test("memory-store: setValue overwrites existing", async () => {
   await store.setValue("key1", "first");
   await store.setValue("key1", "second");
   assert.equal(await store.getValue("key1"), "second");
+});
+
+test("memory-store: compareAndSetValue creates and advances matching revisions", async () => {
+  const store = makeStore();
+  assert.equal(
+    await store.compareAndSetValue("projection", null, { revision: 1, value: "a" }),
+    true,
+  );
+  assert.equal(
+    await store.compareAndSetValue("projection", null, { revision: 1, value: "race" }),
+    false,
+  );
+  assert.equal(
+    await store.compareAndSetValue("projection", 9, { revision: 10, value: "wrong" }),
+    false,
+  );
+  assert.equal(
+    await store.compareAndSetValue("projection", 1, { revision: 2, value: "b" }),
+    true,
+  );
+  assert.deepEqual(await store.getValue("projection"), { revision: 2, value: "b" });
 });
 
 test("memory-store: deleteValue removes key", async () => {

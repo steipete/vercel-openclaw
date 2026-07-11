@@ -20,6 +20,7 @@ import {
   channelUserMessageDedupKey,
   cronJobsKey,
   cronNextWakeKey,
+  cronProjectionKey,
   debugLockKey,
   initLockKey,
   instanceKeyPrefix,
@@ -83,6 +84,7 @@ test("keyspace: default instance id preserves existing keys", () => {
     assert.equal(tokenRefreshLockKey(), "openclaw-single:lock:token-refresh");
     assert.equal(cronNextWakeKey(), "openclaw-single:cron-next-wake-ms");
     assert.equal(cronJobsKey(), "openclaw-single:cron-jobs-json");
+    assert.equal(cronProjectionKey(), "openclaw-single:cron:projection");
     assert.equal(adminSecretKey(), "openclaw-single:admin-secret");
     assert.equal(learningLockKey(), "openclaw-single:lock:learning-refresh");
     assert.equal(debugLockKey(), "openclaw-single:lock:debug-timing");

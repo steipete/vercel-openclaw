@@ -59,6 +59,10 @@ class FakeRedis {
     return this.values.delete(key) ? 1 : 0;
   }
 
+  async exists(key: string): Promise<number> {
+    return this.values.has(key) ? 1 : 0;
+  }
+
   async eval(
     _script: string,
     numKeys: number,
@@ -973,7 +977,12 @@ test("[redis-store] low-level redis methods reject unscoped keys", async () => {
       const store = new RedisStore(redis as never);
 
       await assert.rejects(() => store.getValue("fork-b:key"), /outside instance prefix "fork-a:"/);
+      await assert.rejects(() => store.hasValue("fork-b:key"), /outside instance prefix "fork-a:"/);
       await assert.rejects(() => store.setValue("plain-key", "value"), /outside instance prefix "fork-a:"/);
+      await assert.rejects(
+        () => store.compareAndSetValue("plain-key", null, { revision: 1 }),
+        /outside instance prefix "fork-a:"/,
+      );
       await assert.rejects(() => store.deleteValue("fork-b:key"), /outside instance prefix "fork-a:"/);
       await assert.rejects(() => store.acquireLock("fork-b:lock", 30), /outside instance prefix "fork-a:"/);
       await assert.rejects(() => store.renewLock("fork-b:lock", "token", 30), /outside instance prefix "fork-a:"/);

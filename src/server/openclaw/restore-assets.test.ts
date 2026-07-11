@@ -31,6 +31,12 @@ import {
   OPENCLAW_WORKER_SANDBOX_BATCH_SKILL_PATH,
   OPENCLAW_WORKER_SANDBOX_BATCH_SCRIPT_PATH,
 } from "@/server/openclaw/config";
+import {
+  OPENCLAW_CRON_PROJECTION_MAX_WAKES,
+  OPENCLAW_CRON_PROJECTION_PLUGIN_DIR,
+  buildCronProjectionPluginSource,
+} from "@/server/openclaw/cron-projection-plugin";
+import { CRON_PROJECTION_MAX_WAKES } from "@/server/cron/projection";
 
 // --- buildRestoreAssetManifest ---
 
@@ -158,6 +164,36 @@ test("buildRestoreRuntimeEnv uses placeholder for AI gateway key (real credentia
   assert.equal(env.OPENAI_BASE_URL, "https://ai-gateway.vercel.sh/v1");
   assert.ok(env.AI_GATEWAY_API_KEY.includes("placeholder"), "Should use placeholder, not real key");
   assert.equal(env.OPENAI_API_KEY, env.AI_GATEWAY_API_KEY);
+});
+
+test("static restore files stage the host-owned cron projection plugin before boot", () => {
+  const paths = buildStaticRestoreFiles().map((file) => file.path);
+  assert.ok(paths.includes(`${OPENCLAW_CRON_PROJECTION_PLUGIN_DIR}/package.json`));
+  assert.ok(paths.includes(`${OPENCLAW_CRON_PROJECTION_PLUGIN_DIR}/openclaw.plugin.json`));
+  assert.ok(paths.includes(`${OPENCLAW_CRON_PROJECTION_PLUGIN_DIR}/index.mjs`));
+
+  const source = buildCronProjectionPluginSource();
+  assert.equal(OPENCLAW_CRON_PROJECTION_MAX_WAKES, CRON_PROJECTION_MAX_WAKES);
+  assert.match(source, /\.slice\(0, maxProjectedWakes\)/);
+  assert.match(source, /createHmac\("sha256", gatewayValue\)/);
+  assert.match(source, /api\.on\("cron_reconciled"/);
+  assert.match(source, /api\.on\("cron_changed"/);
+  assert.match(source, /cron\.list\(\{ includeDisabled: true \}\)/);
+  assert.match(source, /jobKey: createHash\("sha256"\)/);
+  assert.doesNotMatch(source, /jobId: job\.id/);
+  assert.match(source, /reconciliationSignal = ctx\.abortSignal/);
+  assert.match(source, /return requestProjection\(event\.reason\)/);
+  assert.match(source, /const ownerSignal = reconciliationSignal/);
+  assert.match(source, /if \(!ownerSignal \|\| ownerSignal\.aborted\) return/);
+  assert.match(source, /if \(ownerSignal\.aborted\) return/);
+  assert.match(source, /AbortSignal\.timeout\(attemptTimeoutMs\)/);
+  assert.match(source, /Promise\.race\(\[/);
+  assert.match(source, /response\.body\?\.cancel\(\)/);
+  assert.match(
+    source,
+    /restartPrefixes:[\s\S]*plugins\.entries\.vercel-cron-projection/,
+  );
+  assert.doesNotMatch(source, /job\.payload|job\.name|job\.description/);
 });
 
 test("buildRestoreRuntimeEnv ignores apiKey param (network policy handles real credential)", () => {

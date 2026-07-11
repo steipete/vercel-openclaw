@@ -1783,7 +1783,7 @@ test("persistent bundle identity mismatch quiesces and requires explicit migrati
       meta.status = "stopped";
       meta.snapshotId = null;
       meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
-      meta.gatewayToken = "test-gw-token";
+      meta.gatewayToken = "gw-test";
       meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
     });
 

@@ -219,14 +219,20 @@ export async function sendMessage(
   options?: {
     messageThreadId?: number | null;
     parseMode?: "Markdown" | "MarkdownV2" | "HTML";
+    signal?: AbortSignal;
   },
 ): Promise<TelegramSendMessageResult> {
-  return callTelegramApi<TelegramSendMessageResult>(botToken, "sendMessage", {
-    chat_id: chatId,
-    text: clampTelegramText(text),
-    message_thread_id: options?.messageThreadId ?? undefined,
-    parse_mode: options?.parseMode,
-  });
+  return callTelegramApi<TelegramSendMessageResult>(
+    botToken,
+    "sendMessage",
+    {
+      chat_id: chatId,
+      text: clampTelegramText(text),
+      message_thread_id: options?.messageThreadId ?? undefined,
+      parse_mode: options?.parseMode,
+    },
+    { signal: options?.signal },
+  );
 }
 
 type TelegramFile = {

@@ -354,7 +354,7 @@ function buildNextSteps(input: {
       id: "connect-channels",
       label: "Connect a channel",
       description:
-        "Go to the Channels tab in the admin panel. Each channel has a step-by-step wizard: Slack (paste signing secret + bot token), Telegram (paste bot token from @BotFather), Discord (paste bot token — endpoint and /ask command are configured automatically).",
+        "Go to the Channels tab in the admin panel. Hosted delivery supports Slack (paste signing secret + bot token) and Telegram (paste bot token from @BotFather).",
     });
   }
 

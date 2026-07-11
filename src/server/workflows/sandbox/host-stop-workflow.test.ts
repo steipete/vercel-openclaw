@@ -129,6 +129,28 @@ test("host stop monitor reconciles a prepared operation before metadata parking"
   assert.deepEqual(result, { status: "done", reason: "terminal-failed" });
 });
 
+test("host stop monitor retries an interrupted thaw before accepting terminal state", async () => {
+  let reconcileCalls = 0;
+  const testDeps = deps({
+    states: [
+      state({ phase: "thawing" }),
+      state({ phase: "running", ingressFenced: false }),
+    ],
+    meta: { status: "error", sandboxId: "sbx-1" } as SingleMeta,
+    reconciled: { status: "running", sandboxId: "sbx-1" } as SingleMeta,
+  });
+  const originalReconcile = testDeps.reconcile;
+  testDeps.reconcile = async () => {
+    reconcileCalls += 1;
+    return originalReconcile();
+  };
+
+  const result = await processHostStopMonitorStep("operation-1", testDeps);
+
+  assert.equal(reconcileCalls, 1);
+  assert.deepEqual(result, { status: "done", reason: "terminal-running" });
+});
+
 test("host stop monitor adopts an interrupted reset delete", async () => {
   let resetCalls = 0;
   const testDeps = deps({

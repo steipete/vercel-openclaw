@@ -32,6 +32,7 @@ function fakeSandbox(runCommand: SandboxHandle["runCommand"]): SandboxHandle {
     stop: async () => {},
     delete: async () => {},
     extendTimeout: async () => {},
+    extendTimeoutWithoutResume: async () => {},
     updateNetworkPolicy: async (policy) => policy,
     runDetachedCommand: async () => ({ cmdId: "unused" }),
     getCommand: async () => ({ kill: async () => {} }),

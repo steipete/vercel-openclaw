@@ -678,7 +678,9 @@ export async function setupOpenClaw(
     slackCredentials?: { botToken: string; signingSecret: string };
     telegramWebhookSecret?: string;
     progress?: SetupProgressWriter;
-    beforeGatewayStart?: () => Promise<void>;
+    launchGateway?: (
+      launch: () => Promise<CommandResult>,
+    ) => Promise<CommandResult>;
   },
 ): Promise<{
   startupScript: string;
@@ -1016,14 +1018,17 @@ export async function setupOpenClaw(
     drift,
   });
 
-  await options.beforeGatewayStart?.();
   progress?.setPhase("starting-gateway", "Launching gateway");
-  const startupResult = await sandbox.runCommand({
-    cmd: "bash",
-    args: [OPENCLAW_STARTUP_SCRIPT_PATH],
-    stdout: progress?.makeWritable("stdout"),
-    stderr: progress?.makeWritable("stderr"),
-  });
+  const launchGateway = () =>
+    sandbox.runCommand({
+      cmd: "bash",
+      args: [OPENCLAW_STARTUP_SCRIPT_PATH],
+      stdout: progress?.makeWritable("stdout"),
+      stderr: progress?.makeWritable("stderr"),
+    });
+  const startupResult = options.launchGateway
+    ? await options.launchGateway(launchGateway)
+    : await launchGateway();
 
   const startupStdout = (await startupResult.output("stdout")).trim();
   const startupStderr = (await startupResult.output("stderr")).trim();

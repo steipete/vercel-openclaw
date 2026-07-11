@@ -161,6 +161,7 @@ test("GET /api/admin/logs: sandbox log parsing prefers top-level source over ctx
             return { snapshotId: "snap-123" };
           },
           async extendTimeout() {},
+          async extendTimeoutWithoutResume() {},
           async updateNetworkPolicy() {
             return "allow-all";
           },
@@ -451,6 +452,7 @@ function fakeSandboxController(
           return { snapshotId: `snap-${sandboxId}` };
         },
         async extendTimeout() {},
+        async extendTimeoutWithoutResume() {},
         async updateNetworkPolicy() {
           return "allow-all" as const;
         },

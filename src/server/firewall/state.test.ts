@@ -23,6 +23,7 @@ import {
   syncFirewallPolicyIfRunning,
 } from "@/server/firewall/state";
 import { toNetworkPolicy } from "@/server/firewall/policy";
+import { parseFirewallFailClosedReason } from "@/server/firewall/fail-close";
 import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
 import type { SandboxController, SandboxHandle } from "@/server/sandbox/controller";
 import {
@@ -165,6 +166,7 @@ function installFailingSandboxSync(options?: { stopFails?: boolean }): {
           return { snapshotId: "snap-123" };
         },
         async extendTimeout() {},
+        async extendTimeoutWithoutResume() {},
         async updateNetworkPolicy(policy) {
           updateCalls += 1;
           attemptedPolicies.push(policy);
@@ -432,6 +434,7 @@ function installSucceedingSandboxController(opts?: {
           return { snapshotId: "snap-123" };
         },
         async extendTimeout() {},
+        async extendTimeoutWithoutResume() {},
         async updateNetworkPolicy(policy: NetworkPolicy) {
           appliedPolicies.push(policy);
           await opts?.onUpdateNetworkPolicy?.();
@@ -1972,7 +1975,7 @@ test("firewall mutation durably fences its generation after lifecycle ownership 
       }>(hostSuspensionOperationKey());
       assert.equal(stopOperation?.sandboxId, "sandbox-123");
       assert.equal(stopOperation?.lifecycleAttemptId, "attempt-old");
-      assert.equal(stopOperation?.reason, "firewall-policy-apply-failed");
+      assert.ok(parseFirewallFailClosedReason(stopOperation?.reason ?? ""));
       assert.equal(stopOperation?.ingressFenced, true);
       assert.ok(
         getServerLogs().some(
@@ -1981,6 +1984,193 @@ test("firewall mutation durably fences its generation after lifecycle ownership 
       );
     } finally {
       store.renewLock = originalRenewLock;
+      ctrl.restore();
+    }
+  });
+});
+
+test("fail-close repairs ownership loss during durable stop enqueue", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-enqueue-loss";
+    });
+    const store = getStore();
+    const originalRenewLock = store.renewLock.bind(store);
+    let policyFailed = false;
+    let renewalsAfterFailure = 0;
+    store.renewLock = async (key, token, ttlSeconds) => {
+      if (!policyFailed) {
+        return originalRenewLock(key, token, ttlSeconds);
+      }
+      renewalsAfterFailure += 1;
+      if (renewalsAfterFailure < 3) {
+        return originalRenewLock(key, token, ttlSeconds);
+      }
+      await store.releaseLock(key, token);
+      return false;
+    };
+    const ctrl = installSucceedingSandboxController({
+      onUpdateNetworkPolicy: () => {
+        policyFailed = true;
+        throw new Error("policy apply failed");
+      },
+    });
+
+    try {
+      await assertFirewallSyncFailed(setFirewallMode("learning"));
+
+      const meta = await getInitializedMeta();
+      const stopOperation = await getStore().getValue<{
+        sandboxId: string;
+        lifecycleAttemptId: string | null;
+        reason: string;
+      }>(hostSuspensionOperationKey());
+      assert.ok(renewalsAfterFailure >= 3);
+      assert.equal(meta.status, "error");
+      assert.equal(stopOperation?.sandboxId, "sandbox-123");
+      assert.equal(stopOperation?.lifecycleAttemptId, "attempt-enqueue-loss");
+      assert.ok(parseFirewallFailClosedReason(stopOperation?.reason ?? ""));
+    } finally {
+      store.renewLock = originalRenewLock;
+      ctrl.restore();
+    }
+  });
+});
+
+test("stale fail-close cannot stop a repaired policy revision on the same sandbox generation", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-shared";
+      meta.firewall.mode = "learning";
+      meta.firewall.allowlist = ["api.openai.com"];
+    });
+    const store = getStore();
+    const originalAcquireLock = store.acquireLock.bind(store);
+    const originalRenewLock = store.renewLock.bind(store);
+    let loseOwnership = false;
+    let successorInstalled = false;
+    store.renewLock = async (key, token, ttlSeconds) => {
+      if (!loseOwnership) {
+        return originalRenewLock(key, token, ttlSeconds);
+      }
+      await store.releaseLock(key, token);
+      return false;
+    };
+    store.acquireLock = async (key, ttlSeconds) => {
+      if (
+        key === lifecycleLockKey()
+        && loseOwnership
+        && !successorInstalled
+      ) {
+        successorInstalled = true;
+        await mutateMeta((meta) => {
+          meta.status = "running";
+          meta.firewall.policyRevisionId = "successor-policy-revision";
+          meta.firewall.lastPolicySdkCompletionRevisionId =
+            "successor-policy-revision";
+          meta.firewall.lastPolicySdkCompletionHash = "b".repeat(64);
+          meta.firewall.failClosedPolicyRevisionId = null;
+          meta.firewall.failClosedPolicyHash = null;
+          meta.firewall.lastSyncReason = "policy-applied";
+        });
+      }
+      return originalAcquireLock(key, ttlSeconds);
+    };
+    const ctrl = installSucceedingSandboxController({
+      onUpdateNetworkPolicy: () => {
+        loseOwnership = true;
+      },
+    });
+
+    try {
+      await assertFirewallSyncFailed(setFirewallMode("enforcing"));
+
+      const meta = await getInitializedMeta();
+      assert.equal(successorInstalled, true);
+      assert.equal(meta.status, "running");
+      assert.equal(meta.firewall.policyRevisionId, "successor-policy-revision");
+      assert.equal(meta.firewall.lastSyncReason, "policy-applied");
+      assert.equal(await getStore().getValue(hostSuspensionOperationKey()), null);
+      assert.equal(ctrl.appliedPolicies.length, 1);
+    } finally {
+      store.acquireLock = originalAcquireLock;
+      store.renewLock = originalRenewLock;
+      ctrl.restore();
+    }
+  });
+});
+
+test("policy apply lock prevents same-generation successor SDK overlap", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-overlap";
+    });
+    const store = getStore();
+    const originalAcquireLock = store.acquireLock.bind(store);
+    let firstLifecycleToken: string | null = null;
+    store.acquireLock = async (key, ttlSeconds) => {
+      const token = await originalAcquireLock(key, ttlSeconds);
+      if (key === lifecycleLockKey() && token && !firstLifecycleToken) {
+        firstLifecycleToken = token;
+      }
+      return token;
+    };
+    let applyCalls = 0;
+    let signalFirstApply!: () => void;
+    let releaseFirstApply!: () => void;
+    const firstApplyStarted = new Promise<void>((resolve) => {
+      signalFirstApply = resolve;
+    });
+    const firstApplyGate = new Promise<void>((resolve) => {
+      releaseFirstApply = resolve;
+    });
+    const ctrl = installSucceedingSandboxController({
+      onUpdateNetworkPolicy: async () => {
+        applyCalls += 1;
+        if (applyCalls !== 1) return;
+        signalFirstApply();
+        await firstApplyGate;
+      },
+    });
+
+    try {
+      const stale = setFirewallMode("learning");
+      await firstApplyStarted;
+      assert.ok(firstLifecycleToken);
+      await store.releaseLock(lifecycleLockKey(), firstLifecycleToken);
+
+      await assert.rejects(
+        setFirewallMode("enforcing"),
+        (error: unknown) => {
+          assert.equal(
+            (error as { code?: unknown }).code,
+            "FIREWALL_POLICY_APPLY_IN_PROGRESS",
+          );
+          return true;
+        },
+      );
+      releaseFirstApply();
+      await assertFirewallSyncFailed(stale);
+
+      const meta = await getInitializedMeta();
+      const stopOperation = await getStore().getValue<{
+        reason: string;
+        ingressFenced: boolean;
+      }>(hostSuspensionOperationKey());
+      const stoppedRevision = parseFirewallFailClosedReason(
+        stopOperation?.reason ?? "",
+      );
+      assert.equal(applyCalls, 1);
+      assert.equal(meta.status, "error");
+      assert.equal(meta.firewall.mode, "learning");
+      assert.equal(stopOperation?.ingressFenced, true);
+      assert.equal(
+        stoppedRevision?.revisionId,
+        meta.firewall.lastPolicySdkCompletionRevisionId,
+      );
+      assert.equal(stoppedRevision?.revisionId, meta.firewall.policyRevisionId);
+    } finally {
+      store.acquireLock = originalAcquireLock;
       ctrl.restore();
     }
   });

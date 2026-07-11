@@ -118,7 +118,7 @@ test("GET /api/channels/summary: returns summary for all channels including what
     assert.equal(body.featureSupport.schemaVersion, 1);
     assert.equal(
       body.featureSupport.entries.find((entry) => entry.id === "channel-discord")?.hostedStatus,
-      "experimental",
+      "not-supported",
     );
     assert.equal(
       body.featureSupport.entries.find((entry) => entry.id === "channel-whatsapp")?.hostedStatus,
@@ -645,11 +645,11 @@ test("GET /api/channels/summary: Discord separates route, native, and visible re
     assert.equal(result.status, 200);
     const body = result.json as ChannelSummaryResponse;
 
-    assert.equal(body.discord.routeReady, true);
-    assert.equal(body.discord.nativeAccepted, true);
+    assert.equal(body.discord.routeReady, false);
+    assert.equal(body.discord.nativeAccepted, false);
     assert.equal(body.discord.userVisibleReplyVerified, false);
     assert.equal(body.discord.readiness.ackSemantics, "deferred-only");
-    assert.equal(body.discord.readiness.reason, "discord_user_visible_reply_not_observed");
+    assert.equal(body.discord.readiness.reason, "hosted_discord_transport_unavailable");
     assert.equal(body.discord.lastDeliveryState?.state, "visibility-unknown");
   });
 });
@@ -681,7 +681,7 @@ test("GET /api/channels/summary: Discord endpoint drift blocks route readiness",
     assert.equal(body.discord.routeReady, false);
     assert.equal(body.discord.nativeAccepted, false);
     assert.equal(body.discord.userVisibleReplyVerified, false);
-    assert.equal(body.discord.readiness.reason, "discord_endpoint_drift");
+    assert.equal(body.discord.readiness.reason, "hosted_discord_transport_unavailable");
   });
 });
 
@@ -708,12 +708,12 @@ test("GET /api/channels/summary: Discord endpoint bypass query alone is not drif
     const body = result.json as ChannelSummaryResponse;
 
     assert.equal(body.discord.endpointDrift, false);
-    assert.equal(body.discord.routeReady, true);
+    assert.equal(body.discord.routeReady, false);
     assert.equal(body.discord.currentEndpointUrl, "http://localhost:3000/api/channels/discord/webhook");
     assert.equal(body.discord.desiredEndpointUrl, "http://localhost:3000/api/channels/discord/webhook");
     assert.equal(body.discord.readiness.endpointDrift, false);
-    assert.equal(body.discord.readiness.routeReady, true);
-    assert.equal(body.discord.readiness.reason, "discord_native_acceptance_not_observed");
+    assert.equal(body.discord.readiness.routeReady, false);
+    assert.equal(body.discord.readiness.reason, "hosted_discord_transport_unavailable");
   });
 });
 
@@ -767,10 +767,10 @@ test("GET /api/channels/summary: Discord observed visible reply is the final rea
     assert.equal(result.status, 200);
     const body = result.json as ChannelSummaryResponse;
 
-    assert.equal(body.discord.routeReady, true);
-    assert.equal(body.discord.nativeAccepted, true);
-    assert.equal(body.discord.userVisibleReplyVerified, true);
-    assert.equal(body.discord.readiness.reason, null);
+    assert.equal(body.discord.routeReady, false);
+    assert.equal(body.discord.nativeAccepted, false);
+    assert.equal(body.discord.userVisibleReplyVerified, false);
+    assert.equal(body.discord.readiness.reason, "hosted_discord_transport_unavailable");
   });
 });
 

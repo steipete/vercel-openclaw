@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { ApiError } from "@/shared/http";
 import {
   createDefaultHotSpareState,
   FIREWALL_FAIL_CLOSED_LAST_ERROR,
-  FIREWALL_FAIL_CLOSED_REASON,
   type SingleMeta,
 } from "@/shared/types";
+import { firewallFailClosedReason } from "@/server/firewall/fail-close";
 import {
   OPENCLAW_BUNDLE_IDENTITY_PATH,
   OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH,
@@ -18,6 +19,7 @@ import {
   REQUIRED_OPENCLAW_BUNDLE_ASSETS,
   type VerifiedBundleAdmission,
 } from "@/server/openclaw/bundle-identity";
+import { readCronProjection } from "@/server/cron/projection";
 
 import {
   ensureFreshGatewayToken,
@@ -128,6 +130,14 @@ const ENV_OVERRIDES: Record<string, string | undefined> = {
   OPENCLAW_BUNDLE_SHA256: undefined,
   OPENCLAW_HOT_SPARE_ENABLED: undefined,
 };
+
+const FIREWALL_POLICY_REVISION = {
+  revisionId: "firewall-revision-test",
+  policyHash: "a".repeat(64),
+};
+const FIREWALL_FAIL_CLOSED_REASON = firewallFailClosedReason(
+  FIREWALL_POLICY_REVISION,
+);
 
 async function withTestEnv(
   fake: FakeSandboxController,
@@ -1443,7 +1453,98 @@ test("ensureSandboxRunning retries the exact rollback-pending operation without 
       ),
       false,
     );
-    assert.equal((await readHostSuspensionState())?.phase, "running");
+    const suspension = await readHostSuspensionState();
+    assert.equal(suspension?.phase, "running");
+    assert.equal(suspension?.ingressFenced, false);
+  });
+});
+
+test("reconcileSnapshottingStatus completes an exact interrupted thaw from error metadata", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-thaw-crash-recovery";
+    const lifecycleAttemptId = "attempt-thaw-crash-recovery";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = "worker exited after persisting thawing";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        lifecycleAttemptId,
+        phase: "thawing",
+        suspensionId: null,
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+
+    const result = await reconcileSnapshottingStatus();
+    const suspension = await readHostSuspensionState();
+
+    assert.equal(result.status, "running");
+    assert.equal(result.sandboxId, sandboxId);
+    assert.equal(result.lifecycleAttemptId, lifecycleAttemptId);
+    assert.equal(result.lastError, null);
+    assert.equal(suspension?.phase, "running");
+    assert.equal(suspension?.ingressFenced, false);
+  });
+});
+
+test("snapshotting rollback recovery settles persistent stop metadata before returning to running", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-snapshotting-rollback-recovery";
+    const lifecycleAttemptId = "attempt-snapshotting-rollback-recovery";
+    const operationId = "operation-snapshotting-rollback-recovery";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    handle.setStatus("running");
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.activePersistentStop = {
+        stopAttemptId: "stop-snapshotting-rollback-recovery",
+        sandboxId,
+        lifecycleAttemptId,
+        operationId,
+        reason: "sandbox.stop",
+        startedAt: Date.now() - 60_000,
+      };
+      meta.pendingPersistentAutoSave = {
+        sandboxId,
+        lifecycleAttemptId,
+        operationId,
+        dynamicConfigHash: "config-snapshotting-rollback-recovery",
+        assetSha256: "assets-snapshotting-rollback-recovery",
+        createdAt: Date.now() - 60_000,
+      };
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        lifecycleAttemptId,
+        operationId,
+        requestId: operationId,
+        phase: "rollback-pending",
+        stopRequestDeadlineAtMs: null,
+        updatedAtMs: Date.now() - 60_000,
+      }),
+    );
+
+    const result = await reconcileSnapshottingStatus();
+
+    assert.equal(result.status, "running");
+    assert.equal(result.activePersistentStop, null);
+    assert.equal(result.pendingPersistentAutoSave, null);
+    assert.match(result.lastError ?? "", /Gateway admission resumed/);
+    const suspension = await readHostSuspensionState();
+    assert.equal(suspension?.phase, "failed");
+    assert.equal(suspension?.ingressFenced, false);
   });
 });
 
@@ -1538,6 +1639,121 @@ test("suspended persistent resume retires the durable lease before starting a re
         .map((command) => command.args?.[2]);
       assert.deepEqual(phases, ["kill", "start"]);
     } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent resume does not launch Gateway after lifecycle lease loss during kill", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-resume-lease-loss";
+      meta.gatewayToken = "test-gw-token";
+    });
+    const handle = preRegisterResumeHandle(fake);
+    const store = getStore();
+    const renewLock = store.renewLock.bind(store);
+    let loseLifecycleLease = false;
+    store.renewLock = async (key, token, ttlSeconds) =>
+      key === lifecycleLockKey() && loseLifecycleLease
+        ? false
+        : renewLock(key, token, ttlSeconds);
+    const originalRunCommand = handle.runCommand.bind(handle);
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      const result = await originalRunCommand(commandOrOpts as never, args, opts);
+      if (
+        (typeof commandOrOpts === "string" ? commandOrOpts : commandOrOpts.cmd) === "bash"
+        && commandArgs?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
+        && commandArgs[2] === "kill"
+      ) {
+        loseLifecycleLease = true;
+      }
+      return result;
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("resume-lease-loss-after-kill");
+      const phases = handle.commands
+        .filter((command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH)
+        .map((command) => command.args?.[2]);
+      assert.deepEqual(phases, ["kill"]);
+    } finally {
+      store.renewLock = renewLock;
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent resume does not kill Gateway after lifecycle lease loss during suspension read", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-resume-read-lease-loss";
+      meta.gatewayToken = "test-gw-token";
+    });
+    const handle = preRegisterResumeHandle(fake);
+    const store = getStore();
+    const renewLock = store.renewLock.bind(store);
+    const getValue = store.getValue.bind(store);
+    const originalRunCommand = handle.runCommand.bind(handle);
+    let loseLifecycleLease = false;
+    let armSuspensionRead = false;
+
+    store.renewLock = async (key, token, ttlSeconds) =>
+      key === lifecycleLockKey() && loseLifecycleLease
+        ? false
+        : renewLock(key, token, ttlSeconds);
+    store.getValue = async <T>(key: string): Promise<T | null> => {
+      const value = await getValue<T>(key);
+      if (key === hostSuspensionOperationKey() && armSuspensionRead) {
+        armSuspensionRead = false;
+        loseLifecycleLease = true;
+      }
+      return value;
+    };
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      const result = await originalRunCommand(commandOrOpts as never, args, opts);
+      if (
+        (typeof commandOrOpts === "string" ? commandOrOpts : commandOrOpts.cmd)
+          === "bash"
+        && commandArgs?.[0] === "-c"
+        && commandArgs[1]?.includes("gateway_lock.cleared_stale")
+      ) {
+        armSuspensionRead = true;
+      }
+      return result;
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("resume-lease-loss-during-suspension-read");
+      const phases = handle.commands
+        .filter((command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH)
+        .map((command) => command.args?.[2]);
+      assert.deepEqual(phases, []);
+    } finally {
+      store.renewLock = renewLock;
+      store.getValue = getValue;
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
     }
@@ -3515,7 +3731,11 @@ test("restoreSandboxFromSnapshot with fast-restore script exit code != 0 throws 
 
   // Make the fast-restore script command fail
   fake.defaultResponders.push((cmd, args) => {
-    if (cmd === "bash" && args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH) {
+    if (
+      cmd === "bash"
+      && args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
+      && args[2] === "start"
+    ) {
       return { exitCode: 1, output: async () => "fast-restore script failed: missing config" };
     }
     return undefined;
@@ -5101,6 +5321,47 @@ test("[failure] bootstrap (setupOpenClaw) failure sets status to error", async (
   });
 });
 
+test("fresh bootstrap does not launch Gateway after lifecycle lease loss at firewall boundary", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const store = getStore();
+    const renewLock = store.renewLock.bind(store);
+    let loseLifecycleLease = false;
+    store.renewLock = async (key, token, ttlSeconds) =>
+      key === lifecycleLockKey() && loseLifecycleLease
+        ? false
+        : renewLock(key, token, ttlSeconds);
+    const create = fake.create.bind(fake);
+    fake.create = async (params) => {
+      const handle = await create(params) as FakeSandboxHandle;
+      handle.networkPolicyHandler = async (policy) => {
+        loseLifecycleLease = true;
+        return policy;
+      };
+      return handle;
+    };
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("fresh-bootstrap-lease-loss");
+      const handle = [...fake.handlesByIds.values()][0];
+      assert.ok(handle, "fresh sandbox should be created");
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === OPENCLAW_STARTUP_SCRIPT_PATH,
+        ),
+        false,
+        "Gateway startup must not run after lifecycle ownership is lost",
+      );
+    } finally {
+      store.renewLock = renewLock;
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
 test("[failure] ambiguous stop failure remains snapshotting and fenced", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
@@ -5124,6 +5385,40 @@ test("[failure] ambiguous stop failure remains snapshotting and fenced", async (
     );
     assert.equal(suspension?.phase, "stop-requesting");
     assert.equal(suspension?.ingressFenced, true);
+  });
+});
+
+test("[failure] admitted bundle refuses platform stop when admin RPC is missing", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    const sandboxId = "sbx-bundle-admin-rpc-missing";
+    const lifecycleAttemptId = "attempt-bundle-admin-rpc-missing";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    handle.responders.unshift((cmd, args) => {
+      if (cmd !== "node" || !args?.includes("--input-type=module")) return undefined;
+      return {
+        exitCode: 0,
+        output: async () => JSON.stringify({ status: 404, body: "Not Found" }),
+      };
+    });
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+
+    await assert.rejects(stopSandbox(), /admin-http-rpc plugin is not enabled/);
+
+    const suspension = await readHostSuspensionState();
+    assert.equal(handle.stopCalled, false, "required suspension failure must refuse platform stop");
+    assert.equal(suspension?.sandboxId, sandboxId);
+    assert.equal(suspension?.lifecycleAttemptId, lifecycleAttemptId);
+    assert.equal(suspension?.phase, "preparing");
+    assert.equal(suspension?.ingressFenced, true);
+    assert.equal(suspension?.lastErrorCode, "ADMIN_RPC_NOT_INSTALLED");
   });
 });
 
@@ -5217,7 +5512,11 @@ test("[failure] restore failure from stopped state (fast-restore script fails)",
 
   // Make bash fast-restore-script command return non-zero exit code
   fake.defaultResponders.push((cmd, args) => {
-    if (cmd === "bash" && args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH) {
+    if (
+      cmd === "bash"
+      && args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
+      && args[2] === "start"
+    ) {
       return { exitCode: 1, output: async () => "fast-restore script failed" };
     }
     return undefined;
@@ -5674,6 +5973,7 @@ test("touchRunningSandbox tops up to desired idle plus safety runway", async () 
     assert.equal(result.status, "running");
     assert.equal(handle.extendedTimeouts.length, 1, "Should extend timeout exactly once");
     assert.equal(handle.extendedTimeouts[0], 480_000, "Should extend by 600000 - 120000 = 480000");
+    assert.deepEqual(handle.extendedTimeoutsWithoutResume, [480_000]);
   });
 });
 
@@ -7101,6 +7401,47 @@ test("resetSandbox rotates cron generation when metadata has no sandbox", async 
   });
 });
 
+test("reset cron transition survives cleanup failure and recovers before create", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await getInitializedMeta();
+    const store = getStore();
+    const deleteOwned = store.deleteValuesIfValueToken.bind(store);
+    store.deleteValuesIfValueToken = async () => false;
+
+    try {
+      await assert.rejects(
+        resetSandbox({
+          origin: "https://app.example.com",
+          reason: "reset-cron-cleanup-failure-test",
+        }),
+      );
+    } finally {
+      store.deleteValuesIfValueToken = deleteOwned;
+    }
+
+    const interrupted = await getInitializedMeta();
+    assert.equal(interrupted.status, "error");
+    assert.equal(interrupted.sandboxId, null);
+    assert.ok(interrupted.resetCronTransition);
+    assert.notEqual(interrupted.gatewayToken, before.gatewayToken);
+
+    const ready = await ensureSandboxReady({
+      origin: "https://app.example.com",
+      reason: "reset-cron-transition-recovery-test",
+    });
+    assert.equal(ready.status, "running");
+    assert.equal(ready.resetCronTransition, null);
+    assert.equal(
+      (await readCronProjection())?.gatewayGeneration,
+      createHash("sha256")
+        .update(ready.gatewayToken)
+        .digest("hex")
+        .slice(0, 32),
+    );
+  });
+});
+
 test("resetSandbox preserves the released runtime path when suspend RPC is unavailable", async () => {
   await withHarness(async (h) => {
     await h.driveToRunning();
@@ -8123,6 +8464,11 @@ test("firewall fail-closed monitor stops the exact fenced generation", async () 
       meta.status = "error";
       meta.sandboxId = handle.sandboxId;
       meta.lifecycleAttemptId = "firewall-attempt";
+      meta.firewall.policyRevisionId = FIREWALL_POLICY_REVISION.revisionId;
+      meta.firewall.lastPolicySdkCompletionRevisionId =
+        FIREWALL_POLICY_REVISION.revisionId;
+      meta.firewall.lastPolicySdkCompletionHash =
+        FIREWALL_POLICY_REVISION.policyHash;
       meta.portUrls = { "3000": handle.domain(3000) };
       meta.lastGatewayProbeReady = true;
     });
@@ -8146,6 +8492,36 @@ test("firewall fail-closed monitor stops the exact fenced generation", async () 
   });
 });
 
+test("firewall fail-closed monitor ignores an older policy revision on the same generation", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-firewall-new-policy", fake.events);
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "firewall-attempt";
+      meta.firewall.policyRevisionId = "successor-policy-revision";
+      meta.firewall.lastPolicySdkCompletionRevisionId =
+        "successor-policy-revision";
+      meta.firewall.lastPolicySdkCompletionHash = "b".repeat(64);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        lifecycleAttemptId: "firewall-attempt",
+        reason: FIREWALL_FAIL_CLOSED_REASON,
+      }),
+    );
+
+    const reconciled = await reconcileSnapshottingStatus();
+
+    assert.equal(reconciled.status, "running");
+    assert.equal(handle.stopCalled, false);
+    assert.deepEqual(handle.networkPolicies, []);
+  });
+});
+
 test("firewall fail-closed metadata repairs a missing durable stop handoff", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
@@ -8156,6 +8532,14 @@ test("firewall fail-closed metadata repairs a missing durable stop handoff", asy
       meta.sandboxId = handle.sandboxId;
       meta.lifecycleAttemptId = "firewall-repair-attempt";
       meta.lastError = FIREWALL_FAIL_CLOSED_LAST_ERROR;
+      meta.firewall.policyRevisionId = FIREWALL_POLICY_REVISION.revisionId;
+      meta.firewall.failClosedPolicyRevisionId =
+        FIREWALL_POLICY_REVISION.revisionId;
+      meta.firewall.failClosedPolicyHash = FIREWALL_POLICY_REVISION.policyHash;
+      meta.firewall.lastPolicySdkCompletionRevisionId =
+        FIREWALL_POLICY_REVISION.revisionId;
+      meta.firewall.lastPolicySdkCompletionHash =
+        FIREWALL_POLICY_REVISION.policyHash;
     });
     const reconciled = await reconcileSnapshottingStatus();
     const suspension = await readHostSuspensionState();

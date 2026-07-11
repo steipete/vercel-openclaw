@@ -250,7 +250,7 @@ test("preflight ok is true when Redis and OIDC are configured without bypass sec
         new Request("https://app.example.com/api/admin/preflight"),
       );
 
-      assert.equal(payload.channels.discord.canConnect, true);
+      assert.equal(payload.channels.discord.canConnect, false);
       assert.equal(payload.ok, true);
     },
   );
@@ -653,7 +653,7 @@ test("cross-surface: unpinned package-spec is a warning, not a blocker", async (
           undefined,
           `channel ${ch.channel} should not have openclaw-package-spec issue`,
         );
-        if (ch.channel === "whatsapp") {
+        if (ch.channel === "discord" || ch.channel === "whatsapp") {
           assert.equal(ch.canConnect, false);
           assert.equal(
             ch.issues.some(
@@ -1097,7 +1097,7 @@ test("preflight is config-only: passes on a fresh deployment before launch-verif
       // Channel prerequisites should pass (config is correct)
       assert.equal(payload.channels.slack.canConnect, true);
       assert.equal(payload.channels.telegram.canConnect, true);
-      assert.equal(payload.channels.discord.canConnect, true);
+      assert.equal(payload.channels.discord.canConnect, false);
       assert.equal(payload.channels.whatsapp.canConnect, false);
       assert.equal(
         payload.channels.whatsapp.issues.some(
@@ -1672,7 +1672,11 @@ test("preflight bypass remediation text mentions only hosted channels", async ()
       assert.ok(bypassAction, "expected configure-webhook-bypass action");
       assert.match(bypassAction.message, /Slack/i, "message must mention Slack");
       assert.match(bypassAction.message, /Telegram/i, "message must mention Telegram");
-      assert.match(bypassAction.message, /Discord/i, "message must mention Discord");
+      assert.doesNotMatch(
+        bypassAction.message,
+        /Discord/i,
+        "unsupported Discord must not be presented as a protected webhook",
+      );
       assert.doesNotMatch(
         bypassAction.message,
         /WhatsApp/i,
@@ -1818,7 +1822,7 @@ test("preflight treats missing webhook bypass as warning and mentions channels",
       assert.ok(action, "expected configure-webhook-bypass action");
       assert.match(action.message, /Slack/i);
       assert.match(action.message, /Telegram/i);
-      assert.match(action.message, /Discord/i);
+      assert.doesNotMatch(action.message, /Discord/i);
     },
   );
 });

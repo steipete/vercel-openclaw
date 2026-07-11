@@ -5,7 +5,6 @@ export const CHANNEL_NAMES = ["slack", "telegram", "discord", "whatsapp"] as con
 export const HOSTED_DELIVERY_CHANNEL_NAMES = [
   "slack",
   "telegram",
-  "discord",
 ] as const;
 
 export const HOSTED_DELIVERY_CHANNELS_LABEL =
@@ -48,11 +47,21 @@ export type SlackChannelConfig = {
 
 export type TelegramChannelConfig = {
   botToken: string;
+  botId?: string;
+  deliveryNamespace?: string;
   webhookSecret: string;
   previousWebhookSecret?: string;
   previousSecretExpiresAt?: number;
+  previousBotId?: string;
+  previousDeliveryNamespace?: string;
   previousBotUsername?: string;
   previousConfiguredAt?: number;
+  pendingWebhookCleanups?: Array<{
+    botToken: string;
+    botId?: string;
+    requestedAt: number;
+  }>;
+  deletionPending?: boolean;
   webhookUrl: string;
   botUsername: string;
   configuredAt: number;
@@ -366,10 +375,25 @@ function isTelegramChannelConfig(value: unknown): value is TelegramChannelConfig
     typeof raw.webhookUrl === "string" &&
     typeof raw.botUsername === "string" &&
     typeof raw.configuredAt === "number" &&
+    (raw.botId === undefined || typeof raw.botId === "string") &&
+    (raw.deliveryNamespace === undefined || typeof raw.deliveryNamespace === "string") &&
     (raw.previousWebhookSecret === undefined || typeof raw.previousWebhookSecret === "string") &&
     (raw.previousSecretExpiresAt === undefined || typeof raw.previousSecretExpiresAt === "number") &&
+    (raw.previousBotId === undefined || typeof raw.previousBotId === "string") &&
+    (raw.previousDeliveryNamespace === undefined || typeof raw.previousDeliveryNamespace === "string") &&
     (raw.previousBotUsername === undefined || typeof raw.previousBotUsername === "string") &&
     (raw.previousConfiguredAt === undefined || typeof raw.previousConfiguredAt === "number") &&
+    (raw.pendingWebhookCleanups === undefined ||
+      (Array.isArray(raw.pendingWebhookCleanups) &&
+        raw.pendingWebhookCleanups.every(
+          (cleanup) =>
+            typeof cleanup === "object" &&
+            cleanup !== null &&
+            typeof cleanup.botToken === "string" &&
+            (cleanup.botId === undefined || typeof cleanup.botId === "string") &&
+            typeof cleanup.requestedAt === "number",
+        ))) &&
+    (raw.deletionPending === undefined || typeof raw.deletionPending === "boolean") &&
     (raw.commandSyncStatus === undefined ||
       raw.commandSyncStatus === "synced" ||
       raw.commandSyncStatus === "unsynced" ||

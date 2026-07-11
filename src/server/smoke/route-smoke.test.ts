@@ -698,7 +698,7 @@ test("route-smoke: Discord PING interaction returns type 1 ack", async (t) => {
   }
 });
 
-test("route-smoke: Discord command interaction returns deferred response", async (t) => {
+test("route-smoke: Discord command interaction fails closed immediately", async (t) => {
   const h = createScenarioHarness();
   h.installDefaultGatewayHandlers();
   const { discordWebhookWorkflowRuntime } = await import("@/app/api/channels/discord/webhook/route");
@@ -714,8 +714,9 @@ test("route-smoke: Discord command interaction returns deferred response", async
     const result = await callRoute(route.POST, request);
     assert.equal(result.status, 200);
     const body = result.json as { type: number };
-    // Type 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
-    assert.equal(body.type, 5);
+    // Type 4 = immediate CHANNEL_MESSAGE_WITH_SOURCE.
+    assert.equal(body.type, 4);
+    assert.equal(startMock.mock.callCount(), 0);
   } catch (err) {
     await dumpDiagnostics(t, h);
     throw err;

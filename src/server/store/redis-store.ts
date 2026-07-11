@@ -51,6 +51,30 @@ redis.call("set", KEYS[1], ARGV[2])
 return 1
 `;
 
+const CAS_META_IF_LOCK_HELD_LUA = `
+if redis.call("get", KEYS[1]) ~= ARGV[1] then
+  return -2
+end
+
+local current = redis.call("get", KEYS[2])
+if not current then
+  return -1
+end
+
+local decoded = cjson.decode(current)
+local currentVersion = tonumber(decoded["version"])
+if not currentVersion then
+  currentVersion = 1
+end
+
+if currentVersion ~= tonumber(ARGV[2]) then
+  return 0
+end
+
+redis.call("set", KEYS[2], ARGV[3])
+return 1
+`;
+
 const CAS_VALUE_LUA = `
 local current = redis.call("get", KEYS[1])
 local expected = ARGV[1]
@@ -198,6 +222,27 @@ export class RedisStore {
       CAS_META_LUA,
       1,
       this.getMetaKey(),
+      String(expectedVersion),
+      JSON.stringify(next),
+    );
+
+    return toNumber(result) === 1;
+  }
+
+  async compareAndSetMetaIfLockHeld(
+    lockKey: string,
+    token: string,
+    expectedVersion: number,
+    next: SingleMeta,
+  ): Promise<boolean> {
+    assertScopedRedisKey(lockKey);
+    this.validateMetaOwnership(next);
+    const result = await this.redis.eval(
+      CAS_META_IF_LOCK_HELD_LUA,
+      2,
+      lockKey,
+      this.getMetaKey(),
+      token,
       String(expectedVersion),
       JSON.stringify(next),
     );

@@ -13,7 +13,10 @@ import {
   type DeadlineStepDeps,
   type SandboxDeadlineState,
 } from "@/server/sandbox/deadline-coordinator";
-import { HostSuspensionBusyError } from "@/server/sandbox/host-suspension";
+import {
+  HostSuspensionBusyError,
+  type HostSuspensionState,
+} from "@/server/sandbox/host-suspension";
 import { SandboxLifecycleGuardRejectedError } from "@/server/sandbox/lifecycle";
 import {
   MAX_PORTABLE_SANDBOX_SLEEP_AFTER_MS,
@@ -65,6 +68,7 @@ function coordinatorHarness(): {
         state = structuredClone(next);
         return true;
       },
+      retireLegacy: async () => false,
       clear: async () => {
         state = null;
       },
@@ -185,6 +189,46 @@ test("lifecycle stop claim seals the deadline against concurrent activity", asyn
   assert.equal(await armSandboxDeadline(runningMeta(), h.deps, {
     activityAtMs: 2_000_001,
   }), null);
+});
+
+test("force repair replaces a terminal sealed-stop workflow without reopening activity", async () => {
+  const h = coordinatorHarness();
+  const armed = await armSandboxDeadline(runningMeta(), h.deps);
+  assert.ok(armed);
+  h.setNow(2_000_000);
+  await h.deps.write({
+    ...armed,
+    deadlineAtMs: 1_900_000,
+    lastAttemptAtMs: 2_000_000,
+  });
+  assert.equal(await claimSandboxDeadlineStop({
+    generationId: armed.generationId,
+    claimedAtMs: 2_000_000,
+  }, h.deps), true);
+  h.setWorkflowStatus("failed");
+  let activityWrites = 0;
+  const recordActivity = h.deps.recordActivity;
+  h.deps.recordActivity = async (input) => {
+    activityWrites += 1;
+    return recordActivity(input);
+  };
+
+  const repaired = await armSandboxDeadline(
+    runningMeta(),
+    h.deps,
+    { refreshDeadline: false, forceWorkflowStart: true },
+  );
+
+  assert.equal(repaired?.workflowRunId, "run-2");
+  assert.equal(repaired?.lastOutcome, "stopping");
+  assert.equal(repaired?.lastAttemptAtMs, 2_000_000);
+  assert.equal(repaired?.deadlineAtMs, 1_900_000);
+  assert.equal(activityWrites, 0);
+  assert.equal(await armSandboxDeadline(runningMeta(), h.deps, {
+    activityAtMs: 2_000_001,
+  }), null);
+  assert.equal(activityWrites, 0);
+  assert.equal(h.read()?.lastOutcome, "stopping");
 });
 
 test("expired lifecycle stop claim cannot overwrite refreshed activity", async () => {
@@ -322,7 +366,13 @@ test("v1 deadline state migrates to a fenced replacement workflow", async () => 
   delete legacy.revision;
   delete legacy.workflowAttemptId;
   delete legacy.workflowStartLeaseExpiresAtMs;
-  h.deps.readLegacy = async () => legacy as unknown as SandboxDeadlineState;
+  let legacyState = legacy as unknown as SandboxDeadlineState;
+  h.deps.readLegacy = async () => structuredClone(legacyState);
+  h.deps.retireLegacy = async (expected, next) => {
+    if (legacyState.generationId !== expected.generationId) return false;
+    legacyState = structuredClone(next);
+    return true;
+  };
 
   const migrated = await armSandboxDeadline(runningMeta(), h.deps);
 
@@ -331,6 +381,57 @@ test("v1 deadline state migrates to a fenced replacement workflow", async () => 
   assert.equal(migrated?.workflowRunId, "run-1");
   assert.equal(migrated?.workflowAttemptId, "generation-1");
   assert.ok((migrated?.revision ?? 0) >= 3);
+  assert.equal(legacyState.generationId, "generation-1");
+  assert.equal(legacyState.lastOutcome, "stopping");
+  assert.equal(legacyState.lastErrorCode, "DEADLINE_V1_RETIRED");
+  assert.notEqual(legacyState.generationId, "legacy-generation");
+});
+
+test("v1 deadline owner stays fenced across a crash before v2 publication", async () => {
+  const h = coordinatorHarness();
+  const legacy = deadlineState({
+    generationId: "legacy-generation",
+    workflowRunId: "run-legacy",
+  }) as unknown as Record<string, unknown>;
+  legacy.version = 1;
+  delete legacy.revision;
+  delete legacy.workflowAttemptId;
+  delete legacy.workflowStartLeaseExpiresAtMs;
+  let legacyState = legacy as unknown as SandboxDeadlineState;
+  h.deps.readLegacy = async () => structuredClone(legacyState);
+  h.deps.retireLegacy = async (expected, next) => {
+    if (legacyState.generationId !== expected.generationId) return false;
+    legacyState = structuredClone(next);
+    return true;
+  };
+  const createMigrated = h.deps.createMigrated;
+  let crashBeforePublish = true;
+  h.deps.createMigrated = async (next) => {
+    if (crashBeforePublish) {
+      crashBeforePublish = false;
+      return false;
+    }
+    return createMigrated(next);
+  };
+
+  await assert.rejects(
+    armSandboxDeadline(runningMeta(), h.deps),
+    (error: unknown) =>
+      error instanceof ApiError
+      && error.code === "SANDBOX_DEADLINE_TRANSITION",
+  );
+  assert.equal(h.read(), null);
+  assert.equal(legacyState.lastOutcome, "stopping");
+  assert.equal(legacyState.lastErrorCode, "DEADLINE_V1_RETIRED");
+  assert.notEqual(legacyState.generationId, "legacy-generation");
+
+  const recovered = await armSandboxDeadline(runningMeta(), h.deps);
+
+  assert.equal(recovered?.version, 2);
+  assert.equal(recovered?.workflowRunId, "run-1");
+  assert.equal(legacyState.lastOutcome, "stopping");
+  assert.equal(legacyState.lastErrorCode, "DEADLINE_V1_RETIRED");
+  assert.notEqual(legacyState.generationId, "legacy-generation");
 });
 
 test("stale remote start cannot overwrite a successor start intent", async () => {
@@ -666,6 +767,34 @@ function deadlineState(overrides: Partial<SandboxDeadlineState> = {}): SandboxDe
   };
 }
 
+function hostSuspensionState(
+  overrides: Partial<HostSuspensionState> = {},
+): HostSuspensionState {
+  return {
+    version: 1,
+    operationId: "stop-operation",
+    requestId: "stop-request",
+    sandboxId: "sbx-deadline",
+    lifecycleAttemptId: "attempt-1",
+    intent: "stop",
+    reason: "manual stop",
+    phase: "stopping",
+    ingressFenced: true,
+    suspensionId: "gateway-suspension",
+    leaseExpiresAtMs: 60_000,
+    stopRequestDeadlineAtMs: 60_000,
+    monitorHeartbeatAtMs: 2_000,
+    startedAtMs: 1_000,
+    updatedAtMs: 2_000,
+    stoppedAtMs: null,
+    resumedAtMs: null,
+    lastError: null,
+    lastErrorCode: null,
+    lastErrorClass: null,
+    ...overrides,
+  };
+}
+
 function stepHarness(input: {
   stop: DeadlineStepDeps["stop"];
   timeout?: number;
@@ -689,17 +818,19 @@ function stepHarness(input: {
   meta.lastAccessedAt = null;
   const extensions: number[] = [];
   let reconciliations = 0;
+  const extendTimeout = async (duration: number) => {
+    extensions.push(duration);
+    if (input.activityAtMsDuringExtend !== undefined) {
+      meta.lastAccessedAt = input.activityAtMsDuringExtend;
+    }
+  };
   const sandbox = {
     sandboxId: "sbx-deadline",
     status: input.platformStatus ?? "running",
     timeout: input.totalTimeout ?? 60_000 + SANDBOX_TIMEOUT_SAFETY_RUNWAY_MS,
     timeoutRemaining: input.timeout ?? 1,
-    extendTimeout: async (duration: number) => {
-      extensions.push(duration);
-      if (input.activityAtMsDuringExtend !== undefined) {
-        meta.lastAccessedAt = input.activityAtMsDuringExtend;
-      }
-    },
+    extendTimeout,
+    extendTimeoutWithoutResume: extendTimeout,
   } as SandboxHandle;
   return {
     deps: {
@@ -719,6 +850,7 @@ function stepHarness(input: {
       renewLock: async () => true,
       releaseLock: async () => {},
       getMeta: async () => structuredClone(meta),
+      getHostSuspension: async () => null,
       getSandbox: async () => {
         if (input.getSandboxError !== undefined) throw input.getSandboxError;
         return sandbox;
@@ -764,6 +896,147 @@ test("deadline step extends native runway before explicit cooperative stop", asy
   assert.equal(h.read(), null);
 });
 
+test("deadline extension never auto-resumes a concurrently stopping sandbox", async () => {
+  let suspension: HostSuspensionState | null = null;
+  let autoResumeCalled = false;
+  let stopped = false;
+  const h = stepHarness({
+    stop: async () => {
+      stopped = true;
+      throw new Error("must not run");
+    },
+  });
+  h.deps.getHostSuspension = async () => structuredClone(suspension);
+  const getSandbox = h.deps.getSandbox;
+  h.deps.getSandbox = async (sandboxId) => {
+    const sandbox = await getSandbox(sandboxId);
+    const extendCapturedSession = sandbox.extendTimeoutWithoutResume!.bind(sandbox);
+    sandbox.extendTimeout = async () => {
+      autoResumeCalled = true;
+    };
+    sandbox.extendTimeoutWithoutResume = async (duration) => {
+      await extendCapturedSession(duration);
+      suspension = hostSuspensionState();
+    };
+    return sandbox;
+  };
+
+  const result = await processSandboxDeadlineStep(
+    "generation-1",
+    "workflow-attempt-1",
+    h.deps,
+  );
+
+  assert.equal(autoResumeCalled, false);
+  assert.equal(stopped, false);
+  assert.deepEqual(result, { status: "sleep", deadlineAtMs: 7_000 });
+  assert.equal(h.read()?.lastErrorCode, "DEADLINE_PLATFORM_TRANSITIONAL");
+});
+
+test("host-suspension retry preserves a sealed stop against later activity", async () => {
+  const coordinator = coordinatorHarness();
+  const armed = await armSandboxDeadline(runningMeta(), coordinator.deps);
+  assert.ok(armed?.workflowAttemptId);
+  await coordinator.deps.write({
+    ...armed,
+    deadlineAtMs: 1_000,
+    lastAttemptAtMs: 1_000,
+    lastOutcome: "stopping",
+  });
+  coordinator.setNow(2_000);
+  let activityWrites = 0;
+  const recordActivity = coordinator.deps.recordActivity;
+  coordinator.deps.recordActivity = async (input) => {
+    activityWrites += 1;
+    return recordActivity(input);
+  };
+  const step = stepHarness({
+    stop: async () => {
+      throw new Error("must not run");
+    },
+  });
+  step.deps.read = coordinator.deps.read;
+  step.deps.write = coordinator.deps.write;
+  step.deps.compareAndSet = coordinator.deps.compareAndSet;
+  step.deps.clear = coordinator.deps.clear;
+  step.deps.getMeta = coordinator.deps.getMeta;
+  step.deps.getHostSuspension = async () => hostSuspensionState();
+
+  const result = await processSandboxDeadlineStep(
+    armed.generationId,
+    armed.workflowAttemptId,
+    step.deps,
+  );
+
+  assert.deepEqual(result, { status: "sleep", deadlineAtMs: 7_000 });
+  assert.equal(coordinator.read()?.lastOutcome, "stopping");
+  coordinator.setNow(3_000);
+  assert.equal(await armSandboxDeadline(runningMeta(), coordinator.deps, {
+    activityAtMs: 3_000,
+  }), null);
+  assert.equal(activityWrites, 0);
+  assert.equal(coordinator.read()?.lastOutcome, "stopping");
+});
+
+test("failed unfenced host suspension does not block deadline stop", async () => {
+  const h = stepHarness({
+    stop: async () => ({ status: "snapshotting" }) as SingleMeta,
+  });
+  h.deps.getHostSuspension = async () => hostSuspensionState({
+    phase: "failed",
+    ingressFenced: false,
+    lastError: "monitor crashed after releasing ingress",
+    lastErrorCode: "HOST_MONITOR_FAILED",
+  });
+
+  const result = await processSandboxDeadlineStep(
+    "generation-1",
+    "workflow-attempt-1",
+    h.deps,
+  );
+
+  assert.deepEqual(result, { status: "done", reason: "stop-snapshotting" });
+  assert.equal(h.extensions.length, 1);
+  assert.equal(h.read(), null);
+});
+
+test("failed unfenced suspension published after extension still allows deadline stop", async () => {
+  let suspension: HostSuspensionState | null = null;
+  let stopCalls = 0;
+  const h = stepHarness({
+    stop: async () => {
+      stopCalls += 1;
+      return { status: "snapshotting" } as SingleMeta;
+    },
+  });
+  h.deps.getHostSuspension = async () => structuredClone(suspension);
+  const getSandbox = h.deps.getSandbox;
+  h.deps.getSandbox = async (sandboxId) => {
+    const sandbox = await getSandbox(sandboxId);
+    const extendCapturedSession = sandbox.extendTimeoutWithoutResume!.bind(sandbox);
+    sandbox.extendTimeoutWithoutResume = async (duration) => {
+      await extendCapturedSession(duration);
+      suspension = hostSuspensionState({
+        phase: "failed",
+        ingressFenced: false,
+        lastError: "crashed before clearing durable host state",
+        lastErrorCode: "HOST_MONITOR_FAILED",
+      });
+    };
+    return sandbox;
+  };
+
+  const result = await processSandboxDeadlineStep(
+    "generation-1",
+    "workflow-attempt-1",
+    h.deps,
+  );
+
+  assert.deepEqual(result, { status: "done", reason: "stop-snapshotting" });
+  assert.equal(stopCalls, 1);
+  assert.equal(h.read(), null);
+});
+
 test("deadline step releases its lock before entering lifecycle stop", async () => {
   let deadlineLockHeld = false;
   const h = stepHarness({
@@ -797,8 +1070,8 @@ test("expired step lease cannot overwrite a successor deadline state", async () 
   const getSandbox = h.deps.getSandbox;
   h.deps.getSandbox = async (sandboxId) => {
     const sandbox = await getSandbox(sandboxId);
-    const extendTimeout = sandbox.extendTimeout.bind(sandbox);
-    sandbox.extendTimeout = async (duration) => {
+    const extendTimeout = sandbox.extendTimeoutWithoutResume!.bind(sandbox);
+    sandbox.extendTimeoutWithoutResume = async (duration) => {
       await extendTimeout(duration);
       const current = h.read()!;
       await h.deps.write({
@@ -813,7 +1086,7 @@ test("expired step lease cannot overwrite a successor deadline state", async () 
   let renewals = 0;
   h.deps.renewLock = async () => {
     renewals += 1;
-    return renewals === 1;
+    return renewals <= 2;
   };
 
   const result = await processSandboxDeadlineStep(

@@ -121,6 +121,7 @@ function makeFakeHandle(sandboxId: string, restoreAssetManifest: Buffer): Sandbo
       return { snapshotId: `snap-${sandboxId}` };
     },
     async extendTimeout() {},
+    async extendTimeoutWithoutResume() {},
     async updateNetworkPolicy(policy: NetworkPolicy) {
       return policy;
     },

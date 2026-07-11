@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { GatewayAdminRpcError } from "@/server/openclaw/admin-rpc";
-import { FIREWALL_FAIL_CLOSED_REASON } from "@/shared/types";
+import { firewallFailClosedReason } from "@/server/firewall/fail-close";
 import type { SandboxHandle } from "@/server/sandbox/controller";
 import {
   HostSuspensionBusyError,
@@ -24,6 +24,10 @@ import {
 } from "@/server/sandbox/host-suspension";
 
 const LIFECYCLE_ATTEMPT_ID = "lifecycle-attempt-1";
+const FIREWALL_FAIL_CLOSED_REASON = firewallFailClosedReason({
+  revisionId: "firewall-revision-test",
+  policyHash: "a".repeat(64),
+});
 
 function fakeSandbox(): SandboxHandle {
   return { sandboxId: "sbx-host-suspension" } as SandboxHandle;

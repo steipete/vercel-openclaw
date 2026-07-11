@@ -6,7 +6,19 @@ import {
   tryAcquireChannelDedupLock,
   type ChannelDedupLock,
 } from "@/server/channels/dedup";
-import { recordChannelDlqFailure } from "@/server/channels/dlq";
+import {
+  recordChannelDlqFailure,
+  recordFastPathAcceptanceUnknown,
+} from "@/server/channels/dlq";
+import {
+  markChannelHandoffHandedOff,
+  markChannelDeliveryTerminal,
+  markChannelFastPathDispatching,
+  markChannelHandoffStartFailed,
+  markChannelHandoffStarting,
+  prepareChannelHandoff,
+  readChannelHandoff,
+} from "@/server/channels/handoff-ledger";
 import { refreshChannelFastPathGatewayToken } from "@/server/channels/fast-path-token";
 import { recordChannelLastForward } from "@/server/channels/last-forward";
 import {
@@ -19,7 +31,10 @@ import {
   channelDedupKey,
   channelUserMessageDedupKey,
 } from "@/server/channels/keys";
-import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-workflow";
+import {
+  drainChannelWorkflow,
+  type DrainChannelWorkflowEnvelopeV1,
+} from "@/server/workflows/channels/drain-channel-workflow";
 import {
   getSlackUrlVerificationChallenge,
   isValidSlackSignature,
@@ -39,6 +54,16 @@ import {
 // the full Vercel function maxDuration when the TCP connection to the
 // sandbox wedges half-open. 10 minutes hits that middle ground.
 const SLACK_FAST_PATH_FORWARD_TIMEOUT_MS = 10 * 60 * 1000;
+// Production delivery always hands off to Workflow. Native fast dispatch has
+// no atomic queued owner/idempotency contract yet, so it remains test-only.
+let nativeFastPathEnabledForTesting = false;
+
+export function _setSlackNativeFastPathForTesting(enabled: boolean): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("Slack native fast path override is test-only");
+  }
+  nativeFastPathEnabledForTesting = enabled;
+}
 
 const SLACK_FORWARD_HEADERS = [
   "x-slack-signature",
@@ -67,6 +92,19 @@ function workflowStartFailedResponse() {
   return Response.json(
     { ok: false, error: "WORKFLOW_START_FAILED", retryable: true },
     { status: 500 },
+  );
+}
+
+async function settleFastPathDelivery(deliveryId: string): Promise<void> {
+  await markChannelDeliveryTerminal({ channel: "slack", deliveryId }).catch(
+    (error) => {
+      // Native admission already happened. Bookkeeping failure must never
+      // turn a settled platform delivery into a second native dispatch.
+      logWarn("channels.slack_fast_path_terminal_record_failed", {
+        deliveryId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
   );
 }
 
@@ -294,6 +332,9 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   let dedupLock: SlackWebhookDedupLock | null = null;
+  const handoffDeliveryId = dedupId
+    ? `slack:${dedupId}`
+    : `slack:request:${requestId ?? receivedAtMs}`;
   if (dedupId) {
     const dedupKey = channelDedupKey("slack", dedupId);
     const dedupResult = await tryAcquireChannelDedupLock({
@@ -305,12 +346,32 @@ export async function POST(request: Request): Promise<Response> {
       lockKind: "event-id",
     });
     if (dedupResult.kind === "duplicate") {
+      const handoff = await readChannelHandoff("slack", handoffDeliveryId);
       logInfo("channels.slack_webhook_dedup_skip", {
         requestId,
         dedupId,
         ...eventInfo,
       });
-      return Response.json({ ok: true });
+      if (
+        handoff?.state === "handed-off" ||
+        handoff?.state === "processing" ||
+        handoff?.state === "terminal"
+      ) {
+        return Response.json({ ok: true });
+      }
+      if (handoff?.state === "fast-path-dispatching") {
+        const dlqRecord = await recordFastPathAcceptanceUnknown({
+          channel: "slack",
+          deliveryId: handoffDeliveryId,
+          requestId: requestId ?? null,
+          receivedAtMs,
+          reason: "slack_fast_path_dispatch_interrupted",
+        });
+        if (!dlqRecord) return workflowStartFailedResponse();
+        await settleFastPathDelivery(handoffDeliveryId);
+        return Response.json({ ok: true });
+      }
+      return workflowStartFailedResponse();
     }
     if (dedupResult.kind === "acquired") {
       dedupLock = dedupResult.lock;
@@ -377,7 +438,12 @@ export async function POST(request: Request): Promise<Response> {
   // outcome as unknown so the wake path cannot duplicate an accepted event.
   let effectiveMeta = meta;
   let revalidateSandboxBeforeForward = false;
-  if (effectiveMeta.status === "running" && effectiveMeta.sandboxId) {
+  if (
+    nativeFastPathEnabledForTesting &&
+    effectiveMeta.status === "running" &&
+    effectiveMeta.sandboxId &&
+    config.liveConfigSync?.liveConfigFresh !== false
+  ) {
     const forwardHeaders: Record<string, string> = {
       "content-type": request.headers.get("content-type") ?? "application/json",
     };
@@ -386,6 +452,9 @@ export async function POST(request: Request): Promise<Response> {
       if (v) forwardHeaders[h] = v;
     }
     const fastPathDedupId = extractSlackDedupId(payload);
+    const fastPathDeliveryId = fastPathDedupId
+      ? `slack:${fastPathDedupId}`
+      : `slack:request:${requestId ?? receivedAtMs}`;
     if (fastPathDedupId) {
       forwardHeaders["x-openclaw-delivery-id"] = `slack:${fastPathDedupId}`;
     }
@@ -444,6 +513,10 @@ export async function POST(request: Request): Promise<Response> {
         }));
 
         fastPathAttempts += 1;
+        await markChannelFastPathDispatching({
+          channel: "slack",
+          deliveryId: fastPathDeliveryId,
+        });
         nativeDispatchInFlight = true;
         let resp = await fetch(forwardUrl, {
           method: "POST",
@@ -473,6 +546,7 @@ export async function POST(request: Request): Promise<Response> {
             completedAt: Date.now(),
             deliveryId: fastPathDedupId ? `slack:${fastPathDedupId}` : null,
           });
+          await settleFastPathDelivery(fastPathDeliveryId);
           return Response.json({ ok: true });
         }
 
@@ -519,6 +593,7 @@ export async function POST(request: Request): Promise<Response> {
                 completedAt: Date.now(),
                 deliveryId: fastPathDedupId ? `slack:${fastPathDedupId}` : null,
               });
+              await settleFastPathDelivery(fastPathDeliveryId);
               return Response.json({ ok: true });
             }
             resp = retry;
@@ -558,6 +633,7 @@ export async function POST(request: Request): Promise<Response> {
           gatewayUnavailableResponse &&
           gatewayAdmissionRejectionAdmitted;
         const definitePreAdmissionResponse =
+          resp.status === 401 ||
           resp.status === 404 ||
           isSandboxNotListening ||
           admittedGatewayUnavailable;
@@ -576,9 +652,7 @@ export async function POST(request: Request): Promise<Response> {
               finalReasonHead: respBodyHead,
               startedAt: fastPathStartedAt,
               completedAt: Date.now(),
-              deliveryId: fastPathDedupId
-                ? `slack:${fastPathDedupId}`
-                : null,
+              deliveryId: fastPathDeliveryId,
             },
             { closedOutcome: "unknown" },
           );
@@ -596,6 +670,22 @@ export async function POST(request: Request): Promise<Response> {
               ...eventInfo,
             }),
           );
+          const dlqRecord = await recordFastPathAcceptanceUnknown({
+            channel: "slack",
+            deliveryId: fastPathDeliveryId,
+            requestId: requestId ?? null,
+            receivedAtMs,
+            reason: "slack_fast_path_acceptance_unknown",
+            diag: {
+              status: resp.status,
+              bodyHead: respBodyHead,
+              sandboxId: effectiveMeta.sandboxId ?? null,
+            },
+          });
+          if (!dlqRecord) {
+            return workflowStartFailedResponse();
+          }
+          await settleFastPathDelivery(fastPathDeliveryId);
           return Response.json({ ok: true });
         }
         revalidateSandboxBeforeForward = admittedGatewayUnavailable;
@@ -646,7 +736,7 @@ export async function POST(request: Request): Promise<Response> {
           finalReasonHead: respBodyHead,
           startedAt: fastPathStartedAt,
           completedAt: Date.now(),
-          deliveryId: fastPathDedupId ? `slack:${fastPathDedupId}` : null,
+          deliveryId: fastPathDeliveryId,
         });
 
         // For SANDBOX_NOT_LISTENING, refresh the cached port URL + reconcile
@@ -713,6 +803,21 @@ export async function POST(request: Request): Promise<Response> {
         acceptanceUnknown ? { closedOutcome: "unknown" } : undefined,
       );
       if (acceptanceUnknown) {
+        const dlqRecord = await recordFastPathAcceptanceUnknown({
+          channel: "slack",
+          deliveryId: fastPathDeliveryId,
+          requestId: requestId ?? null,
+          receivedAtMs,
+          reason: "slack_fast_path_transport_acceptance_unknown",
+          diag: {
+            error: error instanceof Error ? error.message : String(error),
+            sandboxId: effectiveMeta.sandboxId ?? null,
+          },
+        });
+        if (!dlqRecord) {
+          return workflowStartFailedResponse();
+        }
+        await settleFastPathDelivery(fastPathDeliveryId);
         return Response.json({ ok: true });
       }
       effectiveMeta = await reconcileStaleRunningStatus();
@@ -791,10 +896,10 @@ export async function POST(request: Request): Promise<Response> {
     if (v) slackForwardHeaders[h] = v;
   }
 
+  let handoffAttemptId: string | null = null;
   try {
     const origin = getPublicOrigin(request);
-    await slackWebhookWorkflowRuntime.start(drainChannelWorkflow, [
-      {
+    const envelope: DrainChannelWorkflowEnvelopeV1 = {
         version: 1,
         channel: "slack",
         payload,
@@ -806,6 +911,8 @@ export async function POST(request: Request): Promise<Response> {
           slackCleanupConfig: {
             botToken: config.botToken,
             configuredAt: config.configuredAt,
+            team: config.team,
+            botId: config.botId,
           },
           slackConfigGeneration: config.configuredAt,
           slackBootTarget,
@@ -813,13 +920,51 @@ export async function POST(request: Request): Promise<Response> {
           slackForwardHeaders,
           slackRawBody: rawBody,
         },
-      },
+      };
+    const prepared = await prepareChannelHandoff({
+      channel: "slack",
+      deliveryId: handoffDeliveryId,
+      envelope,
+    });
+    if (prepared.action === "ack") {
+      return Response.json({ ok: true });
+    }
+    if (prepared.action === "retry") {
+      return workflowStartFailedResponse();
+    }
+    handoffAttemptId = prepared.attemptId;
+    envelope.workflowHandoff = {
+      ...envelope.workflowHandoff,
+      handoffDeliveryId,
+      handoffAttemptId,
+    };
+    await markChannelHandoffStarting({
+      channel: "slack",
+      deliveryId: handoffDeliveryId,
+      attemptId: handoffAttemptId,
+    });
+    const run = await slackWebhookWorkflowRuntime.start(drainChannelWorkflow, [
+      envelope,
     ]);
+    await markChannelHandoffHandedOff({
+      channel: "slack",
+      deliveryId: handoffDeliveryId,
+      attemptId: handoffAttemptId,
+      runId: run?.runId ?? `unreported:${handoffAttemptId}`,
+    });
     logInfo("channels.slack_workflow_started", withOperationContext(op, {
       ...eventInfo,
       slackForwardHeaderKeys: Object.keys(slackForwardHeaders),
     }));
   } catch (error) {
+    if (handoffAttemptId) {
+      await markChannelHandoffStartFailed({
+        channel: "slack",
+        deliveryId: handoffDeliveryId,
+        attemptId: handoffAttemptId,
+        error,
+      }).catch(() => {});
+    }
     const [dedupRelease, userMessageRelease] =
       await releaseSlackWebhookDedupLocksForRetry([
         dedupLock,
@@ -841,9 +986,7 @@ export async function POST(request: Request): Promise<Response> {
       retryable: true,
       ...eventInfo,
     }));
-    const dlqDeliveryId = dedupId
-      ? `slack:${dedupId}`
-      : `slack:request:${requestId ?? receivedAtMs}`;
+    const dlqDeliveryId = handoffDeliveryId;
     await recordChannelDlqFailure({
       channel: "slack",
       deliveryId: dlqDeliveryId,

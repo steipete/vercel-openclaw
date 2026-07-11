@@ -22,7 +22,7 @@ test("hosted feature support matrix covers the expected OpenClaw feature gaps", 
 
   assert.equal(byId.get("channel-slack")?.hostedStatus, "supported");
   assert.equal(byId.get("channel-telegram")?.hostedStatus, "supported");
-  assert.equal(byId.get("channel-discord")?.hostedStatus, "experimental");
+  assert.equal(byId.get("channel-discord")?.hostedStatus, "not-supported");
   assert.equal(byId.get("channel-whatsapp")?.hostedStatus, "not-supported");
   assert.equal(byId.get("channels-upstream-rest")?.hostedStatus, "upstream-only");
   assert.equal(byId.get("companion-devices")?.hostedStatus, "upstream-only");

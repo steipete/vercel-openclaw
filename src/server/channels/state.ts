@@ -125,8 +125,7 @@ export async function setSlackChannelConfig(
   config: SlackChannelConfig | null,
 ): Promise<SingleMeta> {
   return withChannelConfigLease("slack", async (lease) => {
-    await lease.assertOwned();
-    return mutateMeta((meta) => {
+    return lease.mutateMeta((meta) => {
       if (!config) {
         meta.channels.slack = null;
         return;
@@ -152,8 +151,7 @@ export async function setTelegramChannelConfigUnderLease(
   lease: ChannelConfigLease,
   config: TelegramChannelConfig | null,
 ): Promise<SingleMeta> {
-  await lease.assertOwned();
-  return mutateMeta((meta) => {
+  return lease.mutateMeta((meta) => {
     meta.channels.telegram = config;
   });
 }

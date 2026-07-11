@@ -20,13 +20,16 @@ import test from "node:test";
 import type { NetworkPolicy } from "@vercel/sandbox";
 
 import type { SandboxController, SandboxHandle } from "@/server/sandbox/controller";
+import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
 import { buildRestoreAssetManifest, OPENCLAW_RESTORE_ASSET_MANIFEST_PATH } from "@/server/openclaw/restore-assets";
 import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
 import {
   _resetStoreForTesting,
   getInitializedMeta,
+  getStore,
   mutateMeta,
 } from "@/server/store/store";
+import { lifecycleLockKey } from "@/server/store/keyspace";
 import {
   callRoute,
   buildPostRequest,
@@ -62,6 +65,7 @@ const snapshotsRoute = loadRoute("@/app/api/admin/snapshots/route");
 const restoreRoute = loadRoute("@/app/api/admin/snapshots/restore/route");
 const statusRoute = loadRoute("@/app/api/status/route");
 const prepareRestoreRoute = loadRoute("@/app/api/admin/prepare-restore/route");
+const refreshTokenRoute = loadRoute("@/app/api/admin/refresh-token/route");
 const restoreTargetRoute = loadRoute("@/app/api/admin/restore-target/route");
 
 // ---------------------------------------------------------------------------
@@ -101,6 +105,7 @@ async function withTestEnv(fn: () => Promise<void>): Promise<void> {
   try {
     await fn();
   } finally {
+    _setAiGatewayTokenOverrideForTesting(null);
     _setSandboxControllerForTesting(null);
     _resetStoreForTesting();
     resetAfterCallbacks();
@@ -112,6 +117,25 @@ async function withTestEnv(fn: () => Promise<void>): Promise<void> {
       }
     }
   }
+}
+
+function observeLifecycleLockAcquisitions(): {
+  count: () => number;
+  restore: () => void;
+} {
+  const store = getStore();
+  const acquireLock = store.acquireLock.bind(store);
+  let lifecycleAcquisitions = 0;
+  store.acquireLock = async (key, ttlSeconds) => {
+    if (key === lifecycleLockKey()) lifecycleAcquisitions += 1;
+    return acquireLock(key, ttlSeconds);
+  };
+  return {
+    count: () => lifecycleAcquisitions,
+    restore: () => {
+      store.acquireLock = acquireLock;
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -139,20 +163,35 @@ function authGet(path: string): Request {
 // Fake sandbox controller
 // ---------------------------------------------------------------------------
 
-function installFakeController(): {
+function installFakeController(options?: { timeoutRemainingMs?: number }): {
   snapshotCalls: number;
   appliedPolicies: NetworkPolicy[];
+  nonResumingTimeoutExtensions: number[];
   restore(): void;
 } {
   let snapshotCalls = 0;
   const appliedPolicies: NetworkPolicy[] = [];
+  const nonResumingTimeoutExtensions: number[] = [];
+  const timeoutRemainingMs = options?.timeoutRemainingMs ?? 1800000;
 
   const fake: SandboxController = {
     async create() {
-      return makeFakeHandle("sbx-test-create", () => snapshotCalls++, appliedPolicies);
+      return makeFakeHandle(
+        "sbx-test-create",
+        () => snapshotCalls++,
+        appliedPolicies,
+        nonResumingTimeoutExtensions,
+        timeoutRemainingMs,
+      );
     },
     async get(opts: { sandboxId: string }) {
-      return makeFakeHandle(opts.sandboxId, () => snapshotCalls++, appliedPolicies);
+      return makeFakeHandle(
+        opts.sandboxId,
+        () => snapshotCalls++,
+        appliedPolicies,
+        nonResumingTimeoutExtensions,
+        timeoutRemainingMs,
+      );
     },
   };
 
@@ -161,6 +200,7 @@ function installFakeController(): {
   return {
     get snapshotCalls() { return snapshotCalls; },
     appliedPolicies,
+    nonResumingTimeoutExtensions,
     restore() { _setSandboxControllerForTesting(null); },
   };
 }
@@ -169,6 +209,8 @@ function makeFakeHandle(
   sandboxId: string,
   onSnapshot: () => void,
   policies: NetworkPolicy[],
+  nonResumingTimeoutExtensions: number[],
+  timeoutRemainingMs: number,
 ): SandboxHandle {
   let snapCount = 0;
   const restoreAssetManifest = Buffer.from(
@@ -177,7 +219,7 @@ function makeFakeHandle(
   return {
     sandboxId,
     get timeout() { return 1800000; },
-    get timeoutRemaining() { return 1800000; },
+    get timeoutRemaining() { return timeoutRemainingMs; },
     get status() { return "running" as const; },
     async runCommand(commandOrOptions) {
       if (
@@ -219,6 +261,9 @@ function makeFakeHandle(
       return { snapshotId: `snap-${sandboxId}-${snapCount}` };
     },
     async extendTimeout() {},
+    async extendTimeoutWithoutResume(duration) {
+      nonResumingTimeoutExtensions.push(duration);
+    },
     async updateNetworkPolicy(policy: NetworkPolicy) {
       policies.push(policy);
       return policy;
@@ -620,7 +665,8 @@ test("GET /api/status: returns status for stopped sandbox", async () => {
 
 test("POST /api/status: heartbeat extends sandbox timeout on running sandbox", async () => {
   await withTestEnv(async () => {
-    installFakeController();
+    const fake = installFakeController({ timeoutRemainingMs: 1 });
+    const lifecycleLocks = observeLifecycleLockAcquisitions();
     await mutateMeta((m) => {
       m.status = "running";
       m.sandboxId = "sbx-heartbeat";
@@ -637,6 +683,47 @@ test("POST /api/status: heartbeat extends sandbox timeout on running sandbox", a
     // Verify lastAccessedAt was updated
     const meta = await getInitializedMeta();
     assert.ok(meta.lastAccessedAt, "lastAccessedAt should be set after heartbeat");
+    assert.equal(fake.nonResumingTimeoutExtensions.length, 1);
+    assert.ok(fake.nonResumingTimeoutExtensions[0]! > 0);
+    assert.equal(
+      lifecycleLocks.count(),
+      1,
+      "auth must not reacquire the lifecycle lock around touchRunningSandbox",
+    );
+    lifecycleLocks.restore();
+  });
+});
+
+test("POST /api/admin/refresh-token: refresh executes under one lifecycle lock", async () => {
+  await withTestEnv(async () => {
+    const fake = installFakeController();
+    const lifecycleLocks = observeLifecycleLockAcquisitions();
+    _setAiGatewayTokenOverrideForTesting("fresh-route-oidc-token");
+    await mutateMeta((m) => {
+      m.status = "running";
+      m.sandboxId = "sbx-route-refresh";
+      m.lastTokenRefreshAt = Date.now();
+      m.lastTokenExpiresAt = Math.floor(Date.now() / 1000) + 30 * 60;
+      m.lastTokenSource = "oidc";
+    });
+
+    try {
+      const result = await callRoute(
+        refreshTokenRoute.POST!,
+        authPost("/api/admin/refresh-token"),
+      );
+
+      assert.equal(result.status, 200);
+      assert.equal((result.json as { refreshed: boolean }).refreshed, true);
+      assert.equal(fake.appliedPolicies.length, 1, "refresh must update the sandbox policy");
+      assert.equal(
+        lifecycleLocks.count(),
+        1,
+        "auth must not reacquire the lifecycle lock around token refresh",
+      );
+    } finally {
+      lifecycleLocks.restore();
+    }
   });
 });
 

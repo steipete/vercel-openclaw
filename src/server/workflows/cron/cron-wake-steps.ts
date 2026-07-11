@@ -24,6 +24,7 @@ import {
 import { getInitializedMeta } from "@/server/store/store";
 import {
   CRON_SETTLEMENT_RECOVERY_INTERVAL_MS,
+  type CronWakeSettleOutcome,
   CRON_WAKE_DEFAULT_RETRY_MS,
   CRON_WAKE_MAX_STEP_ATTEMPTS,
   CRON_WAKE_MONITOR_INTERVAL_MS,
@@ -177,10 +178,11 @@ export async function processCronWakeStep(
 
 export async function settleCronWakeStep(
   envelope: CronWakeWorkflowEnvelopeV1,
-): Promise<{ status: "settled" } | { status: "retry"; retryAfterMs: number }> {
+): Promise<CronWakeSettleOutcome> {
   "use step";
 
   const { RetryableError, getStepMetadata } = await import("workflow");
+  let settlementRecoveryAttempted = false;
   try {
     const meta = await getInitializedMeta();
     const identity = matchesConfiguredBundleIdentity(meta.bundleIdentity)
@@ -231,6 +233,9 @@ export async function settleCronWakeStep(
         envelope.runAtMs + CRON_DISPATCH_SETTLEMENT_GRACE_MS;
       const now = Date.now();
       if (now >= settlementAtMs) {
+        // Count the durable cycle even when the sandbox/credential touch
+        // exhausts its step retries; failures must not reset the terminal budget.
+        settlementRecoveryAttempted = true;
         const isCurrent = () => isCronWakeDispatchCurrent(envelope, enabled);
         const ready = await ensureSandboxReadyForCron({
           origin: getPublicOriginFromHint(envelope.origin),
@@ -252,11 +257,13 @@ export async function settleCronWakeStep(
           now < settlementAtMs
             ? Math.max(1_000, settlementAtMs - now)
             : CRON_SETTLEMENT_RECOVERY_INTERVAL_MS,
+        settlementRecoveryAttempted,
       };
     }
     return {
       status: "retry",
       retryAfterMs: CRON_WAKE_MONITOR_INTERVAL_MS,
+      settlementRecoveryAttempted: false,
     };
   } catch (error) {
     const attempt = getStepMetadata().attempt;
@@ -275,7 +282,11 @@ export async function settleCronWakeStep(
         retryAfter: retryAfterMs,
       });
     }
-    return { status: "retry", retryAfterMs };
+    return {
+      status: "retry",
+      retryAfterMs,
+      settlementRecoveryAttempted,
+    };
   }
 }
 

@@ -174,7 +174,6 @@ export type FirewallSyncOutcome = {
 
 export const FIREWALL_FAIL_CLOSED_LAST_ERROR =
   "Firewall policy application failed; sandbox execution was fenced.";
-export const FIREWALL_FAIL_CLOSED_REASON = "firewall-policy-apply-failed";
 
 export type FirewallState = {
   mode: FirewallMode;
@@ -207,6 +206,16 @@ export type FirewallState = {
   lastCommittedLearningBatchId?: string | null;
   /** Structured outcome of the last sync operation, or null if none yet. */
   lastSyncOutcome: FirewallSyncOutcome | null;
+  /** Random identity of the latest desired-policy application attempt. */
+  policyRevisionId?: string | null;
+  /** Desired-policy revision whose failed apply owns fail-close recovery. */
+  failClosedPolicyRevisionId?: string | null;
+  /** Desired-policy hash whose failed apply owns fail-close recovery. */
+  failClosedPolicyHash?: string | null;
+  /** Latest SDK policy call to settle for this sandbox generation. */
+  lastPolicySdkCompletionRevisionId?: string | null;
+  /** Policy hash paired with the latest settled SDK policy call. */
+  lastPolicySdkCompletionHash?: string | null;
 };
 
 export type FirewallReport = {
@@ -582,6 +591,11 @@ export function createDefaultMeta(
       lastIngestOutcome: null,
       lastCommittedLearningBatchId: null,
       lastSyncOutcome: null,
+      policyRevisionId: null,
+      failClosedPolicyRevisionId: null,
+      failClosedPolicyHash: null,
+      lastPolicySdkCompletionRevisionId: null,
+      lastPolicySdkCompletionHash: null,
     },
     lastTokenRefreshAt: null,
     channels: createDefaultChannelConfigs(),
@@ -920,6 +934,34 @@ export function ensureMetaShape(
       )
         ? ((raw.firewall as Record<string, unknown>).lastSyncOutcome as FirewallSyncOutcome)
         : null,
+      policyRevisionId:
+        typeof (raw.firewall as Record<string, unknown>)?.policyRevisionId
+          === "string"
+          ? (raw.firewall as Record<string, unknown>).policyRevisionId as string
+          : null,
+      failClosedPolicyRevisionId:
+        typeof (raw.firewall as Record<string, unknown>)
+          ?.failClosedPolicyRevisionId === "string"
+          ? (raw.firewall as Record<string, unknown>)
+              .failClosedPolicyRevisionId as string
+          : null,
+      failClosedPolicyHash:
+        typeof (raw.firewall as Record<string, unknown>)?.failClosedPolicyHash
+          === "string"
+          ? (raw.firewall as Record<string, unknown>).failClosedPolicyHash as string
+          : null,
+      lastPolicySdkCompletionRevisionId:
+        typeof (raw.firewall as Record<string, unknown>)
+          ?.lastPolicySdkCompletionRevisionId === "string"
+          ? (raw.firewall as Record<string, unknown>)
+              .lastPolicySdkCompletionRevisionId as string
+          : null,
+      lastPolicySdkCompletionHash:
+        typeof (raw.firewall as Record<string, unknown>)
+          ?.lastPolicySdkCompletionHash === "string"
+          ? (raw.firewall as Record<string, unknown>)
+              .lastPolicySdkCompletionHash as string
+          : null,
     },
     lastTokenRefreshAt:
       typeof raw.lastTokenRefreshAt === "number" ? raw.lastTokenRefreshAt : null,

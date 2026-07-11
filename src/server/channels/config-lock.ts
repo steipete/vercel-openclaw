@@ -1,7 +1,8 @@
 import type { ChannelName } from "@/shared/channels";
+import type { SingleMeta } from "@/shared/types";
 import { logWarn } from "@/server/log";
 import { channelConfigLockKey } from "@/server/store/keyspace";
-import { getStore } from "@/server/store/store";
+import { getInitializedMeta, getStore } from "@/server/store/store";
 
 const CHANNEL_CONFIG_LOCK_TTL_SECONDS = 90;
 const CHANNEL_CONFIG_LOCK_RETRY_MS = 50;
@@ -10,6 +11,9 @@ const CHANNEL_CONFIG_LOCK_WAIT_MS = 60_000;
 export type ChannelConfigLease = {
   readonly signal: AbortSignal;
   assertOwned(): Promise<void>;
+  mutateMeta(
+    mutator: (meta: SingleMeta) => SingleMeta | void,
+  ): Promise<SingleMeta>;
   release(): Promise<void>;
 };
 
@@ -85,6 +89,31 @@ export async function acquireChannelConfigLease(
           ? abortController.signal.reason
           : new Error(`channel_config_lock_lost:${channel}`);
       }
+    },
+    async mutateMeta(mutator) {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        if (abortController.signal.aborted) {
+          throw abortController.signal.reason;
+        }
+        const current = await getInitializedMeta();
+        const draft = structuredClone(current);
+        const next = mutator(draft) ?? draft;
+        next.version = current.version + 1;
+        next.updatedAt = Date.now();
+        const saved = await store.compareAndSetMetaIfLockHeld(
+          key,
+          heldToken,
+          current.version,
+          next,
+        );
+        if (saved) {
+          return next;
+        }
+        if (!(await renew())) {
+          throw abortController.signal.reason;
+        }
+      }
+      throw new Error(`channel_config_meta_conflict:${channel}`);
     },
     async release() {
       if (released) return;

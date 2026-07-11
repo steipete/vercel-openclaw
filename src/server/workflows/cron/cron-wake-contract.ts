@@ -5,6 +5,7 @@ export const CRON_WAKE_DEFAULT_RETRY_MS = 60_000;
 export const CRON_WAKE_MAX_DURABLE_RETRY_MS = 15 * 60_000;
 export const CRON_WAKE_MONITOR_INTERVAL_MS = 60_000;
 export const CRON_SETTLEMENT_RECOVERY_INTERVAL_MS = 15 * 60_000;
+export const CRON_SETTLEMENT_MAX_RECOVERY_ATTEMPTS = 4;
 export const CRON_WAKE_POST_DUE_SAFETY_MS = 15 * 60_000;
 
 export type CronWakeHandoffOutcome =
@@ -16,6 +17,14 @@ export type CronWakeProcessOutcome =
   | { status: "settled" }
   | { status: "completed" }
   | { status: "retry"; retryAfterMs: number };
+
+export type CronWakeSettleOutcome =
+  | { status: "settled" }
+  | {
+      status: "retry";
+      retryAfterMs: number;
+      settlementRecoveryAttempted: boolean;
+    };
 
 export function shouldCancelCronWakeHandoff(
   result: "installed" | "owned" | "occupied" | "stale",
@@ -46,4 +55,17 @@ export function getCronWakeDurableRetryMs(
     CRON_WAKE_MAX_DURABLE_RETRY_MS,
     requested * 2 ** cycle,
   );
+}
+
+export function shouldContinueCronSettlementRecovery(
+  completedAttempts: number,
+): boolean {
+  return completedAttempts < CRON_SETTLEMENT_MAX_RECOVERY_ATTEMPTS;
+}
+
+export function countCronSettlementRecoveryAttempt(
+  completedAttempts: number,
+  attempted: boolean,
+): number {
+  return attempted ? completedAttempts + 1 : completedAttempts;
 }

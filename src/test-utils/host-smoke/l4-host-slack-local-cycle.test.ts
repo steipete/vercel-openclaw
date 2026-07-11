@@ -91,7 +91,7 @@ function slackForwardRequests(urlPrefix: string | null, requests: CapturedReques
   );
 }
 
-test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after wake", async () => {
+test("L4-host Slack local cycle: durable Workflow before and after wake", async () => {
   await withHarness(async (h) => {
     _resetLogBuffer();
     h.fakeFetch.onGet(/fake\.vercel\.run/, () => gatewayReadyResponse());
@@ -135,7 +135,6 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
         threadTs: "1780000000.000100",
         text: "<@U0E2ETESTBOT> first local-cycle message",
       });
-      const firstRawBody = JSON.stringify(firstPayload);
       const firstResult = await callRoute(
         route.POST,
         buildSignedSlackRequest({
@@ -145,10 +144,9 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
       );
       assert.equal(firstResult.status, 200);
       assert.deepEqual(firstResult.json, { ok: true });
-      assert.equal(startMock.mock.callCount(), 0, "running sandbox should use Slack fast path");
-      assert.equal(slackForwardRequests(sandboxUrl, h.fakeFetch.requests()).length, 1);
-      assert.equal(nativeBodies.length, 1, "first Slack message should reach native handler");
-      assert.equal(nativeBodies[0], firstRawBody);
+      assert.equal(startMock.mock.callCount(), 1, "running sandbox should use durable Workflow");
+      assert.equal(slackForwardRequests(sandboxUrl, h.fakeFetch.requests()).length, 0);
+      assert.equal(nativeBodies.length, 0);
 
       await h.stopToSnapshot();
       const stoppedMeta = await h.getMeta();
@@ -198,9 +196,9 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
       const wakeResult = await callRoute(route.POST, wakeRequest);
       assert.equal(wakeResult.status, 200);
       assert.deepEqual(wakeResult.json, { ok: true });
-      assert.equal(startMock.mock.callCount(), 1, "stopped sandbox should start durable wake workflow");
+      assert.equal(startMock.mock.callCount(), 2, "stopped sandbox should start durable wake workflow");
 
-      const startArgs = startMock.mock.calls[0]?.arguments?.[1] as unknown[] | undefined;
+      const startArgs = startMock.mock.calls[1]?.arguments?.[1] as unknown[] | undefined;
       assert.ok(Array.isArray(startArgs), "workflow start should receive args array");
       const envelope = startArgs[0] as {
         payload?: unknown;
@@ -250,7 +248,6 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
             createSlackAdapter: () => ({}) as never,
             createTelegramAdapter: () => ({}) as never,
             createDiscordAdapter: () => ({}) as never,
-            reconcileDiscordIntegration: async () => null,
             runWithBootMessages: async () => {
               await h.driveToRunning();
               return {
@@ -368,7 +365,6 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
         threadTs: "1780000000.000300",
         text: "<@U0E2ETESTBOT> post-wake local-cycle message",
       });
-      const postWakeRawBody = JSON.stringify(postWakePayload);
       const postWakeResult = await callRoute(
         route.POST,
         buildSignedSlackRequest({
@@ -378,15 +374,12 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
       );
       assert.equal(postWakeResult.status, 200);
       assert.deepEqual(postWakeResult.json, { ok: true });
-      assert.equal(startMock.mock.callCount(), 1, "post-wake Slack message should return to fast path");
-      assert.equal(slackForwardRequests(null, h.fakeFetch.requests()).length, 2);
-      assert.equal(nativeBodies.length, 2, "post-wake Slack message should reach native handler");
-      assert.equal(nativeBodies[1], postWakeRawBody);
+      assert.equal(startMock.mock.callCount(), 3, "post-wake Slack message should remain Workflow-owned");
+      assert.equal(slackForwardRequests(null, h.fakeFetch.requests()).length, 0);
+      assert.equal(nativeBodies.length, 0);
 
-      const fastPathOkLog = getServerLogs().find((entry) => entry.message === "channels.slack_fast_path_ok");
-      assert.equal(fastPathOkLog?.data?.ackSemantics, "native-handler-accepted");
       const logs = getServerLogs().map((entry) => entry.message);
-      assert.ok(logs.includes("channels.slack_fast_path_ok"));
+      assert.ok(!logs.includes("channels.slack_fast_path_ok"));
       assert.ok(logs.includes("channels.slack_workflow_started"));
       assert.ok(logs.includes("channels.slack_wake_summary"));
       resetAfterCallbacks();

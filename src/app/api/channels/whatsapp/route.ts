@@ -19,7 +19,8 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
     );
   },
 
-  async delete() {
+  async delete({ assertMutationOwned }) {
+    await assertMutationOwned();
     await setWhatsAppChannelConfig(null);
     logInfo("channels.whatsapp_config_removed", {});
   },

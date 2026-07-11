@@ -8,6 +8,10 @@ import {
   encryptPayload,
 } from "@/server/auth/session";
 import { getInitializedMeta } from "@/server/store/store";
+import {
+  hostSuspensionOperationKey,
+  lifecycleLockKey,
+} from "@/server/store/keyspace";
 
 patchNextServerAfter();
 
@@ -163,5 +167,119 @@ test("callback persists Slack config on successful token exchange", async () => 
     );
     assert.ok(stateCleared, "state cookie is cleared");
     assert.ok(ctxCleared, "context cookie is cleared");
+  });
+});
+
+test("callback does not persist Slack config when host stop fences before lifecycle admission", async () => {
+  await withHarness(async (h) => {
+    setSlackEnv();
+    _setAiGatewayTokenOverrideForTesting("oidc-token");
+    h.fakeFetch.onPost(/slack\.com\/api\/oauth\.v2\.access/, () =>
+      Response.json({
+        ok: true,
+        access_token: "xoxb-stop-race",
+        token_type: "bot",
+      }),
+    );
+    h.fakeFetch.onPost(/slack\.com\/api\/auth\.test/, () =>
+      Response.json({
+        ok: true,
+        team: "Stop Race Team",
+        user: "openclaw",
+        bot_id: "B_STOP_RACE",
+      }),
+    );
+
+    const store = h.getStore();
+    const acquireLock = store.acquireLock.bind(store);
+    let injected = false;
+    store.acquireLock = async (key, ttlSeconds) => {
+      const token = await acquireLock(key, ttlSeconds);
+      if (key === lifecycleLockKey() && token && !injected) {
+        injected = true;
+        const now = Date.now();
+        await store.setValue(hostSuspensionOperationKey(), {
+          version: 1,
+          operationId: "operation-slack-oauth-stop-race",
+          requestId: "operation-slack-oauth-stop-race",
+          sandboxId: "sbx-slack-oauth-stop-race",
+          lifecycleAttemptId: null,
+          intent: "stop",
+          reason: "test-race",
+          phase: "stopping",
+          ingressFenced: true,
+          suspensionId: "suspension-slack-oauth-stop-race",
+          leaseExpiresAtMs: now + 60_000,
+          stopRequestDeadlineAtMs: null,
+          monitorHeartbeatAtMs: now,
+          startedAtMs: now - 1_000,
+          updatedAtMs: now,
+          stoppedAtMs: null,
+          resumedAtMs: null,
+          lastError: null,
+          lastErrorCode: null,
+          lastErrorClass: null,
+        });
+      }
+      return token;
+    };
+
+    try {
+      const stateValue = "stop-race-state";
+      const ctxEncrypted = await encryptPayload({ next: "/admin" }, "5m");
+      const response = await GET(await buildCallbackRequest(
+        { code: "stop-race-code", state: stateValue },
+        { state: stateValue, ctx: ctxEncrypted },
+      ));
+
+      assert.equal(response.status, 302);
+      assert.match(
+        response.headers.get("location") ?? "",
+        /slack_install_error=host_ingress_fenced/,
+      );
+      assert.equal((await getInitializedMeta()).channels.slack, null);
+    } finally {
+      store.acquireLock = acquireLock;
+    }
+  });
+});
+
+test("callback clears OAuth state and reports lifecycle contention without persisting config", async () => {
+  await withHarness(async (h) => {
+    setSlackEnv();
+    _setAiGatewayTokenOverrideForTesting("oidc-token");
+    h.fakeFetch.onPost(/slack\.com\/api\/oauth\.v2\.access/, () =>
+      Response.json({ ok: true, access_token: "xoxb-lock-contended" }),
+    );
+    h.fakeFetch.onPost(/slack\.com\/api\/auth\.test/, () =>
+      Response.json({
+        ok: true,
+        team: "Contended Team",
+        user: "openclaw",
+        bot_id: "B_CONTENDED",
+      }),
+    );
+
+    const store = h.getStore();
+    const token = await store.acquireLock(lifecycleLockKey(), 30);
+    assert.ok(token);
+    try {
+      const stateValue = "lock-contended-state";
+      const ctxEncrypted = await encryptPayload({ next: "/admin" }, "5m");
+      const response = await GET(await buildCallbackRequest(
+        { code: "lock-contended-code", state: stateValue },
+        { state: stateValue, ctx: ctxEncrypted },
+      ));
+
+      assert.equal(response.status, 302);
+      assert.match(
+        response.headers.get("location") ?? "",
+        /slack_install_error=lifecycle_busy/,
+      );
+      assert.equal((await getInitializedMeta()).channels.slack, null);
+      assert.equal(response.headers.getSetCookie().length, 2);
+    } finally {
+      await store.releaseLock(lifecycleLockKey(), token);
+    }
   });
 });

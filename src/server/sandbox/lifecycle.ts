@@ -7,12 +7,15 @@ import { ApiError } from "@/shared/http";
 import {
   computePolicyHash,
   FIREWALL_FAIL_CLOSED_LAST_ERROR,
-  FIREWALL_FAIL_CLOSED_REASON,
   type OperationContext,
   type RestorePhaseMetrics,
   type RestorePreparedReason,
   type SingleMeta,
 } from "@/shared/types";
+import {
+  firewallFailClosedReason,
+  parseFirewallFailClosedReason,
+} from "@/server/firewall/fail-close";
 import {
   withOperationContext,
 } from "@/server/observability/operation-context";
@@ -126,6 +129,7 @@ import {
   clearLegacyCronStateForReset,
   fenceCronProjectionStateForReset,
   normalizeResetCronProjectionGeneration,
+  readCronProjection,
 } from "@/server/cron/projection";
 import { cancelSupersededCronWake } from "@/server/cron/dispatch";
 import {
@@ -653,6 +657,15 @@ async function prepareDedicatedHostSuspension(input: {
   reason: string;
   intent?: "stop" | "reset";
 }): Promise<HostSuspensionState | null> {
+  const meta = await getInitializedMeta();
+  const admittedCapabilities =
+    meta.sandboxId === input.sandbox.sandboxId
+      && (meta.lifecycleAttemptId ?? null) === input.lifecycleAttemptId
+      && isVerifiedBundleIdentity(meta.bundleIdentity)
+      ? meta.bundleIdentity.capabilities
+      : [];
+  const capabilityRequired = admittedCapabilities.includes("admin-http-rpc-v1")
+    && admittedCapabilities.includes("gateway-suspend-v1");
   const existing = await readHostSuspensionState();
   if (
     existing?.ingressFenced
@@ -692,9 +705,10 @@ async function prepareDedicatedHostSuspension(input: {
   }
 
   try {
-    return await prepareHostSuspension(input);
+    return await prepareHostSuspension({ ...input, capabilityRequired });
   } catch (error) {
     if (!isGatewaySuspensionCapabilityUnavailable(error)) throw error;
+    if (capabilityRequired) throw error;
     await clearInactiveHostSuspension({ sandboxId: input.sandbox.sandboxId });
     return null;
   }
@@ -1001,16 +1015,31 @@ export type EnsureUsableCredentialOptions = {
 // Public API
 // ---------------------------------------------------------------------------
 
-async function recoverRollbackPendingSandbox(
+async function recoverPendingHostSuspension(
   expected: SingleMeta,
 ): Promise<SingleMeta> {
+  if (!expected.sandboxId) return expected;
   const expectedStatus = expected.status;
   if (
-    (expectedStatus !== "error" && expectedStatus !== "running")
-    || !expected.sandboxId
+    expectedStatus !== "running"
+    && expectedStatus !== "error"
+    && expectedStatus !== "setup"
   ) return expected;
   const sandboxId = expected.sandboxId;
   const lifecycleAttemptId = expected.lifecycleAttemptId ?? null;
+  const observedSuspension = await readHostSuspensionState();
+  if (
+    !observedSuspension?.ingressFenced
+    || observedSuspension.sandboxId !== sandboxId
+    || observedSuspension.lifecycleAttemptId !== lifecycleAttemptId
+    || parseFirewallFailClosedReason(observedSuspension.reason)
+    || (
+      observedSuspension.phase !== "rollback-pending"
+      && observedSuspension.phase !== "thawing"
+    )
+  ) return expected;
+  const expectedOperationId = observedSuspension.operationId;
+  const expectedSuspensionId = observedSuspension.suspensionId;
   try {
     return await withSandboxLifecycleMutationLock(async (assertOwned) => {
       const [current, suspension] = await Promise.all([
@@ -1021,7 +1050,12 @@ async function recoverRollbackPendingSandbox(
         current.status !== expectedStatus
         || current.sandboxId !== sandboxId
         || (current.lifecycleAttemptId ?? null) !== lifecycleAttemptId
-        || suspension?.phase !== "rollback-pending"
+        || suspension?.operationId !== expectedOperationId
+        || suspension.suspensionId !== expectedSuspensionId
+        || (
+          suspension?.phase !== "rollback-pending"
+          && suspension?.phase !== "thawing"
+        )
         || suspension.sandboxId !== sandboxId
         || suspension.lifecycleAttemptId !== lifecycleAttemptId
       ) return current;
@@ -1098,12 +1132,7 @@ export async function ensureSandboxRunning(options: {
   if (meta.status === "snapshotting") {
     meta = await reconcileSnapshottingStatus();
   }
-  if (
-    (meta.status === "error" || meta.status === "running")
-    && meta.sandboxId
-  ) {
-    meta = await recoverRollbackPendingSandbox(meta);
-  }
+  if (meta.sandboxId) meta = await recoverPendingHostSuspension(meta);
   // Bundle migration failures are operator-actionable terminal states. Keep
   // them stable instead of letting a waiter erase the code and start again.
   if (meta.status === "error" && terminalBundleReadyFailure(meta.lastError)) {
@@ -1536,7 +1565,12 @@ export async function resetSandbox(
   try {
     return await withLifecycleLock(async (lease) => {
       await lease.assertOwned();
-      const current = await getInitializedMeta();
+      let current = await getInitializedMeta();
+      if (current.resetCronTransition) {
+        await completeResetCronTransition(lease, current);
+        await lease.assertOwned();
+        current = await getInitializedMeta();
+      }
       if (options.expectedOperationId !== undefined) {
         const suspension = await readHostSuspensionState();
         const currentOwnsExpectedGeneration =
@@ -1717,7 +1751,9 @@ export async function resetSandbox(
           || meta.lifecycleAttemptId !== resetTarget.lifecycleAttemptId
         ) return;
         if (sandboxDestroyed) {
+          const resetCronTransition = meta.resetCronTransition;
           clearSandboxRuntimeStateForReset(meta);
+          meta.resetCronTransition = resetCronTransition;
           meta.status = "error";
         }
         meta.lastError = `Sandbox reset failed: ${message}`;
@@ -2138,6 +2174,13 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
       operatorMessage: "Config sync could not acquire the current sandbox lifecycle generation.",
     };
   }
+}
+
+/** Reuse a caller-owned lifecycle lease for an atomic config mutation + sync. */
+export async function syncGatewayConfigToSandboxUnderLifecycleLock(
+  assertOwned: () => Promise<void>,
+): Promise<LiveConfigSyncResult> {
+  return syncGatewayConfigToSandboxWithinLifecycleLock({ assertOwned });
 }
 
 async function syncGatewayConfigToSandboxWithinLifecycleLock(
@@ -3219,7 +3262,7 @@ async function touchRunningSandboxWithinLifecycleLock(
 
     if (extendByMs > 0) {
       await assertOwned();
-      await sandbox.extendTimeout(extendByMs);
+      await sandbox.extendTimeoutWithoutResume(extendByMs);
       await assertOwned();
       if (!await readOwnedRunningMeta()) return getInitializedMeta();
       logInfo("sandbox.timeout_topped_up", {
@@ -3320,7 +3363,7 @@ export async function ensureSandboxAliveThrough(deadlineMs: number): Promise<Sin
     targetRemainingMs: requiredNativeRemainingMs,
   });
   if (extendByMs > 0) {
-    await sandbox.extendTimeout(extendByMs);
+    await sandbox.extendTimeoutWithoutResume(extendByMs);
   }
   const requiredVerifiedRemainingMs =
     Math.max(0, deadlineMs - Date.now()) + SANDBOX_TIMEOUT_SAFETY_RUNWAY_MS;
@@ -3611,18 +3654,44 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
     return meta;
   }
   if (
+    (meta.status === "running" || meta.status === "error" || meta.status === "setup")
+    && meta.sandboxId
+    && hostSuspension?.ingressFenced
+    && hostSuspension.sandboxId === meta.sandboxId
+    && hostSuspension.lifecycleAttemptId === (meta.lifecycleAttemptId ?? null)
+    && !parseFirewallFailClosedReason(hostSuspension.reason)
+    && (
+      hostSuspension.phase === "rollback-pending"
+      || hostSuspension.phase === "thawing"
+    )
+  ) {
+    return recoverPendingHostSuspension(meta);
+  }
+  const hostFirewallRevision = hostSuspension
+    ? parseFirewallFailClosedReason(hostSuspension.reason)
+    : null;
+  if (
     meta.status === "error"
     && meta.lastError === FIREWALL_FAIL_CLOSED_LAST_ERROR
     && meta.sandboxId
+    && meta.firewall.failClosedPolicyRevisionId
+      === meta.firewall.lastPolicySdkCompletionRevisionId
+    && meta.firewall.failClosedPolicyHash
+      === meta.firewall.lastPolicySdkCompletionHash
     && (
       !hostSuspension
       || hostSuspension.sandboxId !== meta.sandboxId
       || hostSuspension.lifecycleAttemptId !== (meta.lifecycleAttemptId ?? null)
-      || hostSuspension.reason !== FIREWALL_FAIL_CLOSED_REASON
+      || hostFirewallRevision?.revisionId
+        !== meta.firewall.failClosedPolicyRevisionId
+      || hostFirewallRevision?.policyHash !== meta.firewall.failClosedPolicyHash
     )
   ) {
     const sandboxId = meta.sandboxId;
     const lifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+    const failClosedPolicyRevisionId =
+      meta.firewall.failClosedPolicyRevisionId as string;
+    const failClosedPolicyHash = meta.firewall.failClosedPolicyHash as string;
     return withLifecycleLock(async (lease) => {
       await lease.assertOwned();
       const current = await getInitializedMeta();
@@ -3631,13 +3700,23 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
         || current.lastError !== FIREWALL_FAIL_CLOSED_LAST_ERROR
         || current.sandboxId !== sandboxId
         || (current.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+        || current.firewall.lastPolicySdkCompletionRevisionId
+          !== failClosedPolicyRevisionId
+        || current.firewall.lastPolicySdkCompletionHash !== failClosedPolicyHash
+        || current.firewall.failClosedPolicyRevisionId
+          !== failClosedPolicyRevisionId
+        || current.firewall.failClosedPolicyHash
+          !== failClosedPolicyHash
       ) return current;
       const latest = await readHostSuspensionState();
       if (latest?.ingressFenced) return current;
       await enqueueHostStopOperation({
         sandboxId,
         lifecycleAttemptId,
-        reason: FIREWALL_FAIL_CLOSED_REASON,
+        reason: firewallFailClosedReason({
+          revisionId: failClosedPolicyRevisionId,
+          policyHash: failClosedPolicyHash,
+        }),
         assertOwned: () => lease.assertOwned(),
       });
       return current;
@@ -3648,8 +3727,13 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
     && hostSuspension?.ingressFenced
     && hostSuspension.sandboxId === meta.sandboxId
     && hostSuspension.lifecycleAttemptId === (meta.lifecycleAttemptId ?? null)
-    && hostSuspension.reason === FIREWALL_FAIL_CLOSED_REASON
-    && ["stop-requesting", "stopping"].includes(hostSuspension.phase)
+    && hostFirewallRevision
+    && meta.firewall.lastPolicySdkCompletionRevisionId
+      === hostFirewallRevision.revisionId
+    && meta.firewall.lastPolicySdkCompletionHash === hostFirewallRevision.policyHash
+    && ["stop-requesting", "stopping", "rollback-pending"].includes(
+      hostSuspension.phase,
+    )
   ) {
     const firewallSandboxId = meta.sandboxId;
     const firewallLifecycleAttemptId = meta.lifecycleAttemptId ?? null;
@@ -3657,12 +3741,22 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
       await lease.assertOwned();
       const current = await getInitializedMeta();
       const currentHostSuspension = await readHostSuspensionState();
+      const currentHostFirewallRevision = currentHostSuspension
+        ? parseFirewallFailClosedReason(currentHostSuspension.reason)
+        : null;
       if (
         current.sandboxId !== firewallSandboxId
         || (current.lifecycleAttemptId ?? null)
           !== firewallLifecycleAttemptId
         || currentHostSuspension?.operationId !== hostSuspension.operationId
-        || currentHostSuspension.reason !== FIREWALL_FAIL_CLOSED_REASON
+        || currentHostFirewallRevision?.revisionId
+          !== hostFirewallRevision.revisionId
+        || currentHostFirewallRevision.policyHash
+          !== hostFirewallRevision.policyHash
+        || current.firewall.lastPolicySdkCompletionRevisionId
+          !== hostFirewallRevision.revisionId
+        || current.firewall.lastPolicySdkCompletionHash
+          !== hostFirewallRevision.policyHash
         || !currentHostSuspension.ingressFenced
       ) return current;
       let sandbox: SandboxHandle;
@@ -3720,34 +3814,6 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
     }
     const sandboxId = meta.sandboxId;
     const runningLifecycleAttemptId = meta.lifecycleAttemptId ?? null;
-    if (hostSuspension.phase === "rollback-pending") {
-      let sandbox: SandboxHandle;
-      try {
-        sandbox = await getSandboxController().get({ sandboxId, resume: false });
-      } catch (error) {
-        if (!isSandboxGoneError(error)) return meta;
-        return markSandboxUnavailable(
-          "Sandbox disappeared while Gateway suspension rollback was pending.",
-          sandboxId,
-          runningLifecycleAttemptId,
-        );
-      }
-      if (sandbox.status !== "running") return meta;
-      const thawed = await thawHostSuspensionIfNeeded({
-        sandbox,
-        lifecycleAttemptId: runningLifecycleAttemptId,
-      });
-      if (!thawed) return meta;
-      return mutateMeta((next) => {
-        if (
-          next.sandboxId !== sandboxId
-          || next.status !== "running"
-          || (next.lifecycleAttemptId ?? null) !== runningLifecycleAttemptId
-        ) return;
-        next.lastError = null;
-        next.lastGatewayProbeReady = false;
-      });
-    }
     const preStopPhase = hostSuspension.phase === "fencing"
       || hostSuspension.phase === "preparing"
       || hostSuspension.phase === "prepared";
@@ -5152,20 +5218,44 @@ async function createAndBootstrapSandbox(
 
 async function createAndBootstrapSandboxWithinLifecycleLock(
   origin: string,
-  options?: {
+  options: {
     lifecycleGuard?: SandboxLifecycleGuard;
     op?: OperationContext;
-    lease?: AutoRenewedLockLease;
+    lease: AutoRenewedLockLease;
   },
 ): Promise<SingleMeta> {
-  await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-  const current = await getInitializedMeta();
-  await normalizeResetCronProjectionGeneration({
-    gatewayGeneration: createHash("sha256")
-      .update(current.gatewayToken)
-      .digest("hex")
-      .slice(0, 32),
+  await assertLifecycleGuardCurrent(options.lifecycleGuard);
+  await options.lease.assertOwned();
+  let current = await getInitializedMeta();
+  if (current.resetCronTransition) {
+    await completeResetCronTransition(options.lease, current);
+    await options.lease.assertOwned();
+    current = await getInitializedMeta();
+  }
+  const expectedGatewayToken = current.gatewayToken;
+  const expectedProjectionGeneration =
+    (await readCronProjection())?.gatewayGeneration ?? null;
+  await options.lease.assertOwned();
+  const beforeNormalize = await getInitializedMeta();
+  if (beforeNormalize.gatewayToken !== expectedGatewayToken) {
+    throw new LifecycleLockOwnershipLostError();
+  }
+  const gatewayGeneration = createHash("sha256")
+    .update(expectedGatewayToken)
+    .digest("hex")
+    .slice(0, 32);
+  const normalized = await normalizeResetCronProjectionGeneration({
+    gatewayGeneration,
+    expectedGatewayGeneration: expectedProjectionGeneration,
   });
+  if (normalized && normalized.gatewayGeneration !== gatewayGeneration) {
+    throw new LifecycleLockOwnershipLostError();
+  }
+  await options.lease.assertOwned();
+  const afterNormalize = await getInitializedMeta();
+  if (afterNormalize.gatewayToken !== expectedGatewayToken) {
+    throw new LifecycleLockOwnershipLostError();
+  }
   if (current.status === "running" && current.sandboxId) {
     return current;
   }
@@ -6231,9 +6321,11 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       );
       let retiredGatewaySuspension = false;
       const restoreResult = await (async () => {
-        if (!replacesSuspendedGateway || !replacementSuspension) {
-          return runFastRestore("all");
-        }
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+        await assertSandboxGenerationOwnership(
+          initialSandbox,
+          bundleMode && sandboxIsBundleCandidate,
+        );
         const killResult = await runFastRestore("kill");
         if (killResult.exitCode !== 0) {
           const output = await killResult.output("both");
@@ -6243,18 +6335,20 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
             output,
           });
         }
-        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-        await assertSandboxGenerationOwnership(
-          initialSandbox,
-          bundleMode && sandboxIsBundleCandidate,
-        );
-        retiredGatewaySuspension = await clearHostSuspensionAfterGatewayReplacement({
-          expected: replacementSuspension,
-          sandboxId: initialSandbox.sandboxId,
-          lifecycleAttemptId: attemptId,
-        });
-        if (!retiredGatewaySuspension) {
-          throw new LifecycleLockOwnershipLostError();
+        if (replacesSuspendedGateway && replacementSuspension) {
+          await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+          await assertSandboxGenerationOwnership(
+            initialSandbox,
+            bundleMode && sandboxIsBundleCandidate,
+          );
+          retiredGatewaySuspension = await clearHostSuspensionAfterGatewayReplacement({
+            expected: replacementSuspension,
+            sandboxId: initialSandbox.sandboxId,
+            lifecycleAttemptId: attemptId,
+          });
+          if (!retiredGatewaySuspension) {
+            throw new LifecycleLockOwnershipLostError();
+          }
         }
         await options?.lease?.assertOwned();
         await assertLifecycleGuardCurrent(options?.lifecycleGuard);
@@ -6463,7 +6557,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       telegramWebhookSecret: latest.channels.telegram?.webhookSecret,
       slackCredentials: slackCfg ?? undefined,
       progress,
-      beforeGatewayStart: async () => {
+      launchGateway: async (launch) => {
         await assertLifecycleGuardCurrent(options?.lifecycleGuard);
         await assertSandboxGenerationOwnership(
           initialSandbox,
@@ -6571,10 +6665,12 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         }
         firewallCompletedAt = Date.now();
         // No Gateway process may be launched after lifecycle ownership moves.
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
         await assertSandboxGenerationOwnership(
           initialSandbox,
           bundleMode && sandboxIsBundleCandidate,
         );
+        return launch();
       },
     });
     await assertLifecycleGuardCurrent(options?.lifecycleGuard);
@@ -7036,14 +7132,7 @@ async function destroyCurrentSandboxWithoutSnapshot(
           });
           cleanupOperationId = suspension?.operationId ?? cleanupOperationId;
         } catch (error) {
-          if (isGatewaySuspensionCapabilityUnavailable(error)) {
-            await clearInactiveHostSuspension({ sandboxId: sandbox.sandboxId });
-            logWarn("sandbox.host_suspension.capability_unavailable", ctx({
-              sandboxId: meta.sandboxId,
-              code: error.code,
-              action: "legacy-platform-delete",
-            }));
-          } else if (!(error instanceof HostSuspensionStateCorruptError)) {
+          if (!(error instanceof HostSuspensionStateCorruptError)) {
             throw error;
           } else {
             // Destructive reset is the sole recovery owner for corrupt durable
@@ -7268,27 +7357,56 @@ async function clearResetCronState(
     ) throw new LifecycleLockOwnershipLostError();
   }
   await assertCurrent(nextGatewayValue);
+  await completeResetCronTransition(options.lease, {
+    ...current,
+    gatewayToken: nextGatewayValue,
+    resetCronTransition: transition,
+  });
+  logInfo("sandbox.reset.cron_state_fenced", ctx());
+}
+
+async function completeResetCronTransition(
+  lease: AutoRenewedLockLease,
+  expected: SingleMeta,
+): Promise<void> {
+  const transition = expected.resetCronTransition;
+  if (!transition) return;
+  const assertCurrent = async (): Promise<void> => {
+    await lease.assertOwned();
+    const current = await getInitializedMeta();
+    if (
+      current.gatewayToken !== expected.gatewayToken
+      || current.resetCronTransition?.sandboxId !== transition.sandboxId
+      || current.resetCronTransition?.lifecycleAttemptId
+        !== transition.lifecycleAttemptId
+      || current.resetCronTransition?.previousGatewayGeneration
+        !== transition.previousGatewayGeneration
+      || current.resetCronTransition?.nextGatewayGeneration
+        !== transition.nextGatewayGeneration
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+  };
+
+  await assertCurrent();
   const fenced = await fenceCronProjectionStateForReset({
     gatewayGeneration: transition.nextGatewayGeneration,
     expectedGatewayGeneration: transition.previousGatewayGeneration,
   });
-  await assertCurrent(nextGatewayValue);
+  await assertCurrent();
   const legacyCleared = await clearLegacyCronStateForReset({
     gatewayGeneration: fenced.record.gatewayGeneration!,
     projectionRevision: fenced.record.projectionRevision,
   });
-  if (!legacyCleared) {
-    throw new LifecycleLockOwnershipLostError();
-  }
-  await assertCurrent(nextGatewayValue);
+  if (!legacyCleared) throw new LifecycleLockOwnershipLostError();
+  await assertCurrent();
   await cancelSupersededCronWake(fenced.supersededWorkflowRunId);
-  await assertCurrent(nextGatewayValue);
+  await assertCurrent();
   const completed = await mutateMeta((meta) => {
     if (
-      meta.sandboxId !== options.expected.sandboxId
-      || (meta.lifecycleAttemptId ?? null)
-        !== (options.expected.lifecycleAttemptId ?? null)
-      || meta.gatewayToken !== nextGatewayValue
+      meta.gatewayToken !== expected.gatewayToken
+      || meta.resetCronTransition?.previousGatewayGeneration
+        !== transition.previousGatewayGeneration
       || meta.resetCronTransition?.nextGatewayGeneration
         !== transition.nextGatewayGeneration
     ) return;
@@ -7297,7 +7415,6 @@ async function clearResetCronState(
   if (completed.resetCronTransition !== null) {
     throw new LifecycleLockOwnershipLostError();
   }
-  logInfo("sandbox.reset.cron_state_fenced", ctx());
 }
 
 function clearSandboxRuntimeStateForReset(meta: SingleMeta): void {

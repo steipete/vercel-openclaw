@@ -194,7 +194,7 @@ test("ChannelsPanel renders hosted support boundary", () => {
   assert.ok(html.includes('data-feature-id="voice-canvas"'));
   assert.ok(html.includes('data-feature-id="plugins-skills-bundled"'));
   assert.ok(html.includes('data-hosted-status="supported"'));
-  assert.ok(html.includes('data-hosted-status="experimental"'));
+  assert.ok(html.includes('data-hosted-status="not-supported"'));
   assert.ok(html.includes('data-hosted-status="upstream-only"'));
   assert.ok(html.includes('data-hosted-status="bundled-only"'));
 });

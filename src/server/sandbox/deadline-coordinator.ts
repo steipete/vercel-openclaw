@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 
 import { logInfo, logWarn } from "@/server/log";
 import { getSandboxController } from "@/server/sandbox/controller";
-import { HostSuspensionBusyError } from "@/server/sandbox/host-suspension";
+import {
+  HostSuspensionBusyError,
+  readHostSuspensionState,
+  type HostSuspensionState,
+} from "@/server/sandbox/host-suspension";
 import {
   sandboxDeadlineKey,
   sandboxDeadlineLockKey,
@@ -63,6 +67,10 @@ export type DeadlineCoordinatorDeps = {
     state: SandboxDeadlineState,
   ) => Promise<boolean>;
   createMigrated: (state: SandboxDeadlineState) => Promise<boolean>;
+  retireLegacy: (
+    expected: SandboxDeadlineState,
+    state: SandboxDeadlineState,
+  ) => Promise<boolean>;
   clear: () => Promise<void>;
   getMeta: () => Promise<SingleMeta>;
   recordActivity: (input: {
@@ -98,6 +106,18 @@ const defaultDeps: DeadlineCoordinatorDeps = {
     null,
     state,
   ),
+  retireLegacy: async (expected, state) => {
+    const key = sandboxDeadlineKey();
+    const current = await getStore().getValueState<unknown>(key);
+    if (
+      current.status !== "present"
+      || !current.value
+      || typeof current.value !== "object"
+      || (current.value as { generationId?: unknown }).generationId
+        !== expected.generationId
+    ) return false;
+    return getStore().compareAndSetValueToken(key, current.token, state);
+  },
   clear: () => getStore().deleteValue(sandboxDeadlineV2Key()),
   getMeta: getInitializedMeta,
   recordActivity: (input) => mutateMeta((meta) => {
@@ -207,6 +227,7 @@ function prepareDeadlineWorkflowStart(
 ): { state: SandboxDeadlineState; plan: Extract<WorkflowStartPlan, { kind: "start" }> } {
   const startedAtMs = deps.now();
   const workflowAttemptId = deps.randomId();
+  const sealedStop = state.lastOutcome === "stopping";
   return {
     state: {
       ...state,
@@ -216,7 +237,7 @@ function prepareDeadlineWorkflowStart(
       workflowStartedAtMs: startedAtMs,
       workflowScheduledDeadlineAtMs: state.deadlineAtMs,
       updatedAtMs: startedAtMs,
-      lastOutcome: "armed",
+      lastOutcome: sealedStop ? "stopping" : "armed",
       lastErrorCode: null,
       lastErrorClass: null,
     },
@@ -269,13 +290,31 @@ async function migrateLegacyDeadlineState(
     );
   }
 
-  // Rotate the generation so a Workflow pinned to the v1 deployment exits
-  // instead of publishing the unrevisioned record again after migration.
+  const migratedGenerationId = deps.randomId();
+  const legacyFence = {
+    ...legacy,
+    generationId: migratedGenerationId,
+    updatedAtMs: deps.now(),
+    lastAttemptAtMs: null,
+    lastOutcome: "stopping",
+    lastErrorCode: "DEADLINE_V1_RETIRED",
+    lastErrorClass: null,
+  } as SandboxDeadlineState;
+  if (!await deps.retireLegacy(legacy, legacyFence)) {
+    throw new ApiError(
+      503,
+      "SANDBOX_DEADLINE_TRANSITION",
+      "Sandbox deadline v1 owner changed during retirement; retry this request.",
+    );
+  }
+
+  // The v1-understood stopping fence makes deployment-pinned v1 Workflows
+  // exit on generation mismatch and prevents old request handlers reopening it.
   const migrated: SandboxDeadlineState = {
     ...legacy,
     version: 2,
     revision: 1,
-    generationId: deps.randomId(),
+    generationId: migratedGenerationId,
     workflowRunId: null,
     workflowAttemptId: null,
     workflowStartLeaseExpiresAtMs: null,
@@ -367,7 +406,7 @@ async function attachDeadlineWorkflowRun(
       workflowStartedAtMs: deps.now(),
       workflowScheduledDeadlineAtMs: current.deadlineAtMs,
       updatedAtMs: deps.now(),
-      lastOutcome: "armed",
+      lastOutcome: current.lastOutcome === "stopping" ? "stopping" : "armed",
       lastErrorCode: null,
       lastErrorClass: null,
     };
@@ -402,7 +441,7 @@ async function releaseFailedDeadlineWorkflowStart(
       workflowStartLeaseExpiresAtMs: null,
       workflowStartedAtMs: null,
       updatedAtMs: deps.now(),
-      lastOutcome: "error",
+      lastOutcome: current.lastOutcome === "stopping" ? "stopping" : "error",
       lastErrorCode: identity.code,
       lastErrorClass: identity.className,
     };
@@ -500,7 +539,18 @@ export async function armSandboxDeadline(
     ) {
       return null;
     }
-    if (options.activityAtMs !== undefined) {
+    const existing = await migrateLegacyDeadlineState(
+      await deps.read(),
+      token,
+      deps,
+    );
+    const current = sameGeneration(existing, latestMeta) ? existing : null;
+    const sealedStop = current?.lastOutcome === "stopping";
+    // The lifecycle owner claimed this exact expired generation while holding
+    // the lifecycle lock. Activity may not reopen it behind the admission
+    // fence. Anti-entropy may only repair its existing stop Workflow owner.
+    if (sealedStop && options.forceWorkflowStart !== true) return null;
+    if (!sealedStop && options.activityAtMs !== undefined) {
       latestMeta = await deps.recordActivity({
         sandboxId: meta.sandboxId,
         lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
@@ -521,16 +571,6 @@ export async function armSandboxDeadline(
       ? latestMeta.lastAccessedAt
       : now;
     const desiredDeadlineAtMs = committedActivityAtMs + desiredIdleMs;
-    const existing = await migrateLegacyDeadlineState(
-      await deps.read(),
-      token,
-      deps,
-    );
-    const current = sameGeneration(existing, latestMeta) ? existing : null;
-    // The lifecycle owner claimed this exact expired generation while holding
-    // the lifecycle lock. Activity may not reopen it behind the admission
-    // fence; the stop outcome will clear or re-arm the deadline.
-    if (current?.lastOutcome === "stopping") return null;
     const existingNativeStopDeadlineAtMs = current?.nativeStopDeadlineAtMs ?? null;
     const nativeStopDeadlineAtMs = options.nativeTimeoutRemainingMs === undefined
       ? existingNativeStopDeadlineAtMs
@@ -548,12 +588,18 @@ export async function armSandboxDeadline(
     let state: SandboxDeadlineState = current
       ? {
           ...current,
-          deadlineAtMs: options.refreshDeadline === false
-            ? Math.min(current.deadlineAtMs, refreshedDeadlineAtMs)
-            : refreshedDeadlineAtMs,
-          nativeStopDeadlineAtMs,
-          desiredIdleMs,
-          platformTimeoutMs,
+          deadlineAtMs: sealedStop
+            ? current.deadlineAtMs
+            : options.refreshDeadline === false
+              ? Math.min(current.deadlineAtMs, refreshedDeadlineAtMs)
+              : refreshedDeadlineAtMs,
+          nativeStopDeadlineAtMs: sealedStop
+            ? current.nativeStopDeadlineAtMs
+            : nativeStopDeadlineAtMs,
+          desiredIdleMs: sealedStop ? current.desiredIdleMs : desiredIdleMs,
+          platformTimeoutMs: sealedStop
+            ? current.platformTimeoutMs
+            : platformTimeoutMs,
           workflowRunId: current.workflowRunId ?? null,
           workflowAttemptId: current.workflowAttemptId ?? null,
           workflowStartLeaseExpiresAtMs:
@@ -562,9 +608,9 @@ export async function armSandboxDeadline(
             ? current.workflowScheduledDeadlineAtMs ?? current.deadlineAtMs
             : current.workflowScheduledDeadlineAtMs ?? null,
           updatedAtMs: now,
-          lastOutcome: "armed",
-          lastErrorCode: null,
-          lastErrorClass: null,
+          lastOutcome: sealedStop ? "stopping" : "armed",
+          lastErrorCode: sealedStop ? current.lastErrorCode : null,
+          lastErrorClass: sealedStop ? current.lastErrorClass : null,
         }
       : {
           version: 2,
@@ -587,13 +633,14 @@ export async function armSandboxDeadline(
           lastErrorCode: null,
           lastErrorClass: null,
         };
-    if (options.refreshDeadline !== false) {
+    if (!sealedStop && options.refreshDeadline !== false) {
       state.lastAttemptAtMs = null;
     }
     const deadlineMovedEarlier = state.workflowRunId !== null
       && priorScheduledDeadlineAtMs !== null
       && state.deadlineAtMs < priorScheduledDeadlineAtMs;
-    const pendingStartIsLive = state.workflowRunId === null
+    const pendingStartIsLive = !sealedStop
+      && state.workflowRunId === null
       && state.workflowAttemptId !== null
       && (state.workflowStartLeaseExpiresAtMs ?? 0) > now;
     if (state.workflowRunId === null && !pendingStartIsLive) {
@@ -836,6 +883,7 @@ export type DeadlineStepDeps = {
   renewLock: (token: string) => Promise<boolean>;
   releaseLock: (token: string) => Promise<void>;
   getMeta: () => Promise<SingleMeta>;
+  getHostSuspension: () => Promise<HostSuspensionState | null>;
   getSandbox: (sandboxId: string) => ReturnType<ReturnType<typeof getSandboxController>["get"]>;
   reconcile: (input: {
     sandboxId: string;
@@ -866,6 +914,7 @@ const defaultStepDeps: DeadlineStepDeps = {
   ),
   releaseLock: defaultDeps.releaseLock,
   getMeta: getInitializedMeta,
+  getHostSuspension: readHostSuspensionState,
   getSandbox: (sandboxId) => getSandboxController().get({ sandboxId, resume: false }),
   reconcile: (input) => mutateMeta((meta) => {
     if (
@@ -969,6 +1018,23 @@ function deadlineStepLeaseLossResult(
     status: "sleep",
     deadlineAtMs: Math.max(current.deadlineAtMs, now + 1_000),
   };
+}
+
+function hostSuspensionFencesDeadlineGeneration(
+  suspension: HostSuspensionState | null,
+  state: SandboxDeadlineState,
+): boolean {
+  const activePhase = suspension?.phase !== "running"
+    && suspension?.phase !== "failed";
+  return suspension?.sandboxId === state.sandboxId
+    && suspension.lifecycleAttemptId === state.lifecycleAttemptId
+    && (suspension.ingressFenced || activePhase);
+}
+
+function deadlinePlatformTransitional(message: string): Error {
+  return Object.assign(new Error(message), {
+    code: "DEADLINE_PLATFORM_TRANSITIONAL",
+  });
 }
 
 async function reconcileDeadlinePlatformDeparture(
@@ -1154,11 +1220,60 @@ export async function processSandboxDeadlineStep(
       currentRemainingMs: remainingMs,
       targetRemainingMs: stopRunwayMs,
     });
-    if (extendByMs > 0) await sandbox.extendTimeout(extendByMs);
+    if (extendByMs > 0) {
+      const [extensionState, extensionMeta, suspension] = await Promise.all([
+        deps.read(),
+        deps.getMeta(),
+        deps.getHostSuspension(),
+      ]);
+      if (
+        !extensionState
+        || extensionState.generationId !== generationId
+        || extensionState.workflowAttemptId !== workflowAttemptId
+        || extensionState.revision !== claimedState.revision
+        || extensionState.lastAttemptAtMs !== claimedAtMs
+      ) {
+        return deadlineStepLeaseLossResult(
+          extensionState,
+          generationId,
+          workflowAttemptId,
+          deps.now(),
+        );
+      }
+      if (
+        extensionMeta.status !== "running"
+        || extensionMeta.sandboxId !== extensionState.sandboxId
+        || (extensionMeta.lifecycleAttemptId ?? null)
+          !== extensionState.lifecycleAttemptId
+      ) {
+        return { status: "done", reason: `sandbox-${extensionMeta.status}` };
+      }
+      if (hostSuspensionFencesDeadlineGeneration(suspension, extensionState)) {
+        throw deadlinePlatformTransitional(
+          `Host suspension is ${suspension?.phase ?? "unknown"}.`,
+        );
+      }
+      if (!await deps.renewLock(token)) throw new DeadlineStepLeaseLostError();
+      if (sandbox.status !== "running") {
+        throw deadlinePlatformTransitional(
+          `Platform stop remains ${sandbox.status}.`,
+        );
+      }
+      // Sandbox.extendTimeout uses withResume and can revive a concurrently
+      // stopping session. Bind the update to this captured session instead.
+      if (!sandbox.extendTimeoutWithoutResume) {
+        throw new Error("Captured-session timeout extension is unavailable.");
+      }
+      await sandbox.extendTimeoutWithoutResume(extendByMs);
+    }
 
     // Activity refresh uses this same lock. Re-read after the platform call
     // so only the still-current expired generation may cross into stop.
-    const [latest, latestMeta] = await Promise.all([deps.read(), deps.getMeta()]);
+    const [latest, latestMeta, latestSuspension] = await Promise.all([
+      deps.read(),
+      deps.getMeta(),
+      deps.getHostSuspension(),
+    ]);
     if (
       !latest
       || latest.generationId !== generationId
@@ -1172,6 +1287,11 @@ export async function processSandboxDeadlineStep(
       || (latestMeta.lifecycleAttemptId ?? null) !== latest.lifecycleAttemptId
     ) {
       return { status: "done", reason: `sandbox-${latestMeta.status}` };
+    }
+    if (hostSuspensionFencesDeadlineGeneration(latestSuspension, latest)) {
+      throw deadlinePlatformTransitional(
+        `Host suspension is ${latestSuspension?.phase ?? "unknown"}.`,
+      );
     }
     const activityDeadlineAtMs = typeof latestMeta.lastAccessedAt === "number"
       ? latestMeta.lastAccessedAt + latest.desiredIdleMs
@@ -1286,13 +1406,18 @@ export async function processSandboxDeadlineStep(
       }
       const retryAtMs = deps.now();
       const retryDeadlineAtMs = retryAtMs + retryAfterMs;
+      const sealedStop = retryCurrent.lastOutcome === "stopping";
       const retryState: SandboxDeadlineState = {
         ...retryCurrent,
         deadlineAtMs: retryDeadlineAtMs,
         workflowScheduledDeadlineAtMs: retryDeadlineAtMs,
         updatedAtMs: retryAtMs,
         lastAttemptAtMs: retryAtMs,
-        lastOutcome: error instanceof HostSuspensionBusyError ? "busy" : "error",
+        lastOutcome: sealedStop
+          ? "stopping"
+          : error instanceof HostSuspensionBusyError
+            ? "busy"
+            : "error",
         lastErrorCode: identity.code,
         lastErrorClass: identity.className,
       };

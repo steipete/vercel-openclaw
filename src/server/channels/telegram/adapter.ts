@@ -72,6 +72,8 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 export type TelegramWebhookSecretMatch = {
   generation: "current" | "previous";
+  botId: string | null;
+  deliveryNamespace: string | null;
   botUsername: string;
   configuredAt: number;
 };
@@ -84,6 +86,8 @@ export function matchTelegramWebhookSecret(
   if (timingSafeEqual(secretHeader, config.webhookSecret)) {
     return {
       generation: "current",
+      botId: config.botId ?? null,
+      deliveryNamespace: config.deliveryNamespace ?? null,
       botUsername: config.botUsername,
       configuredAt: config.configuredAt,
     };
@@ -93,12 +97,18 @@ export function matchTelegramWebhookSecret(
     config.previousWebhookSecret &&
       typeof config.previousSecretExpiresAt === "number" &&
       config.previousSecretExpiresAt > nowMs &&
+      typeof config.botId === "string" &&
+      typeof config.previousBotId === "string" &&
+      config.previousBotId === config.botId &&
       typeof config.previousBotUsername === "string" &&
       typeof config.previousConfiguredAt === "number" &&
       timingSafeEqual(secretHeader, config.previousWebhookSecret)
   ) {
     return {
       generation: "previous",
+      botId: config.previousBotId,
+      deliveryNamespace:
+        config.previousDeliveryNamespace ?? config.deliveryNamespace ?? null,
       botUsername: config.previousBotUsername,
       configuredAt: config.previousConfiguredAt,
     };

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  countCronSettlementRecoveryAttempt,
+  CRON_SETTLEMENT_MAX_RECOVERY_ATTEMPTS,
   CRON_WAKE_POST_DUE_SAFETY_MS,
   getCronWakeCredentialRetry,
   getCronWakeDurableRetryMs,
@@ -9,6 +11,7 @@ import {
   isCronDispatchRepairNeededStep,
   processCronWakeStep,
   settleCronWakeStep,
+  shouldContinueCronSettlementRecovery,
   shouldCancelCronWakeHandoff,
 } from "@/server/workflows/cron/cron-wake-workflow";
 
@@ -21,6 +24,21 @@ test("cron wake step retry budget reaches the explicit terminal attempt", () => 
 
 test("cron wake covers the default command timeout after the due time", () => {
   assert.equal(CRON_WAKE_POST_DUE_SAFETY_MS, 15 * 60_000);
+  assert.equal(CRON_SETTLEMENT_MAX_RECOVERY_ATTEMPTS, 4);
+  assert.equal(shouldContinueCronSettlementRecovery(3), true);
+  assert.equal(shouldContinueCronSettlementRecovery(4), false);
+  let failedSettlementAttempts = 0;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    failedSettlementAttempts = countCronSettlementRecoveryAttempt(
+      failedSettlementAttempts,
+      true,
+    );
+  }
+  assert.equal(failedSettlementAttempts, 4);
+  assert.equal(
+    shouldContinueCronSettlementRecovery(failedSettlementAttempts),
+    false,
+  );
 });
 
 test("cron wake keeps terminal recovery durable with bounded backoff", () => {

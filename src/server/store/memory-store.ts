@@ -85,6 +85,20 @@ export class MemoryStore {
     return true;
   }
 
+  async compareAndSetMetaIfLockHeld(
+    lockKey: string,
+    token: string,
+    expectedVersion: number,
+    next: SingleMeta,
+  ): Promise<boolean> {
+    this.gc();
+    const lock = this.locks.get(lockKey);
+    if (!lock || lock.token !== token) {
+      return false;
+    }
+    return this.compareAndSetMeta(expectedVersion, next);
+  }
+
   async getValue<T>(key: string): Promise<T | null> {
     this.gc();
     const entry = this.values.get(key);

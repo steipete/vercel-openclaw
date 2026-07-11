@@ -28,6 +28,12 @@ export type Store = {
   setMeta(meta: SingleMeta): Promise<void>;
   createMetaIfAbsent(meta: SingleMeta): Promise<boolean>;
   compareAndSetMeta(expectedVersion: number, next: SingleMeta): Promise<boolean>;
+  compareAndSetMetaIfLockHeld(
+    lockKey: string,
+    token: string,
+    expectedVersion: number,
+    next: SingleMeta,
+  ): Promise<boolean>;
   getValue<T>(key: string): Promise<T | null>;
   getValueState<T>(key: string): Promise<
     | { status: "absent" }

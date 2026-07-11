@@ -89,6 +89,7 @@ function installSucceedingSandboxController(
           return { snapshotId: "snap-123" };
         },
         async extendTimeout() {},
+        async extendTimeoutWithoutResume() {},
         async updateNetworkPolicy(policy: NetworkPolicy) {
           await assertBeforeApply(policy);
           appliedPolicies.push(policy);

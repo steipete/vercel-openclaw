@@ -44,7 +44,6 @@ import {
 } from "@/server/sandbox/restore-oracle";
 import { getInitializedMeta, mutateMeta } from "@/server/store/store";
 import {
-  FIREWALL_FAIL_CLOSED_LAST_ERROR,
   type OperationContext,
   type SingleMeta,
 } from "@/shared/types";
@@ -68,7 +67,7 @@ export type RunSandboxWatchdogOptions = {
 export type WatchdogDeps = {
   buildContract: (options: { request?: Request }) => Promise<DeploymentContract>;
   getMeta: () => Promise<SingleMeta>;
-  reconcileFailClosed?: () => Promise<SingleMeta>;
+  reconcileLifecycleState?: () => Promise<SingleMeta>;
   probe: () => Promise<ProbeResult>;
   reconcileStale: () => Promise<SingleMeta>;
   reconcile: (options: {
@@ -141,7 +140,7 @@ async function getCronWakeWorkflowStatus(
 const defaultDeps: WatchdogDeps = {
   buildContract: buildDeploymentContract,
   getMeta: getInitializedMeta,
-  reconcileFailClosed: reconcileSnapshottingStatus,
+  reconcileLifecycleState: reconcileSnapshottingStatus,
   probe: () => probeGatewayReady({ resume: false, thaw: false }),
   reconcileStale: reconcileStaleRunningStatus,
   reconcile: reconcileSandboxHealth,
@@ -264,15 +263,74 @@ export async function runSandboxWatchdog(
   let deadlineOwnerFailed = false;
   let cronProjectionEnabled = false;
 
+  const runCronAntiEntropy = async (): Promise<void> => {
+    // Independent repair lane: unrelated contract, sandbox, deadline, or
+    // restore failures must not suppress cron ownership reconciliation.
+    const cronCheckStartedAt = deps.now();
+    try {
+      const cron = await deps.reconcileCronProjection({
+        origin: getPublicOrigin(options.request),
+        enabled: cronProjectionEnabled,
+        bootstrapFromLegacyJobs:
+          (meta.status === "stopped" || meta.status === "error") &&
+          Boolean(meta.sandboxId || meta.snapshotId),
+      });
+      const diagnostics = await deps.getCronProjectionDiagnostics();
+      if (
+        cron.status === "failed" ||
+        cron.status === "starting" ||
+        cron.status === "settlement-blocked"
+      ) {
+        lastError = cron.status === "starting"
+          ? "Cron projection workflow start lease has not settled."
+          : cron.status === "settlement-blocked"
+            ? "Cron settlement recovery budget is exhausted; waiting for a new authoritative projection."
+            : "Cron projection workflow could not be started.";
+        addCheck(
+          WATCHDOG_CRON_WAKE_CHECK_ID,
+          "fail",
+          cronCheckStartedAt,
+          lastError,
+          diagnostics ?? undefined,
+        );
+        status = "failed";
+        return;
+      }
+      const repaired = cron.status === "started" && cron.repaired;
+      triggeredRepair ||= repaired;
+      if (repaired && status !== "failed") status = "repairing";
+      addCheck(
+        WATCHDOG_CRON_WAKE_CHECK_ID,
+        cron.status === "unsupported" ||
+          cron.status === "empty" ||
+          cron.status === "idle"
+          ? "skip"
+          : "pass",
+        cronCheckStartedAt,
+        cron.status === "unsupported"
+          ? "Cron projection is disabled because the active bundle capability is not verified."
+          : cron.status === "empty"
+          ? "No cron projection baseline is available."
+          : cron.status === "idle"
+            ? "Cron projection has no pending wake."
+            : cron.status === "started"
+              ? "Cron projection Workflow started."
+              : "Cron projection Workflow is scheduled.",
+        diagnostics ?? undefined,
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      lastError = `Cron projection reconciliation failed: ${errMsg}`;
+      addCheck(WATCHDOG_CRON_WAKE_CHECK_ID, "fail", cronCheckStartedAt, lastError);
+      status = "failed";
+    }
+  };
+
   try {
     previous = await deps.readPrevious();
     meta = await deps.getMeta();
-    if (
-      meta.status === "error"
-      && meta.lastError === FIREWALL_FAIL_CLOSED_LAST_ERROR
-      && deps.reconcileFailClosed
-    ) {
-      meta = await deps.reconcileFailClosed();
+    if (deps.reconcileLifecycleState) {
+      meta = await deps.reconcileLifecycleState();
     }
     const bundleIdentity = matchesConfiguredBundleIdentity(meta.bundleIdentity)
       ? meta.bundleIdentity
@@ -519,60 +577,6 @@ export async function runSandboxWatchdog(
       } // close SDK stale-check else
     }
 
-    // Anti-entropy only. A token-revalidating Workflow owns the actual wake;
-    // watchdog repairs missing/stale dispatch without becoming a second timer.
-    const cronCheckStartedAt = deps.now();
-    try {
-      const cron = await deps.reconcileCronProjection({
-        origin: getPublicOrigin(options.request),
-        enabled: cronProjectionEnabled,
-        bootstrapFromLegacyJobs:
-          (meta.status === "stopped" || meta.status === "error") &&
-          Boolean(meta.sandboxId || meta.snapshotId),
-      });
-      const diagnostics = await deps.getCronProjectionDiagnostics();
-      if (cron.status === "failed" || cron.status === "starting") {
-        lastError = cron.status === "starting"
-          ? "Cron projection workflow start lease has not settled."
-          : "Cron projection workflow could not be started.";
-        addCheck(
-          WATCHDOG_CRON_WAKE_CHECK_ID,
-          "fail",
-          cronCheckStartedAt,
-          lastError,
-          diagnostics ?? undefined,
-        );
-        status = "failed";
-      } else {
-        const repaired = cron.status === "started" && cron.repaired;
-        triggeredRepair ||= repaired;
-        if (repaired && status !== "failed") status = "repairing";
-        addCheck(
-          WATCHDOG_CRON_WAKE_CHECK_ID,
-          cron.status === "unsupported" ||
-            cron.status === "empty" ||
-            cron.status === "idle"
-            ? "skip"
-            : "pass",
-          cronCheckStartedAt,
-          cron.status === "unsupported"
-            ? "Cron projection is disabled because the active bundle capability is not verified."
-            : cron.status === "empty"
-            ? "No cron projection baseline is available."
-            : cron.status === "idle"
-              ? "Cron projection has no pending wake."
-              : cron.status === "started"
-                ? "Cron projection Workflow started."
-                : "Cron projection Workflow is scheduled.",
-          diagnostics ?? undefined,
-        );
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      lastError = `Cron projection reconciliation failed: ${errMsg}`;
-      addCheck(WATCHDOG_CRON_WAKE_CHECK_ID, "fail", cronCheckStartedAt, lastError);
-      status = "failed";
-    }
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error);
     logError("watchdog.run_failed", {
@@ -580,6 +584,8 @@ export async function runSandboxWatchdog(
     });
     status = "failed";
   }
+
+  await runCronAntiEntropy();
 
   if (deadlineOwnerFailed) status = "failed";
 

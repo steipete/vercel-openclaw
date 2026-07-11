@@ -43,6 +43,7 @@ export type CronProjectionReconcileResult = {
     | "idle"
     | "starting"
     | "scheduled"
+    | "settlement-blocked"
     | "started"
     | "failed";
   projectionRevision: number | null;
@@ -121,6 +122,7 @@ function shouldRearm(
       dispatch.status === "completed") &&
     dispatch.workflowRunId === workflowRunLoss.runId;
   const matchingRunLost = matchingRun && workflowRunLoss.status === "lost";
+  const workflowStatusAmbiguous = workflowRunLoss === null;
   switch (dispatch.status) {
     case "failed":
       return dispatch.retryAtMs <= now;
@@ -134,21 +136,18 @@ function shouldRearm(
       return (
         matchingRunLost ||
         dispatch.scheduledAtMs > now + DISPATCH_CLOCK_ROLLBACK_TOLERANCE_MS ||
-        dispatch.scheduledAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS <=
-          now
+        (workflowStatusAmbiguous &&
+          dispatch.scheduledAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS <= now)
       );
     case "running":
       return (
         matchingRunLost ||
         dispatch.claimedAtMs > now + DISPATCH_CLOCK_ROLLBACK_TOLERANCE_MS ||
-        dispatch.claimedAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS <= now
+        (workflowStatusAmbiguous &&
+          dispatch.claimedAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS <= now)
       );
     case "completed":
-      if (dispatch.legacyWorkflowOwner) return false;
-      return (
-        matchingRunLost ||
-        dispatch.completedAtMs > now + DISPATCH_CLOCK_ROLLBACK_TOLERANCE_MS
-      );
+      return false;
     default:
       return false;
   }
@@ -288,11 +287,19 @@ export async function startCronProjectionDispatch(options: {
     record = await rearmStaleDispatch(record, now, workflowRunLoss);
   }
   if (record.dispatch.status === "none" || record.dispatch.status === "completed") {
+    const completedWorkflowRunId =
+      record.dispatch.status === "completed"
+        ? record.dispatch.workflowRunId
+        : null;
+    const settlementBlocked =
+      completedWorkflowRunId !== null &&
+      workflowRunLoss?.runId === completedWorkflowRunId &&
+      workflowRunLoss.status === "lost";
     return {
-      status: "idle",
+      status: settlementBlocked ? "settlement-blocked" : "idle",
       projectionRevision: record.projectionRevision,
       nextRunAtMs: record.nextRunAtMs,
-      workflowRunId: null,
+      workflowRunId: settlementBlocked ? completedWorkflowRunId : null,
       repaired: false,
     };
   }

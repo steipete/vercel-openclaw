@@ -34,7 +34,10 @@ import {
   getSlackWebhookRoute,
   resetAfterCallbacks,
 } from "@/test-utils/route-caller";
-import { slackWebhookWorkflowRuntime } from "@/app/api/channels/slack/webhook/route";
+import {
+  _setSlackNativeFastPathForTesting,
+  slackWebhookWorkflowRuntime,
+} from "@/app/api/channels/slack/webhook/route";
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
 import { gatewayReadyResponse } from "@/test-utils/fake-fetch";
@@ -68,6 +71,7 @@ async function configureSlack(
   h: ScenarioHarness,
   options: { admitGatewaySuspend?: boolean } = {},
 ) {
+  _setSlackNativeFastPathForTesting(true);
   const admitGatewaySuspend = options.admitGatewaySuspend === true;
   _setBundleAdmissionForTesting(
     admitGatewaySuspend ? VERIFIED_BUNDLE_ADMISSION : null,
@@ -532,6 +536,63 @@ test("Slack webhook: app_mention + message for same user post collapses to one w
         startMock.mock.callCount(),
         1,
         "second sibling event must not start a second workflow",
+      );
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
+test("Slack webhook: Bolt 401 falls back to workflow with raw signed handoff", async () => {
+  await withHarness(async (h) => {
+    await configureSlack(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-slack-401";
+      meta.portUrls = {
+        "3000": "https://sbx-slack-401-3000.fake.vercel.run",
+      };
+    });
+    h.fakeFetch.onGet(
+      "https://sbx-slack-401-3000.fake.vercel.run",
+      () => gatewayReadyResponse(),
+    );
+    h.fakeFetch.onPost(/slack\/events$/, () =>
+      new Response("invalid signature", { status: 401 }),
+    );
+    let envelope: {
+      workflowHandoff?: {
+        slackRawBody?: string | null;
+        slackForwardHeaders?: Record<string, string> | null;
+      } | null;
+    } | null = null;
+    const startMock = mock.method(
+      slackWebhookWorkflowRuntime,
+      "start",
+      async (_workflow: unknown, args: unknown[]) => {
+        envelope = args[0] as typeof envelope;
+      },
+    );
+    try {
+      const request = buildSlackWebhook({
+        signingSecret: SLACK_SIGNING_SECRET,
+      });
+      const rawBody = await request.clone().text();
+      const result = await callRoute(getSlackWebhookRoute().POST, request);
+      assert.equal(result.status, 200);
+      assert.equal(startMock.mock.callCount(), 1);
+      const capturedEnvelope = envelope as {
+        workflowHandoff?: {
+          slackRawBody?: string | null;
+          slackForwardHeaders?: Record<string, string> | null;
+        } | null;
+      } | null;
+      assert.equal(capturedEnvelope?.workflowHandoff?.slackRawBody, rawBody);
+      assert.equal(
+        capturedEnvelope?.workflowHandoff?.slackForwardHeaders?.[
+          "x-slack-signature"
+        ],
+        request.headers.get("x-slack-signature"),
       );
     } finally {
       startMock.mock.restore();

@@ -849,6 +849,7 @@ export async function clearLegacyCronStateForReset(options: {
 
 export async function normalizeResetCronProjectionGeneration(options: {
   gatewayGeneration: string;
+  expectedGatewayGeneration: string | null;
   store?: Store;
 }): Promise<CronProjectionRecordV1 | null> {
   if (!isHex(options.gatewayGeneration, 32)) {
@@ -858,6 +859,7 @@ export async function normalizeResetCronProjectionGeneration(options: {
     if (
       latest.source !== null ||
       latest.dispatch.status !== "none" ||
+      latest.gatewayGeneration !== options.expectedGatewayGeneration ||
       latest.gatewayGeneration === options.gatewayGeneration
     ) {
       return null;

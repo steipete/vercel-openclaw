@@ -413,6 +413,7 @@ const HOST_STOP_MONITOR_PHASES = new Set<HostSuspensionPhase>([
   "prepared",
   "stop-requesting",
   "stopping",
+  "thawing",
   "rollback-pending",
 ]);
 
@@ -634,6 +635,7 @@ export async function prepareHostSuspension(input: {
   lifecycleAttemptId: string | null;
   intent?: HostSuspensionIntent;
   reason: string;
+  capabilityRequired?: boolean;
 }, deps: HostSuspensionDeps = defaultDeps): Promise<HostSuspensionState> {
   let state = await withHostSuspensionStateLock(deps, async () => {
     const existing = await readHostSuspensionState(deps);
@@ -685,6 +687,7 @@ export async function prepareHostSuspension(input: {
     const knownNotPrepared = !preparationMayHaveStarted || (
       error instanceof GatewayAdminRpcError
       && ["ADMIN_RPC_NOT_INSTALLED", "INVALID_REQUEST"].includes(error.code)
+      && input.capabilityRequired !== true
     );
     try {
       const latest = await readHostSuspensionState(deps);

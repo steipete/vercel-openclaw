@@ -63,7 +63,7 @@ afterEach(() => {
 test("fails when the webhook url is not public https", async () => {
   _setAiGatewayTokenOverrideForTesting("oidc-token");
   const result = await buildChannelConnectability(
-    "discord",
+    "slack",
     makeRequest(LOCAL_ORIGIN),
   );
 
@@ -570,10 +570,7 @@ test("prerequisite and connectability report wrappers are behaviorally identical
   const connectability = await buildChannelConnectabilityReport(request, shared);
 
   assert.deepEqual(connectability, prerequisite);
-  assert.equal(
-    connectability.discord.webhookUrl,
-    `${PUBLIC_ORIGIN}/api/channels/discord/webhook`,
-  );
+  assert.equal(connectability.discord.webhookUrl, null);
 });
 
 test("buildChannelConnectabilityMap respects webhookUrlOverrides", async () => {
@@ -684,7 +681,8 @@ test("whatsapp connectability report does not advertise a dead webhook", async (
   assert.equal(report.whatsapp.mode, "unsupported");
   assert.ok(report.slack.webhookUrl, "slack must have a webhookUrl in report");
   assert.ok(report.telegram.webhookUrl, "telegram must have a webhookUrl in report");
-  assert.ok(report.discord.webhookUrl, "discord must have a webhookUrl in report");
+  assert.equal(report.discord.webhookUrl, null);
+  assert.equal(report.discord.mode, "unsupported");
 });
 
 test("webhook-proxied channels include mode field", async () => {
@@ -692,10 +690,12 @@ test("webhook-proxied channels include mode field", async () => {
   _setAiGatewayTokenOverrideForTesting("oidc-token");
 
   const request = makeRequest(PUBLIC_ORIGIN);
-  for (const channel of ["slack", "telegram", "discord"] as const) {
+  for (const channel of ["slack", "telegram"] as const) {
     const result = await buildChannelConnectability(channel, request);
     assert.equal(result.mode, "webhook-proxied", `${channel} should be webhook-proxied`);
   }
   const whatsapp = await buildChannelConnectability("whatsapp", request);
   assert.equal(whatsapp.mode, "unsupported");
+  const discord = await buildChannelConnectability("discord", request);
+  assert.equal(discord.mode, "unsupported");
 });

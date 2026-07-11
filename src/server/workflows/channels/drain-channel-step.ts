@@ -5,15 +5,22 @@ import {
   type TelegramChannelConfig,
 } from "@/shared/channels";
 import { acquireChannelConfigLease } from "@/server/channels/config-lock";
-import type { BootMessageHandle } from "@/server/channels/core/types";
+import {
+  RetryableSendError,
+  type BootMessageHandle,
+} from "@/server/channels/core/types";
 import type { QueuedChannelJob } from "@/server/channels/driver";
 import {
   deleteSlackMessage,
   updateProcessingPlaceholder,
 } from "@/server/channels/slack/message-api";
 import { extractTelegramChatId } from "@/server/channels/telegram/payload";
-import { deleteMessage, editMessageText } from "@/server/channels/telegram/bot-api";
+import {
+  deleteMessage,
+  editMessageText,
+} from "@/server/channels/telegram/bot-api";
 import { deriveChannelDeliveryId } from "@/server/channels/delivery-id";
+import { claimChannelHandoff } from "@/server/channels/handoff-ledger";
 import {
   recordChannelDlqFailure,
   resolveChannelDlqFailure,
@@ -211,7 +218,6 @@ export type DrainChannelWorkflowDependencies = {
   createSlackAdapter: typeof import("@/server/channels/slack/adapter").createSlackAdapter;
   createTelegramAdapter: typeof import("@/server/channels/telegram/adapter").createTelegramAdapter;
   createDiscordAdapter: typeof import("@/server/channels/discord/adapter").createDiscordAdapter;
-  reconcileDiscordIntegration: typeof import("@/server/channels/discord/reconcile").reconcileDiscordIntegration;
   runWithBootMessages: typeof import("@/server/channels/core/boot-messages").runWithBootMessages;
   ensureSandboxReady: typeof import("@/server/sandbox/lifecycle").ensureSandboxReady;
   getSandboxDomain: typeof import("@/server/sandbox/lifecycle").getSandboxDomain;
@@ -297,11 +303,13 @@ export type ProcessChannelStepOptions = {
 };
 
 export type ChannelWorkflowHandoff = {
+  handoffDeliveryId?: string | null;
+  handoffAttemptId?: string | null;
   /** Re-enter lifecycle readiness when fast-path admission closed mid-stop. */
   revalidateSandboxBeforeForward?: boolean;
   slackCleanupConfig?: Pick<
     SlackChannelConfig,
-    "botToken" | "configuredAt"
+    "botToken" | "configuredAt" | "team" | "botId"
   > | null;
   slackConfigGeneration?: number | null;
   slackBootTarget?: {
@@ -313,6 +321,10 @@ export type ChannelWorkflowHandoff = {
   telegramConfigGeneration?: number | null;
   /** Generation-scoped identity computed by the authenticated webhook route. */
   telegramDeliveryId?: string | null;
+  telegramBootTarget?: {
+    chatId: number;
+    threadId: number | null;
+  } | null;
   slackForwardHeaders?: Record<string, string> | null;
   slackRawBody?: string | null;
   discordForwardHeaders?: Record<string, string> | null;
@@ -446,16 +458,38 @@ export async function processChannelStep(
         });
   const resolvedDependencies =
     options?.dependencies ?? (await loadDrainChannelWorkflowDependencies());
-  if (channel === "whatsapp") {
-    logWarn("channels.whatsapp_workflow_rejected", {
+  if (channel === "whatsapp" || channel === "discord") {
+    logWarn(`channels.${channel}_workflow_rejected`, {
       channel,
       requestId,
       deliveryId,
       reason: "hosted-transport-unavailable",
     });
     throw new resolvedDependencies.FatalError(
-      "hosted_whatsapp_transport_unavailable",
+      `hosted_${channel}_transport_unavailable`,
     );
+  }
+  const handoffDeliveryId =
+    options?.workflowHandoff?.handoffDeliveryId ?? null;
+  const handoffAttemptId =
+    options?.workflowHandoff?.handoffAttemptId ?? null;
+  if (handoffDeliveryId && handoffAttemptId && isChannelName(channel)) {
+    const runId = resolvedDependencies.getWorkflowMetadata().workflowRunId;
+    const claimed = await claimChannelHandoff({
+      channel,
+      deliveryId: handoffDeliveryId,
+      attemptId: handoffAttemptId,
+      runId,
+    });
+    if (!claimed) {
+      logWarn("channels.workflow_handoff_not_claimed", {
+        channel,
+        deliveryId: handoffDeliveryId,
+        attemptId: handoffAttemptId,
+        runId,
+      });
+      return;
+    }
   }
   // Diagnostic trace — every phase appends here, written to store at the end.
   const diag: Record<string, unknown> = {
@@ -491,7 +525,6 @@ export async function processChannelStep(
   await persistDiagSnapshot("workflow-step-started");
 
   const {
-    reconcileDiscordIntegration,
     runWithBootMessages,
     ensureSandboxReady,
     getSandboxDomain,
@@ -502,16 +535,6 @@ export async function processChannelStep(
     buildExistingBootHandle,
     hydrateVerifiedBundleIdentity,
   } = resolvedDependencies;
-
-  if (channel === "discord") {
-    try {
-      await reconcileDiscordIntegration();
-    } catch (err) {
-      logWarn("channels.discord_integration_reconcile_failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
 
   async function settleStaleSlackConfig(
     reason: "deleted" | "missing" | "rotated",
@@ -566,6 +589,7 @@ export async function processChannelStep(
   let existingBootHandle: BootMessageHandle | undefined;
   let nativeAcceptance: NativeDeliveryAcceptance | null = null;
   let finalForwardClassification: string | null = null;
+  const slackBootTarget = options?.workflowHandoff?.slackBootTarget ?? null;
 
   try {
     if (channel === "slack") {
@@ -577,14 +601,14 @@ export async function processChannelStep(
         payload,
         bootMessageId,
         { slack: slackCleanupConfig, telegram: null },
-        null,
+        slackBootTarget,
+        deriveSlackBootClientMessageId(deliveryId),
       );
       await settleStaleSlackConfig(reason, "step-start", cleanupHandle);
       return;
     }
   }
 
-  const slackBootTarget = options?.workflowHandoff?.slackBootTarget ?? null;
   if (
     channel === "slack" &&
     requireSlackConfigGuard &&
@@ -720,9 +744,17 @@ export async function processChannelStep(
     }
   }
 
-    if ((await currentTelegramConfigOrSettle("step-start")) === undefined) {
+    const telegramConfigAtStepStart =
+      await currentTelegramConfigOrSettle("step-start");
+    if (telegramConfigAtStepStart === undefined) {
       return;
     }
+
+    // Telegram Bot API sendMessage has neither an idempotency key nor a bot
+    // message-history lookup. Posting here would therefore leave an orphan or
+    // duplicate if the provider accepted the call before a Workflow crash.
+    // Existing handed-off placeholders remain cleanable, but cold Workflow
+    // delivery deliberately has no persistent Telegram wake message.
 
     // --- Phase 1: Wake the sandbox ---
     console.log(`[DIAG] Phase 1: runWithBootMessages starting`);
@@ -1062,20 +1094,7 @@ export async function processChannelStep(
       diag.gatewayAdmissionRejectionAdmitted =
         capabilityAdmissions.gatewayAdmissionRejectionAdmitted;
 
-      // The retry deadline is checked before each attempt, so one last fetch
-      // can consume its full timeout after the wrapper deadline. Derive the
-      // lease from both hard bounds plus cleanup margin; no config mutation
-      // can pass the final generation check before dispatch settles.
-      const telegramForwardLeaseTtlSeconds = Math.ceil(
-        (
-          RETRYING_FORWARD_TIMEOUT_MS +
-          NATIVE_FORWARD_PER_FETCH_TIMEOUT_MS +
-          30_000
-        ) / 1000,
-      );
-      const configLease = await acquireChannelConfigLease("telegram", {
-        ttlSeconds: telegramForwardLeaseTtlSeconds,
-      });
+      const configLease = await acquireChannelConfigLease("telegram");
       try {
         const telegramConfigBeforeForward =
           await currentTelegramConfigOrSettle("pre-forward");
@@ -1091,31 +1110,35 @@ export async function processChannelStep(
             },
           };
         }
-        try {
-          retryingResult = await forwardToNativeHandlerWithRetry(
-            channel as ChannelName,
-            payload,
-            effectiveReadyMeta,
-            getSandboxDomain,
-            forwardTelegramToNativeHandlerLocally,
-            localProbeResult?.ready === true,
-            null,
-            null,
-            deliveryId,
-            capabilityAdmissions.telegramDurableAcceptanceAdmitted,
-            capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
-            origin,
-            configLease.signal,
-          );
-          await configLease.assertOwned();
-        } catch (error) {
-          if (configLease.signal.aborted) {
-            nativeAcceptance = "unknown";
-          }
-          throw error;
-        }
       } finally {
         await configLease.release();
+      }
+      retryingResult = await forwardToNativeHandlerWithRetry(
+        channel as ChannelName,
+        payload,
+        effectiveReadyMeta,
+        getSandboxDomain,
+        forwardTelegramToNativeHandlerLocally,
+        localProbeResult?.ready === true,
+        null,
+        null,
+        deliveryId,
+        capabilityAdmissions.telegramDurableAcceptanceAdmitted,
+        capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
+        origin,
+      );
+      const telegramConfigAfterForward =
+        (await getInitializedMeta()).channels.telegram;
+      if (
+        options?.requireTelegramConfigGeneration === true &&
+        (!telegramConfigAfterForward ||
+          telegramConfigAfterForward.configuredAt !== telegramConfigGeneration)
+      ) {
+        retryingResult = {
+          ...retryingResult,
+          ok: false,
+          acceptance: "unknown",
+        };
       }
       diag.telegramReadinessMode = readinessMode;
       diag.telegramPreForwardProbeMs = Date.now() - preForwardProbeStartedAt;
@@ -1146,6 +1169,16 @@ export async function processChannelStep(
           return;
         }
         if (currentSlackConfig) {
+          if (
+            requireSlackConfigGuard &&
+            currentSlackConfig.liveConfigSync !== undefined &&
+            currentSlackConfig.liveConfigSync?.liveConfigFresh !== true
+          ) {
+            throw new resolvedDependencies.RetryableError(
+              "slack_config_not_live",
+              { retryAfter: "5s" },
+            );
+          }
           effectiveReadyMeta = {
             ...effectiveReadyMeta,
             channels: {
@@ -1241,6 +1274,7 @@ export async function processChannelStep(
       diag.bundleCapabilityAdmissionSource = capabilityAdmissions.source;
       diag.gatewayAdmissionRejectionAdmitted =
         capabilityAdmissions.gatewayAdmissionRejectionAdmitted;
+      await configLease.release();
       retryingResult = await forwardToNativeHandlerWithRetry(
         channel as ChannelName,
         payload,
@@ -1254,9 +1288,20 @@ export async function processChannelStep(
         false,
         capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
         origin,
-        configLease.signal,
       );
-      await configLease.assertOwned();
+      const slackConfigAfterForward =
+        (await getInitializedMeta()).channels.slack;
+      if (
+        requireSlackConfigGuard &&
+        (!slackConfigAfterForward ||
+          slackConfigAfterForward.configuredAt !== slackConfigGeneration)
+      ) {
+        retryingResult = {
+          ...retryingResult,
+          ok: false,
+          acceptance: "unknown",
+        };
+      }
       forwardResult = {
         ok: retryingResult.ok,
         status: retryingResult.status,
@@ -1264,11 +1309,6 @@ export async function processChannelStep(
           retryingResult.acceptance ??
           (retryingResult.ok ? "accepted" : "rejected"),
       };
-      } catch (error) {
-        if (configLease.signal.aborted) {
-          nativeAcceptance = "unknown";
-        }
-        throw error;
       } finally {
         await configLease.release();
       }
@@ -2533,7 +2573,6 @@ function shouldAttemptAiGatewayCredentialRecovery(
   channel: ChannelName,
   status: number,
 ): boolean {
-  if (status === 403) return true;
   if (status === 401) return channel === "telegram";
   return false;
 }
@@ -2554,7 +2593,7 @@ function shouldAttemptAiGatewayCredentialRecovery(
  * Unmarked Telegram success, proxy failures, and fetch exceptions close as
  * unknown because the handler may already have accepted the delivery.
  */
-async function forwardToNativeHandlerWithRetry(
+export async function forwardToNativeHandlerWithRetry(
   channel: ChannelName,
   payload: unknown,
   meta: import("@/shared/types").SingleMeta,
@@ -2663,7 +2702,9 @@ async function forwardToNativeHandlerWithRetry(
         ? channel === "telegram" && !telegramDurablyAccepted
           ? "unknown"
           : "accepted"
-        : gatewayAdmissionClosed || isSandboxNotListening || isHandlerNotReady
+        : result.status === 403
+          ? "unknown"
+          : gatewayAdmissionClosed || isSandboxNotListening || isHandlerNotReady
           ? "rejected"
           : result.status >= 500 || result.status === 0
             ? "unknown"
@@ -3044,12 +3085,43 @@ function deriveSlackBootClientMessageId(deliveryId: string): string {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 
+type SlackBootMessageRecord = {
+  channel: string;
+  configuredAt: number;
+  clientMessageId?: string;
+  team?: string;
+  botId?: string;
+  state?: "posting" | "sent";
+  messageId?: string;
+};
+
+const SLACK_BOOT_MESSAGE_TTL_SECONDS = 3600;
+
+function slackBootPostOutcomeMayBeAccepted(input: {
+  response: Response;
+  body: { ok?: boolean; ts?: string; error?: string } | null;
+}): boolean {
+  const { response, body } = input;
+  return (
+    body === null ||
+    body.ok === true ||
+    response.status >= 500 ||
+    body.error === "fatal_error" ||
+    body.error === "internal_error" ||
+    body.error === "request_timeout" ||
+    body.error === "service_unavailable"
+  );
+}
+
 export async function buildExistingBootHandle(
   channel: string,
   payload: unknown,
   bootMessageId?: number | string | null,
   cleanupConfig?: {
-    slack?: Pick<SlackChannelConfig, "botToken" | "configuredAt"> | null;
+    slack?: Pick<
+      SlackChannelConfig,
+      "botToken" | "configuredAt" | "team" | "botId"
+    > | null;
     telegram?: TelegramChannelConfig | null;
   },
   slackBootTarget?: {
@@ -3094,6 +3166,8 @@ export async function buildExistingBootHandle(
   }
   let slackBootMessageId =
     typeof bootMessageId === "string" ? bootMessageId : null;
+  let slackBootRecord: SlackBootMessageRecord | null = null;
+  let slackBootRecordRead: "absent" | "found" | "unavailable" = "absent";
   const slackBootRecordKey =
     channel === "slack" && slackClientMessageId
       ? channelBootMessageKey("slack", slackClientMessageId)
@@ -3104,19 +3178,30 @@ export async function buildExistingBootHandle(
     cleanupConfig?.slack &&
     slackBootTarget
   ) {
-    const record = await getStore()
-      .getValue<{
-        channel: string;
-        configuredAt: number;
-        messageId: string;
-      }>(slackBootRecordKey)
-      .catch(() => null);
+    try {
+      slackBootRecord = await getStore().getValue<SlackBootMessageRecord>(
+        slackBootRecordKey,
+      );
+      slackBootRecordRead = slackBootRecord ? "found" : "absent";
+    } catch (error) {
+      slackBootRecordRead = "unavailable";
+      logWarn("channels.slack_boot_message_record_read_failed", {
+        channel: slackBootTarget.channel,
+        clientMessageId: slackClientMessageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (slackBootRecordRead === "unavailable") {
+      throw new RetryableSendError(
+        "slack_boot_message_record_read_unavailable",
+      );
+    }
     if (
-      record?.channel === slackBootTarget.channel &&
-      record.configuredAt === cleanupConfig.slack.configuredAt &&
-      typeof record.messageId === "string"
+      slackBootRecord?.channel === slackBootTarget.channel &&
+      slackBootRecord.configuredAt === cleanupConfig.slack.configuredAt &&
+      typeof slackBootRecord.messageId === "string"
     ) {
-      slackBootMessageId = record.messageId;
+      slackBootMessageId = slackBootRecord.messageId;
       logInfo("channels.slack_boot_message_reused", {
         channel: slackBootTarget.channel,
         bootMessageTs: slackBootMessageId,
@@ -3130,11 +3215,48 @@ export async function buildExistingBootHandle(
     cleanupConfig?.slack &&
     slackBootTarget
   ) {
+    const store = getStore();
+    // Persist intent before the external side effect. A retry reuses the same
+    // Slack client_msg_id, allowing Slack to reconcile a request accepted
+    // before its response or our sent-record was durably observed.
+    if (slackBootRecordKey && slackClientMessageId) {
+      await store.setValue(
+        slackBootRecordKey,
+        {
+          channel: slackBootTarget.channel,
+          configuredAt: cleanupConfig.slack.configuredAt,
+          clientMessageId: slackClientMessageId,
+          ...(cleanupConfig.slack.team
+            ? { team: cleanupConfig.slack.team }
+            : {}),
+          ...(cleanupConfig.slack.botId
+            ? { botId: cleanupConfig.slack.botId }
+            : {}),
+          state: "posting",
+        } satisfies SlackBootMessageRecord,
+        SLACK_BOOT_MESSAGE_TTL_SECONDS,
+      );
+    }
+
+    const currentSlackConfig = (await getInitializedMeta()).channels.slack;
+    const sameSlackPrincipal = Boolean(
+      currentSlackConfig &&
+        cleanupConfig.slack.team &&
+        cleanupConfig.slack.botId &&
+        currentSlackConfig.team === cleanupConfig.slack.team &&
+        currentSlackConfig.botId === cleanupConfig.slack.botId,
+    );
+    const postBotToken =
+      sameSlackPrincipal && currentSlackConfig
+        ? currentSlackConfig.botToken
+        : cleanupConfig.slack.botToken;
+
+    let response: Response;
     try {
-      const response = await fetch("https://slack.com/api/chat.postMessage", {
+      response = await fetch("https://slack.com/api/chat.postMessage", {
         method: "POST",
         headers: {
-          authorization: `Bearer ${cleanupConfig.slack.botToken}`,
+          authorization: `Bearer ${postBotToken}`,
           "content-type": "application/json",
         },
         body: JSON.stringify({
@@ -3149,53 +3271,126 @@ export async function buildExistingBootHandle(
         }),
         signal: AbortSignal.timeout(5_000),
       });
-      const body = (await response.json().catch(() => null)) as {
-        ok?: boolean;
-        ts?: string;
-        error?: string;
-      } | null;
-      if (!response.ok || body?.ok !== true || !body.ts) {
-        throw new Error(
-          `slack_boot_message_post_failed: status=${response.status} error=${body?.error ?? "unknown"}`,
+    } catch (error) {
+      logWarn("channels.slack_boot_message_outcome_unknown", {
+        channel: slackBootTarget.channel,
+        clientMessageId: slackClientMessageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw new RetryableSendError(
+        `slack_boot_message_post_network_outcome_unknown: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        { cause: error },
+      );
+    }
+
+    const body = (await response.json().catch(() => null)) as {
+      ok?: boolean;
+      ts?: string;
+      error?: string;
+    } | null;
+    if (!response.ok || body?.ok !== true || !body.ts) {
+      const detail = body?.error ?? "unknown";
+      if (slackBootPostOutcomeMayBeAccepted({ response, body })) {
+        throw new RetryableSendError(
+          `slack_boot_message_post_outcome_unknown: status=${response.status} error=${detail}`,
         );
       }
-      slackBootMessageId = body.ts;
-      if (slackBootRecordKey) {
-        await getStore()
-          .setValue(
-            slackBootRecordKey,
-            {
-              channel: slackBootTarget.channel,
-              configuredAt: cleanupConfig.slack.configuredAt,
-              messageId: slackBootMessageId,
-            },
-            3600,
-          )
-          .catch((error) => {
-            logWarn("channels.slack_boot_message_record_failed", {
-              channel: slackBootTarget.channel,
-              bootMessageTs: slackBootMessageId,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          });
+      const priorAcceptanceMayBeUnknown =
+        slackBootRecord?.state === "posting";
+      if (priorAcceptanceMayBeUnknown) {
+        throw new RetryableSendError(
+          `slack_boot_message_reconcile_rejected_with_prior_unknown: error=${detail}`,
+        );
       }
-      logInfo("channels.slack_boot_message_sent", {
-        channel: slackBootTarget.channel,
-        bootMessageTs: slackBootMessageId,
-        owner: "drain-channel-workflow",
-      });
-    } catch (error) {
       logWarn("channels.slack_boot_message_failed", {
         channel: slackBootTarget.channel,
         owner: "drain-channel-workflow",
-        error: error instanceof Error ? error.message : String(error),
+        error: `status=${response.status} error=${detail}`,
       });
+      if (slackBootRecordKey) {
+        await store.deleteValue(slackBootRecordKey).catch(() => {});
+      }
+      return undefined;
     }
+
+    slackBootMessageId = body.ts;
+    if (slackBootRecordKey) {
+      try {
+        await store.setValue(
+          slackBootRecordKey,
+          {
+            channel: slackBootTarget.channel,
+            configuredAt: cleanupConfig.slack.configuredAt,
+            clientMessageId: slackClientMessageId ?? undefined,
+            ...(cleanupConfig.slack.team
+              ? { team: cleanupConfig.slack.team }
+              : {}),
+            ...(cleanupConfig.slack.botId
+              ? { botId: cleanupConfig.slack.botId }
+              : {}),
+            state: "sent",
+            messageId: slackBootMessageId,
+          } satisfies SlackBootMessageRecord,
+          SLACK_BOOT_MESSAGE_TTL_SECONDS,
+        );
+      } catch (error) {
+        logWarn("channels.slack_boot_message_record_failed", {
+          channel: slackBootTarget.channel,
+          bootMessageTs: slackBootMessageId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        try {
+          await deleteSlackMessage({
+            botToken: postBotToken,
+            channel: slackBootTarget.channel,
+            ts: slackBootMessageId,
+            timeoutMs: 5_000,
+          });
+          await store.deleteValue(slackBootRecordKey).catch(() => {});
+          logInfo("channels.slack_boot_message_deleted_after_record_failure", {
+            channel: slackBootTarget.channel,
+            bootMessageTs: slackBootMessageId,
+          });
+        } catch (cleanupError) {
+          logWarn("channels.slack_boot_message_record_failure_cleanup_unknown", {
+            channel: slackBootTarget.channel,
+            bootMessageTs: slackBootMessageId,
+            error:
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : String(cleanupError),
+          });
+        }
+        throw new RetryableSendError(
+          `slack_boot_message_sent_record_failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          { cause: error },
+        );
+      }
+    }
+    logInfo("channels.slack_boot_message_sent", {
+      channel: slackBootTarget.channel,
+      bootMessageTs: slackBootMessageId,
+      clientMessageId: slackClientMessageId,
+      owner: "drain-channel-workflow",
+    });
   }
   if (slackBootMessageId && channel === "slack") {
-    const slackConfig =
-      cleanupConfig?.slack ??
-      (await getInitializedMeta()).channels.slack;
+    const currentSlackConfig = (await getInitializedMeta()).channels.slack;
+    const cleanupSlackConfig = cleanupConfig?.slack ?? null;
+    const sameSlackPrincipal = Boolean(
+      currentSlackConfig &&
+        cleanupSlackConfig?.team &&
+        cleanupSlackConfig.botId &&
+        currentSlackConfig.team === cleanupSlackConfig.team &&
+        currentSlackConfig.botId === cleanupSlackConfig.botId,
+    );
+    const slackConfig = sameSlackPrincipal
+      ? currentSlackConfig
+      : cleanupSlackConfig ?? currentSlackConfig;
     const slackPayload = payload as {
       event?: { channel?: string };
     } | null;
@@ -3331,7 +3526,6 @@ async function loadDrainChannelWorkflowDependencies(): Promise<DrainChannelWorkf
     { createSlackAdapter },
     { createTelegramAdapter },
     { createDiscordAdapter },
-    { reconcileDiscordIntegration },
     { runWithBootMessages },
     { ensureSandboxReady, getSandboxDomain },
     { hydrateVerifiedBundleIdentity },
@@ -3341,7 +3535,6 @@ async function loadDrainChannelWorkflowDependencies(): Promise<DrainChannelWorkf
     import("@/server/channels/slack/adapter"),
     import("@/server/channels/telegram/adapter"),
     import("@/server/channels/discord/adapter"),
-    import("@/server/channels/discord/reconcile"),
     import("@/server/channels/core/boot-messages"),
     import("@/server/sandbox/lifecycle"),
     import("@/server/openclaw/bundle-identity"),
@@ -3353,7 +3546,6 @@ async function loadDrainChannelWorkflowDependencies(): Promise<DrainChannelWorkf
     createSlackAdapter,
     createTelegramAdapter,
     createDiscordAdapter,
-    reconcileDiscordIntegration,
     runWithBootMessages,
     ensureSandboxReady,
     getSandboxDomain,

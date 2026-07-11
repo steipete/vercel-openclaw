@@ -13,10 +13,16 @@ import type {
 import {
   computePolicyHash,
   FIREWALL_FAIL_CLOSED_LAST_ERROR,
-  FIREWALL_FAIL_CLOSED_REASON,
 } from "@/shared/types";
+import {
+  firewallFailClosedReason,
+  type FirewallPolicyRevision,
+} from "@/server/firewall/fail-close";
 import { getInitializedMeta, getStore, mutateMeta } from "@/server/store/store";
-import { learningLockKey } from "@/server/store/keyspace";
+import {
+  firewallPolicyApplyLockKey,
+  learningLockKey,
+} from "@/server/store/keyspace";
 import {
   applyFirewallPolicyToSandbox,
   controlPlaneDomains,
@@ -34,12 +40,16 @@ import {
   enqueueHostStopOperation,
   getHostMutationFence,
   markHostSuspensionStopped,
+  type HostSuspensionState,
 } from "@/server/sandbox/host-suspension";
 
 const EVENT_RETENTION = 1000;
 const LEARNED_RETENTION = 500;
 const LEARNING_LOG_PATH = "/tmp/shell-commands-for-learning.log";
 const LEARNING_INGEST_INTERVAL_MS = 10_000;
+// Outlives the bounded Function/SDK request so a lost lifecycle lease cannot
+// permit a second, unordered policy write while the first call can still land.
+const FIREWALL_POLICY_APPLY_LOCK_TTL_SECONDS = 330;
 
 type FirewallPolicyContext = {
   requestId?: string;
@@ -57,6 +67,17 @@ type LearningGeneration = SandboxGeneration & {
   learningStartedAt: number | null;
   learningEpochId: string | null;
 };
+
+class FirewallPolicySyncError extends Error {
+  constructor(
+    cause: unknown,
+    readonly generation: SandboxGeneration,
+    readonly revision: FirewallPolicyRevision,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "FirewallPolicySyncError";
+  }
+}
 
 async function withFirewallLifecycleMutation<T>(
   action: (
@@ -92,10 +113,17 @@ function ownsSandboxGeneration(
   generation: SandboxGeneration,
 ): boolean {
   return (
-    meta.sandboxId === generation.sandboxId &&
-    (meta.lifecycleAttemptId ?? null) === generation.lifecycleAttemptId &&
+    ownsSandboxIdentity(meta, generation) &&
     (meta.status === "running" || meta.status === "booting")
   );
+}
+
+function ownsSandboxIdentity(
+  meta: SingleMeta,
+  generation: SandboxGeneration,
+): boolean {
+  return meta.sandboxId === generation.sandboxId
+    && (meta.lifecycleAttemptId ?? null) === generation.lifecycleAttemptId;
 }
 
 function ownsLearningGeneration(
@@ -127,17 +155,58 @@ function learningPendingLogPath(generation: LearningGeneration): string {
 
 async function mutateFirewallSyncForGeneration(
   generation: SandboxGeneration,
+  revisionId: string,
   mutator: (meta: SingleMeta) => void,
 ): Promise<boolean> {
   // The SDK update targets one external process generation. Never let its
   // outcome or credential refresh attest a replacement sandbox.
   let ownsGeneration = false;
   await mutateMeta((meta) => {
-    ownsGeneration = ownsSandboxGeneration(meta, generation);
+    ownsGeneration = ownsSandboxGeneration(meta, generation)
+      && meta.firewall.policyRevisionId === revisionId;
     if (!ownsGeneration) return;
     mutator(meta);
   });
   return ownsGeneration;
+}
+
+async function recordPolicySdkCompletion(
+  generation: SandboxGeneration,
+  revision: FirewallPolicyRevision,
+  applied: boolean,
+): Promise<boolean> {
+  let recorded = false;
+  await mutateMeta((meta) => {
+    if (!ownsSandboxIdentity(meta, generation)) return;
+    recorded = true;
+    meta.firewall.lastPolicySdkCompletionRevisionId = revision.revisionId;
+    meta.firewall.lastPolicySdkCompletionHash = revision.policyHash;
+    if (meta.firewall.policyRevisionId !== revision.revisionId) {
+      // A later desired revision started while this SDK call was in flight.
+      // Fence atomically with completion ordering so process death before the
+      // caller's next ownership assertion cannot leave the stale policy live.
+      meta.status = "error";
+      meta.portUrls = null;
+      meta.lastGatewayProbeReady = false;
+      meta.lastError = FIREWALL_FAIL_CLOSED_LAST_ERROR;
+      meta.firewall.failClosedPolicyRevisionId = revision.revisionId;
+      meta.firewall.failClosedPolicyHash = revision.policyHash;
+    } else if (
+      applied
+      && meta.status === "error"
+      && meta.lastError === FIREWALL_FAIL_CLOSED_LAST_ERROR
+      && meta.firewall.failClosedPolicyRevisionId !== revision.revisionId
+    ) {
+      // The current desired revision settled after an older stale completion;
+      // its policy is authoritative and retires that transient fence.
+      meta.status = "running";
+      meta.lastError = null;
+      meta.lastGatewayProbeReady = false;
+      meta.firewall.failClosedPolicyRevisionId = null;
+      meta.firewall.failClosedPolicyHash = null;
+    }
+  });
+  return recorded;
 }
 
 function requiredControlPlaneDomains(
@@ -185,12 +254,13 @@ export async function setFirewallMode(
   options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   return withFirewallLifecycleMutation((assertOwned, generation) =>
-    setFirewallModeWithinLifecycleLock(
-      mode,
-      assertOwned,
-      generation,
-      options,
-    ));
+    withFirewallPolicyApplyLock(() =>
+      setFirewallModeWithinLifecycleLock(
+        mode,
+        assertOwned,
+        generation,
+        options,
+      )));
 }
 
 async function setFirewallModeWithinLifecycleLock(
@@ -259,12 +329,13 @@ export async function approveDomains(
   options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   return withFirewallLifecycleMutation((assertOwned, generation) =>
-    approveDomainsWithinLifecycleLock(
-      domains,
-      assertOwned,
-      generation,
-      options,
-    ));
+    withFirewallPolicyApplyLock(() =>
+      approveDomainsWithinLifecycleLock(
+        domains,
+        assertOwned,
+        generation,
+        options,
+      )));
 }
 
 async function approveDomainsWithinLifecycleLock(
@@ -327,7 +398,13 @@ export async function removeDomains(
   options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   return withFirewallLifecycleMutation((assertOwned, generation) =>
-    removeDomainsWithinLifecycleLock(domains, assertOwned, generation, options));
+    withFirewallPolicyApplyLock(() =>
+      removeDomainsWithinLifecycleLock(
+        domains,
+        assertOwned,
+        generation,
+        options,
+      )));
 }
 
 async function removeDomainsWithinLifecycleLock(
@@ -394,11 +471,12 @@ export async function promoteLearnedDomainsToEnforcing(
   options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   return withFirewallLifecycleMutation((assertOwned, generation) =>
-    promoteLearnedDomainsToEnforcingWithinLifecycleLock(
-      assertOwned,
-      generation,
-      options,
-    ));
+    withFirewallPolicyApplyLock(() =>
+      promoteLearnedDomainsToEnforcingWithinLifecycleLock(
+        assertOwned,
+        generation,
+        options,
+      )));
 }
 
 async function promoteLearnedDomainsToEnforcingWithinLifecycleLock(
@@ -490,11 +568,11 @@ export async function dismissLearnedDomains(
 async function syncFirewallPolicyAfterMutation(
   mutation: string,
   assertOwned: AssertLifecycleOwnership,
-  generation: SandboxGeneration | null,
+  _generation: SandboxGeneration | null,
   options?: FirewallPolicyContext,
 ): Promise<void> {
   try {
-    const outcome = await syncFirewallPolicyIfRunningWithinLifecycleLock(
+    const outcome = await syncFirewallPolicyWithFailCloseWithinLifecycleLock(
       assertOwned,
       options,
     );
@@ -502,20 +580,10 @@ async function syncFirewallPolicyAfterMutation(
       throw new Error("Firewall sync target changed during policy application.");
     }
   } catch (error) {
-    if (generation) {
-      try {
-        await failClosedFirewallGeneration(generation, assertOwned);
-      } catch (fenceError) {
-        logWarn("firewall.fail_closed_incomplete", {
-          operation: "sync",
-          mutation,
-          reason: fenceError instanceof Error
-            ? fenceError.message
-            : String(fenceError),
-          requestId: options?.requestId,
-        });
-      }
-    }
+    if (
+      error instanceof ApiError
+      && error.code === "FIREWALL_POLICY_APPLY_IN_PROGRESS"
+    ) throw error;
     logWarn("firewall.sync_failed_after_mutation", {
       operation: "sync",
       code: "FIREWALL_SYNC_FAILED",
@@ -533,53 +601,31 @@ async function syncFirewallPolicyAfterMutation(
 
 async function failClosedFirewallGeneration(
   generation: SandboxGeneration,
+  revision: FirewallPolicyRevision,
   assertOwned: AssertLifecycleOwnership,
 ): Promise<void> {
   try {
     await assertOwned();
   } catch {
-    // A stale worker may still fence diagnostics through the exact-generation
-    // metadata CAS, but must not publish a global stop operation after losing
-    // lifecycle ownership.
-    const fenced = await fenceFirewallGenerationMeta(generation);
-    if (fenced) {
-      try {
-        await withSandboxLifecycleRecoveryLock(async () => {
-          const current = await getInitializedMeta();
-          if (
-            current.status !== "error"
-            || current.sandboxId !== generation.sandboxId
-            || (current.lifecycleAttemptId ?? null)
-              !== generation.lifecycleAttemptId
-          ) return;
-          await enqueueHostStopOperation({
-            ...generation,
-            reason: FIREWALL_FAIL_CLOSED_REASON,
-          });
-        });
-      } catch {
-        // A successor owns lifecycle recovery. The exact-generation metadata
-        // fence prevents this stale worker from touching its sandbox.
-      }
-    }
-    logWarn("firewall.fail_closed_deferred", {
-      operation: "sync",
-      sandboxId: generation.sandboxId,
-      lifecycleAttemptId: generation.lifecycleAttemptId,
-      reason: "lifecycle-ownership-lost",
-    });
+    await recoverFirewallFailCloseAfterOwnershipLoss(generation, revision);
     return;
   }
   // Publish the durable forced-stop owner first. Its reason is sufficient for
   // the monitor to stop this exact generation even if this worker dies before
   // the diagnostic metadata write below.
-  const stopOperation = await enqueueHostStopOperation({
-    ...generation,
-    reason: FIREWALL_FAIL_CLOSED_REASON,
-    assertOwned,
-  });
+  let stopOperation: HostSuspensionState;
+  try {
+    stopOperation = await enqueueHostStopOperation({
+      ...generation,
+      reason: firewallFailClosedReason(revision),
+      assertOwned,
+    });
+  } catch {
+    await recoverFirewallFailCloseAfterOwnershipLoss(generation, revision);
+    return;
+  }
 
-  const fenced = await fenceFirewallGenerationMeta(generation);
+  const fenced = await fenceFirewallGenerationMeta(generation, revision);
   if (!fenced) return;
 
   try {
@@ -640,12 +686,56 @@ async function failClosedFirewallGeneration(
   });
 }
 
+async function recoverFirewallFailCloseAfterOwnershipLoss(
+  generation: SandboxGeneration,
+  revision: FirewallPolicyRevision,
+): Promise<void> {
+  // Exact revision CAS prevents a stale worker from fencing a successfully
+  // repaired policy on the same sandbox lifecycle generation.
+  const fenced = await fenceFirewallGenerationMeta(generation, revision);
+  if (fenced) {
+    try {
+      await withSandboxLifecycleRecoveryLock(async () => {
+        const current = await getInitializedMeta();
+        if (
+          current.status !== "error"
+          || current.sandboxId !== generation.sandboxId
+          || (current.lifecycleAttemptId ?? null) !== generation.lifecycleAttemptId
+          || current.firewall.lastPolicySdkCompletionRevisionId
+            !== revision.revisionId
+          || current.firewall.lastPolicySdkCompletionHash !== revision.policyHash
+          || current.firewall.failClosedPolicyRevisionId !== revision.revisionId
+          || current.firewall.failClosedPolicyHash !== revision.policyHash
+        ) return;
+        await enqueueHostStopOperation({
+          ...generation,
+          reason: firewallFailClosedReason(revision),
+        });
+      });
+    } catch {
+      // The durable metadata marker is repaired by status and watchdog passes.
+    }
+  }
+  logWarn("firewall.fail_closed_deferred", {
+    operation: "sync",
+    sandboxId: generation.sandboxId,
+    lifecycleAttemptId: generation.lifecycleAttemptId,
+    reason: "lifecycle-ownership-lost",
+  });
+}
+
 async function fenceFirewallGenerationMeta(
   generation: SandboxGeneration,
+  revision: FirewallPolicyRevision,
 ): Promise<boolean> {
   let fenced = false;
   await mutateMeta((meta) => {
-    if (!ownsSandboxGeneration(meta, generation)) return;
+    if (
+      !ownsSandboxIdentity(meta, generation)
+      || meta.firewall.lastPolicySdkCompletionRevisionId
+        !== revision.revisionId
+      || meta.firewall.lastPolicySdkCompletionHash !== revision.policyHash
+    ) return;
     // The durable monitor may complete between its outbox write and this
     // diagnostic update. Never regress a confirmed stop back to error.
     if (meta.status === "stopped") return;
@@ -654,6 +744,8 @@ async function fenceFirewallGenerationMeta(
     meta.portUrls = null;
     meta.lastGatewayProbeReady = false;
     meta.lastError = FIREWALL_FAIL_CLOSED_LAST_ERROR;
+    meta.firewall.failClosedPolicyRevisionId = revision.revisionId;
+    meta.firewall.failClosedPolicyHash = revision.policyHash;
   });
   return fenced;
 }
@@ -662,14 +754,72 @@ export async function syncFirewallPolicyIfRunning(
   options?: FirewallPolicyContext,
 ): Promise<FirewallSyncOutcome> {
   return withFirewallLifecycleMutation((assertOwned) =>
-    syncFirewallPolicyIfRunningWithinLifecycleLock(assertOwned, options));
+    withFirewallPolicyApplyLock(() =>
+      syncFirewallPolicyWithFailCloseWithinLifecycleLock(
+        assertOwned,
+        options,
+      )));
+}
+
+async function withFirewallPolicyApplyLock<T>(
+  action: () => Promise<T>,
+): Promise<T> {
+  const store = getStore();
+  const lockKey = firewallPolicyApplyLockKey();
+  const lockToken = await store.acquireLock(
+    lockKey,
+    FIREWALL_POLICY_APPLY_LOCK_TTL_SECONDS,
+  );
+  if (!lockToken) {
+    throw new ApiError(
+      503,
+      "FIREWALL_POLICY_APPLY_IN_PROGRESS",
+      "Another firewall policy application is still in progress. Retry this request.",
+    );
+  }
+  try {
+    return await action();
+  } finally {
+    await store.releaseLock(lockKey, lockToken);
+  }
+}
+
+async function syncFirewallPolicyWithFailCloseWithinLifecycleLock(
+  assertOwned: AssertLifecycleOwnership,
+  options?: FirewallPolicyContext,
+): Promise<FirewallSyncOutcome> {
+  try {
+    return await syncFirewallPolicyIfRunningWithinLifecycleLock(
+      assertOwned,
+      options,
+    );
+  } catch (error) {
+    if (error instanceof FirewallPolicySyncError) {
+      try {
+        await failClosedFirewallGeneration(
+          error.generation,
+          error.revision,
+          assertOwned,
+        );
+      } catch (fenceError) {
+        logWarn("firewall.fail_closed_incomplete", {
+          operation: "sync",
+          reason: fenceError instanceof Error
+            ? fenceError.message
+            : String(fenceError),
+          requestId: options?.requestId,
+        });
+      }
+    }
+    throw error;
+  }
 }
 
 async function syncFirewallPolicyIfRunningWithinLifecycleLock(
   assertOwned: AssertLifecycleOwnership,
   options?: FirewallPolicyContext,
 ): Promise<FirewallSyncOutcome> {
-  const meta = await getInitializedMeta();
+  let meta = await getInitializedMeta();
   const sandboxActive =
     Boolean(meta.sandboxId) &&
     (meta.status === "running" || meta.status === "booting");
@@ -708,6 +858,39 @@ async function syncFirewallPolicyIfRunningWithinLifecycleLock(
     sandboxId: meta.sandboxId,
     lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
   };
+  const revision: FirewallPolicyRevision = {
+    revisionId: randomUUID(),
+    policyHash: hash,
+  };
+  let revisionOwned = false;
+  meta = await mutateMeta((current) => {
+    if (!ownsSandboxGeneration(current, generation)) return;
+    const currentRequiredDomains = requiredControlPlaneDomains(
+      current.firewall.mode,
+      options?.controlPlaneOrigin,
+    );
+    if (
+      computePolicyHash(
+        current.firewall.mode,
+        current.firewall.allowlist,
+        currentRequiredDomains,
+      ) !== revision.policyHash
+    ) return;
+    revisionOwned = true;
+    current.firewall.policyRevisionId = revision.revisionId;
+    current.firewall.failClosedPolicyRevisionId = null;
+    current.firewall.failClosedPolicyHash = null;
+  });
+  if (!revisionOwned) {
+    return {
+      timestamp: Date.now(),
+      durationMs: 0,
+      allowlistCount: meta.firewall.allowlist.length,
+      policyHash: hash,
+      applied: false,
+      reason: "sandbox-generation-changed",
+    };
+  }
   try {
     // Resolve the current AI Gateway credential so the firewall transform rule
     // is refreshed with a fresh OIDC token on every policy sync. Without this,
@@ -738,16 +921,39 @@ async function syncFirewallPolicyIfRunningWithinLifecycleLock(
       };
     }
     const sandbox = await getSandboxController().get({
-      sandboxId: meta.sandboxId,
+      sandboxId: generation.sandboxId,
       resume: false,
     });
     await assertOwned();
-    await applyFirewallPolicyToSandbox(
-      sandbox,
-      meta,
-      credential?.token,
-      requiredDomains,
+    let applyError: unknown;
+    let applyFailed = false;
+    try {
+      await applyFirewallPolicyToSandbox(
+        sandbox,
+        meta,
+        credential?.token,
+        requiredDomains,
+      );
+    } catch (error) {
+      applyFailed = true;
+      applyError = error;
+    }
+    const completionRecorded = await recordPolicySdkCompletion(
+      generation,
+      revision,
+      !applyFailed,
     );
+    if (applyFailed) throw applyError;
+    if (!completionRecorded) {
+      return {
+        timestamp: Date.now(),
+        durationMs: Date.now() - syncStart,
+        allowlistCount: meta.firewall.allowlist.length,
+        policyHash: hash,
+        applied: false,
+        reason: "sandbox-generation-changed",
+      };
+    }
     await assertOwned();
     const now = Date.now();
     const durationMs = now - syncStart;
@@ -759,7 +965,10 @@ async function syncFirewallPolicyIfRunningWithinLifecycleLock(
       applied: true,
       reason: "policy-applied",
     };
-    const persisted = await mutateFirewallSyncForGeneration(generation, (m) => {
+    const persisted = await mutateFirewallSyncForGeneration(
+      generation,
+      revision.revisionId,
+      (m) => {
       m.firewall.lastSyncAppliedAt = now;
       m.firewall.lastSyncReason = "policy-applied";
       m.firewall.lastSyncOutcome = outcome;
@@ -768,7 +977,8 @@ async function syncFirewallPolicyIfRunningWithinLifecycleLock(
         m.lastTokenSource = credential.source;
         m.lastTokenExpiresAt = credential.expiresAt ?? null;
       }
-    });
+      },
+    );
     if (!persisted) {
       const staleOutcome: FirewallSyncOutcome = {
         ...outcome,
@@ -810,16 +1020,20 @@ async function syncFirewallPolicyIfRunningWithinLifecycleLock(
     logWarn("firewall.sync_failed", { operation: "sync", code: "SYNC_APPLY_ERROR", reason, durationMs, policyHash: hash, requestId: options?.requestId });
     try {
       await assertOwned();
-      await mutateFirewallSyncForGeneration(generation, (m) => {
+      await mutateFirewallSyncForGeneration(
+        generation,
+        revision.revisionId,
+        (m) => {
         m.firewall.lastSyncFailedAt = now;
         m.firewall.lastSyncReason = reason;
         m.firewall.lastSyncOutcome = outcome;
-      });
+        },
+      );
     } catch {
       // A stale worker may report its local failure, but it cannot publish
       // diagnostics into a lifecycle generation it no longer owns.
     }
-    throw error;
+    throw new FirewallPolicySyncError(error, generation, revision);
   }
 }
 

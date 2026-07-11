@@ -9,6 +9,10 @@ import {
 import { withHarness } from "@/test-utils/harness";
 import { buildAuthPutRequest, buildAuthDeleteRequest, callRoute } from "@/test-utils/route-caller";
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
+import {
+  hostSuspensionOperationKey,
+  lifecycleLockKey,
+} from "@/server/store/keyspace";
 
 const ORIGINAL_APP_URL = process.env.NEXT_PUBLIC_APP_URL;
 
@@ -224,9 +228,16 @@ test("DELETE handler calls spec.delete and returns updated state", async () => {
 // ---------------------------------------------------------------------------
 
 test("PUT handler attaches skipped live-config-sync header and body when sandbox not running", async () => {
-  await withHarness(async () => {
+  await withHarness(async (h) => {
     _setAiGatewayTokenOverrideForTesting("oidc-token");
     process.env.NEXT_PUBLIC_APP_URL = "https://app.example.com";
+    const store = h.getStore();
+    const acquireLock = store.acquireLock.bind(store);
+    let lifecycleAcquisitions = 0;
+    store.acquireLock = async (key, ttlSeconds) => {
+      if (key === lifecycleLockKey()) lifecycleAcquisitions += 1;
+      return acquireLock(key, ttlSeconds);
+    };
 
     const { PUT } = createChannelAdminRouteHandlers({
       channel: "slack",
@@ -266,6 +277,115 @@ test("PUT handler attaches skipped live-config-sync header and body when sandbox
     assert.equal(body.liveConfigSync.reason, "sandbox_not_running");
     assert.equal(body.liveConfigSync.liveConfigFresh, false);
     assert.equal(body.liveConfigSync.operatorMessage, null);
+    assert.equal(
+      lifecycleAcquisitions,
+      1,
+      "auth must not reacquire the lifecycle lock around live config sync",
+    );
+    store.acquireLock = acquireLock;
+  });
+});
+
+test("PUT handler holds one lifecycle lease across owner mutation and live sync", async () => {
+  await withHarness(async (h) => {
+    _setAiGatewayTokenOverrideForTesting("oidc-token");
+    process.env.NEXT_PUBLIC_APP_URL = "https://app.example.com";
+    const store = h.getStore();
+    let ownerObservedLifecycleLease = false;
+
+    const { PUT } = createChannelAdminRouteHandlers({
+      channel: "slack",
+      selectState: (s) => s.slack,
+      async put({ assertMutationOwned }) {
+        await assertMutationOwned();
+        const competingToken = await store.acquireLock(lifecycleLockKey(), 30);
+        ownerObservedLifecycleLease = competingToken === null;
+        if (competingToken) {
+          await store.releaseLock(lifecycleLockKey(), competingToken);
+        }
+      },
+      async delete() {},
+    });
+
+    const result = await callRoute(PUT, buildAuthPutRequest(
+      "/api/channels/slack",
+      JSON.stringify({}),
+      {
+        host: "app.example.com",
+        "x-forwarded-host": "app.example.com",
+        "x-forwarded-proto": "https",
+      },
+    ));
+
+    assert.equal(result.status, 200);
+    assert.equal(ownerObservedLifecycleLease, true);
+  });
+});
+
+test("PUT handler rejects a host fence that wins before route lease admission", async () => {
+  await withHarness(async (h) => {
+    _setAiGatewayTokenOverrideForTesting("oidc-token");
+    process.env.NEXT_PUBLIC_APP_URL = "https://app.example.com";
+    const store = h.getStore();
+    const acquireLock = store.acquireLock.bind(store);
+    let injected = false;
+    let ownerCalled = false;
+    store.acquireLock = async (key, ttlSeconds) => {
+      const token = await acquireLock(key, ttlSeconds);
+      if (key === lifecycleLockKey() && token && !injected) {
+        injected = true;
+        const now = Date.now();
+        await store.setValue(hostSuspensionOperationKey(), {
+          version: 1,
+          operationId: "operation-channel-route-race",
+          requestId: "operation-channel-route-race",
+          sandboxId: "sbx-channel-route-race",
+          lifecycleAttemptId: null,
+          intent: "stop",
+          reason: "test-race",
+          phase: "stopping",
+          ingressFenced: true,
+          suspensionId: "suspension-channel-route-race",
+          leaseExpiresAtMs: now + 60_000,
+          stopRequestDeadlineAtMs: null,
+          monitorHeartbeatAtMs: now,
+          startedAtMs: now - 1_000,
+          updatedAtMs: now,
+          stoppedAtMs: null,
+          resumedAtMs: null,
+          lastError: null,
+          lastErrorCode: null,
+          lastErrorClass: null,
+        });
+      }
+      return token;
+    };
+
+    try {
+      const { PUT } = createChannelAdminRouteHandlers({
+        channel: "slack",
+        selectState: (s) => s.slack,
+        async put() {
+          ownerCalled = true;
+        },
+        async delete() {},
+      });
+      const result = await callRoute(PUT, buildAuthPutRequest(
+        "/api/channels/slack",
+        JSON.stringify({}),
+        {
+          host: "app.example.com",
+          "x-forwarded-host": "app.example.com",
+          "x-forwarded-proto": "https",
+        },
+      ));
+
+      assert.equal(result.status, 503);
+      assert.equal((result.json as { error: string }).error, "HOST_INGRESS_FENCED");
+      assert.equal(ownerCalled, false);
+    } finally {
+      store.acquireLock = acquireLock;
+    }
   });
 });
 

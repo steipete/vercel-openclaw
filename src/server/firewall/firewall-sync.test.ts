@@ -5,7 +5,7 @@
  * Covers:
  * - applyFirewallPolicyToSandbox failure during bootstrap does not crash lifecycle
  * - firewall mode transition from learning to enforcing triggers policy sync
- * - policy sync retry after transient sandbox API failure
+ * - policy sync failure durably fences retry until lifecycle recovery
  * - learning mode ingestion extracts domains from shell log correctly
  * - concurrent sandbox restore results in exactly one firewall policy application
  */
@@ -165,7 +165,7 @@ test("setFirewallMode from learning to disabled syncs allow-all to sandbox", asy
 });
 
 // ---------------------------------------------------------------------------
-// 3. policy sync retry after transient sandbox API failure
+// 3. policy sync failure fences retry until lifecycle recovery
 // ---------------------------------------------------------------------------
 
 test("syncFirewallPolicyIfRunning reports applied:false when sandbox is not running", async () => {
@@ -177,7 +177,7 @@ test("syncFirewallPolicyIfRunning reports applied:false when sandbox is not runn
   });
 });
 
-test("syncFirewallPolicyIfRunning succeeds after transient failure on retry", async () => {
+test("syncFirewallPolicyIfRunning fences retry after transient apply failure", async () => {
   await withHarness(async (h) => {
     await seedRunning(h, (meta) => {
       meta.firewall.mode = "enforcing";
@@ -203,10 +203,20 @@ test("syncFirewallPolicyIfRunning succeeds after transient failure on retry", as
       (err: Error) => err.message === "transient sandbox API error",
     );
 
-    // Second attempt (retry) succeeds
-    const result = await syncFirewallPolicyIfRunning();
-    assert.equal(result.applied, true);
-    assert.equal(result.reason, "policy-applied");
+    const failed = await h.getMeta();
+    assert.equal(failed.status, "error");
+    assert.equal(failed.portUrls, null);
+    assert.equal(fakeHandle.stopCalled, true);
+
+    // The durable stop handoff owns recovery; an immediate same-sandbox retry
+    // must not reopen policy writes before lifecycle replacement completes.
+    await assert.rejects(
+      syncFirewallPolicyIfRunning(),
+      (error: unknown) => {
+        assert.equal((error as { code?: unknown }).code, "HOST_INGRESS_FENCED");
+        return true;
+      },
+    );
     assert.equal(callCount, 2);
   });
 });

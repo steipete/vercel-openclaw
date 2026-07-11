@@ -425,7 +425,7 @@ test("anti-entropy keeps a pending scheduled Workflow before its stale deadline"
   assert.equal(starts, 0);
 });
 
-test("anti-entropy preserves a pending scheduled Workflow until the hard ceiling", async () => {
+test("anti-entropy never replaces an exactly live pending Workflow", async () => {
   await acceptCronProjection(projection(1, now));
   await startCronProjectionDispatch({
     origin: "https://app.test",
@@ -453,7 +453,7 @@ test("anti-entropy preserves a pending scheduled Workflow until the hard ceiling
   assert.equal(starts, 0);
   assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), []);
 
-  const repaired = await reconcileCronProjection({
+  const stillLive = await reconcileCronProjection({
     origin: "https://app.test",
     enabled: true,
     getWorkflowRunStatus: async () => "pending",
@@ -463,10 +463,10 @@ test("anti-entropy preserves a pending scheduled Workflow until the hard ceiling
     },
     now: () => now + 3 * 60 * 60_000,
   });
-  assert.equal(repaired.status, "started");
-  assert.equal(repaired.repaired, true);
-  assert.equal(starts, 1);
-  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), ["wrun-pending-stale"]);
+  assert.equal(stillLive.status, "scheduled");
+  assert.equal(stillLive.repaired, false);
+  assert.equal(starts, 0);
+  assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), []);
 });
 
 test("unknown Workflow status defers replacement until the hard ceiling", async () => {
@@ -522,8 +522,8 @@ test("clock rollback cannot wedge a starting dispatch lease", async () => {
   assert.equal(result.repaired, true);
 });
 
-test("clock rollback cannot wedge scheduled, running, or completed dispatch", async () => {
-  for (const status of ["scheduled", "running", "completed"] as const) {
+test("clock rollback cannot wedge scheduled or running dispatch", async () => {
+  for (const status of ["scheduled", "running"] as const) {
     _resetStoreForTesting();
     await acceptCronProjection(projection(1, now));
     let envelope: CronWakeWorkflowEnvelopeV1 | undefined;
@@ -536,7 +536,7 @@ test("clock rollback cannot wedge scheduled, running, or completed dispatch", as
       now: () => now,
     });
     assert.ok(envelope);
-    if (status === "running" || status === "completed") {
+    if (status === "running") {
       assert.equal(
         await claimCronWake(
           envelope,
@@ -548,9 +548,6 @@ test("clock rollback cannot wedge scheduled, running, or completed dispatch", as
         true,
       );
     }
-    if (status === "completed") {
-      await completeCronWake(envelope, `wrun-${status}-execution`, now);
-    }
     await mutateCronProjection((record) => {
       if (record.dispatch.status !== status) return null;
       const futureMs = now + 10 * 60_000;
@@ -558,8 +555,6 @@ test("clock rollback cannot wedge scheduled, running, or completed dispatch", as
         record.dispatch.scheduledAtMs = futureMs;
       } else if (record.dispatch.status === "running") {
         record.dispatch.claimedAtMs = futureMs;
-      } else {
-        record.dispatch.completedAtMs = futureMs;
       }
       return record;
     });
@@ -622,7 +617,7 @@ test("anti-entropy immediately replaces a terminal running Workflow", async () =
   assert.deepEqual(cancelled.filter((runId) => runId !== "wrun-repair"), ["wrun-parent"]);
 });
 
-test("active running Workflow gets a soft grace and a hard recovery ceiling", async () => {
+test("anti-entropy never replaces an exactly live running Workflow", async () => {
   await acceptCronProjection(projection(1, now));
   let envelope: CronWakeWorkflowEnvelopeV1 | undefined;
   await startCronProjectionDispatch({
@@ -660,7 +655,7 @@ test("active running Workflow gets a soft grace and a hard recovery ceiling", as
   assert.equal(result.workflowRunId, "wrun-parent");
   assert.equal(starts, 0);
 
-  const repaired = await reconcileCronProjection({
+  const stillLive = await reconcileCronProjection({
     origin: "https://app.test",
     enabled: true,
     getWorkflowRunStatus: async () => "running",
@@ -670,9 +665,9 @@ test("active running Workflow gets a soft grace and a hard recovery ceiling", as
     },
     now: () => now + 3 * 60 * 60_000,
   });
-  assert.equal(repaired.status, "started");
-  assert.equal(repaired.repaired, true);
-  assert.equal(starts, 1);
+  assert.equal(stillLive.status, "scheduled");
+  assert.equal(stillLive.repaired, false);
+  assert.equal(starts, 0);
 });
 
 test("handoff records the current-deployment child before watchdog probes", async () => {
@@ -1027,6 +1022,20 @@ test("completed projection never recursively dispatches its old due time", async
   assert.equal(healthyParent.status, "idle");
   assert.equal(starts, 0);
 
+  const exhausted = await reconcileCronProjection({
+    origin: "https://app.test",
+    enabled: true,
+    getWorkflowRunStatus: async () => "completed",
+    startWorkflow: async () => {
+      starts += 1;
+      return { runId: "must-not-replay-exhausted-settlement" };
+    },
+    now: () => now + 3 * 60 * 60_000,
+  });
+  assert.equal(exhausted.status, "settlement-blocked");
+  assert.equal(exhausted.workflowRunId, "wrun-completed");
+  assert.equal(starts, 0);
+
   await mutateCronProjection((record) => {
     if (record.dispatch.status !== "completed") return null;
     record.dispatch.legacyWorkflowOwner = true;
@@ -1042,6 +1051,6 @@ test("completed projection never recursively dispatches its old due time", async
     },
     now: () => now + 4 * 60 * 60_000,
   });
-  assert.equal(legacyCompleted.status, "idle");
+  assert.equal(legacyCompleted.status, "settlement-blocked");
   assert.equal(starts, 0);
 });

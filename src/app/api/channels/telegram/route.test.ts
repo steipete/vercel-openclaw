@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
+import { afterEach, mock, test } from "node:test";
 
 import {
   buildChannelConnectability,
@@ -8,6 +8,7 @@ import {
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
 import { withHarness } from "@/test-utils/harness";
 import {
+  buildAuthDeleteRequest,
   buildAuthPutRequest,
   callRoute,
   getTelegramChannelRoute,
@@ -96,3 +97,167 @@ test("telegram PUT through route factory returns 409 when not connectable", asyn
   });
 });
 
+test("telegram bot replacement keeps a durable cleanup obligation when old deletion fails", async () => {
+  await withHarness(async (h) => {
+    _setAiGatewayTokenOverrideForTesting("oidc-token");
+    const originalAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    process.env.NEXT_PUBLIC_APP_URL = "https://openclaw.example";
+    await h.mutateMeta((meta) => {
+      meta.channels.telegram = {
+        botToken: "old-token",
+        botId: "100",
+        webhookSecret: "old-secret",
+        webhookUrl: "https://openclaw.example/api/channels/telegram/webhook",
+        botUsername: "old_bot",
+        configuredAt: 1,
+      };
+    });
+    const calls: string[] = [];
+    const fetchMock = mock.method(
+      globalThis,
+      "fetch",
+      async (input: string | URL | Request) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("/botnew-token/getMe")) {
+        return Response.json({
+          ok: true,
+          result: { id: 200, is_bot: true, first_name: "New", username: "new_bot" },
+        });
+      }
+      if (url.endsWith("/botold-token/deleteWebhook")) {
+        return Response.json(
+          { ok: false, error_code: 503, description: "cleanup unavailable" },
+          { status: 503 },
+        );
+      }
+      if (
+        url.endsWith("/botnew-token/setWebhook") ||
+        url.endsWith("/botnew-token/setMyCommands") ||
+        url.endsWith("/botnew-token/deleteWebhook")
+      ) {
+        return Response.json({ ok: true, result: true });
+      }
+      throw new Error(`unexpected Telegram API call: ${url}`);
+      },
+    );
+    try {
+      const result = await callRoute(
+        getTelegramChannelRoute().PUT!,
+        buildAuthPutRequest(
+          "/api/channels/telegram",
+          JSON.stringify({ botToken: "new-token" }),
+        ),
+      );
+      assert.equal(result.status, 200);
+      const config = (await h.getMeta()).channels.telegram;
+      assert.equal(config?.botToken, "new-token");
+      assert.equal(config?.pendingWebhookCleanups?.[0]?.botToken, "old-token");
+      assert.equal(
+        calls.some((url) => url.endsWith("/botnew-token/setWebhook")),
+        true,
+      );
+      assert.equal(
+        calls.some((url) => url.endsWith("/botnew-token/deleteWebhook")),
+        false,
+      );
+    } finally {
+      fetchMock.mock.restore();
+      if (originalAppUrl === undefined) delete process.env.NEXT_PUBLIC_APP_URL;
+      else process.env.NEXT_PUBLIC_APP_URL = originalAppUrl;
+    }
+  });
+});
+
+test("telegram bot replacement keeps the old webhook when new setup fails", async () => {
+  await withHarness(async (h) => {
+    _setAiGatewayTokenOverrideForTesting("oidc-token");
+    const originalAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    process.env.NEXT_PUBLIC_APP_URL = "https://openclaw.example";
+    await h.mutateMeta((meta) => {
+      meta.channels.telegram = {
+        botToken: "old-token",
+        botId: "100",
+        webhookSecret: "old-secret",
+        webhookUrl: "https://openclaw.example/api/channels/telegram/webhook",
+        botUsername: "old_bot",
+        configuredAt: 1,
+      };
+    });
+    const calls: string[] = [];
+    const fetchMock = mock.method(
+      globalThis,
+      "fetch",
+      async (input: string | URL | Request) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.endsWith("/botnew-token/getMe")) {
+          return Response.json({
+            ok: true,
+            result: { id: 200, is_bot: true, first_name: "New", username: "new_bot" },
+          });
+        }
+        if (url.endsWith("/botnew-token/setWebhook")) {
+          return Response.json(
+            { ok: false, error_code: 503, description: "setup unavailable" },
+            { status: 503 },
+          );
+        }
+        throw new Error(`unexpected Telegram API call: ${url}`);
+      },
+    );
+    try {
+      const result = await callRoute(
+        getTelegramChannelRoute().PUT!,
+        buildAuthPutRequest(
+          "/api/channels/telegram",
+          JSON.stringify({ botToken: "new-token" }),
+        ),
+      );
+      assert.equal(result.status, 500);
+      assert.equal((await h.getMeta()).channels.telegram?.botToken, "old-token");
+      assert.equal(
+        calls.some((url) => url.endsWith("/botold-token/deleteWebhook")),
+        false,
+      );
+    } finally {
+      fetchMock.mock.restore();
+      if (originalAppUrl === undefined) delete process.env.NEXT_PUBLIC_APP_URL;
+      else process.env.NEXT_PUBLIC_APP_URL = originalAppUrl;
+    }
+  });
+});
+
+test("telegram DELETE retains durable retry state when webhook cleanup fails", async () => {
+  await withHarness(async (h) => {
+    await h.mutateMeta((meta) => {
+      meta.channels.telegram = {
+        botToken: "active-token",
+        botId: "100",
+        webhookSecret: "active-secret",
+        webhookUrl: "https://openclaw.example/api/channels/telegram/webhook",
+        botUsername: "active_bot",
+        configuredAt: 1,
+      };
+    });
+    const fetchMock = mock.method(globalThis, "fetch", async () =>
+      Response.json(
+        { ok: false, error_code: 503, description: "cleanup unavailable" },
+        { status: 503 },
+      ),
+    );
+    try {
+      const result = await callRoute(
+        getTelegramChannelRoute().DELETE!,
+        buildAuthDeleteRequest("/api/channels/telegram", "{}"),
+      );
+      assert.equal(result.status, 500);
+      const config = (await h.getMeta()).channels.telegram;
+      assert.equal(config?.botToken, "active-token");
+      assert.equal(config?.deletionPending, true);
+      assert.equal(config?.lastError, "Telegram disconnect cleanup is pending.");
+    } finally {
+      fetchMock.mock.restore();
+    }
+  });
+});

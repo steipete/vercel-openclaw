@@ -90,6 +90,7 @@ export async function processHostStopMonitorStep(
     || state.phase === "preparing"
     || state.phase === "prepared"
     || state.phase === "stop-requesting"
+    || state.phase === "thawing"
     || state.phase === "rollback-pending"
   ) {
     meta = await deps.reconcile();

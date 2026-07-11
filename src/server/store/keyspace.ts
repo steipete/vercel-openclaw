@@ -87,6 +87,10 @@ export function learningLockKey(): string {
   return buildKey("lock:learning-refresh");
 }
 
+export function firewallPolicyApplyLockKey(): string {
+  return buildKey("lock:firewall-policy-apply");
+}
+
 export function debugLockKey(): string {
   return buildKey("lock:debug-timing");
 }
@@ -172,6 +176,20 @@ export function channelBootMessageKey(
   deliveryId: string,
 ): string {
   return buildKey(`channels:${channel}:boot-message:${deliveryId}`);
+}
+
+export function channelHandoffKey(
+  channel: ChannelName,
+  deliveryId: string,
+): string {
+  return buildKey(`channels:${channel}:handoff:${deliveryId}`);
+}
+
+export function channelHandoffLockKey(
+  channel: ChannelName,
+  deliveryId: string,
+): string {
+  return buildKey(`channels:${channel}:handoff-lock:${deliveryId}`);
 }
 
 export function watchdogReportKey(): string {

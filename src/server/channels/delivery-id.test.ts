@@ -33,7 +33,7 @@ test("channel delivery id: fallback is deterministic for one workflow envelope",
   assert.match(deriveChannelDeliveryId(input), /^slack:[0-9a-f]{32}$/);
 });
 
-test("channel delivery id: Telegram update ids are scoped to config generation", () => {
+test("channel delivery id: legacy Telegram update ids retain a generation namespace", () => {
   const shared = {
     channel: "telegram",
     payload: { update_id: 42 },
@@ -49,7 +49,27 @@ test("channel delivery id: Telegram update ids are scoped to config generation",
     telegramConfig: { botUsername: "second_bot", configuredAt: 200 },
   });
 
-  assert.equal(first, "telegram:first_bot:100:42");
-  assert.equal(second, "telegram:second_bot:200:42");
+  assert.equal(first, "telegram:legacy:first_bot:100:42");
+  assert.equal(second, "telegram:legacy:second_bot:200:42");
   assert.notEqual(first, second);
+});
+
+test("channel delivery id: stable Telegram bot identity survives config rotation", () => {
+  const shared = {
+    channel: "telegram",
+    payload: { update_id: 42 },
+    requestId: "req-42",
+    receivedAtMs: 1000,
+  };
+  const first = deriveChannelDeliveryId({
+    ...shared,
+    telegramConfig: { botId: "123", botUsername: "first_bot", configuredAt: 100 },
+  });
+  const second = deriveChannelDeliveryId({
+    ...shared,
+    telegramConfig: { botId: "123", botUsername: "renamed_bot", configuredAt: 200 },
+  });
+
+  assert.equal(first, "telegram:bot:123:42");
+  assert.equal(second, first);
 });

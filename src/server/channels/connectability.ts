@@ -14,6 +14,7 @@ import { logDebug } from "@/server/log";
 import { getProtectionBypassSecret } from "@/server/public-url";
 import { buildChannelDisplayWebhookUrl } from "@/server/channels/webhook-urls";
 import { HOSTED_WHATSAPP_UNAVAILABLE_MESSAGE } from "@/server/channels/whatsapp/hosted-support";
+import { HOSTED_DISCORD_UNAVAILABLE_MESSAGE } from "@/server/channels/discord/hosted-support";
 
 const ALL_CHANNELS: ChannelName[] = ["slack", "telegram", "discord", "whatsapp"];
 
@@ -25,7 +26,7 @@ type ChannelDefinition = {
 const CHANNEL_DEFINITIONS: Record<ChannelName, ChannelDefinition> = {
   slack: { label: "Slack", mode: "webhook-proxied" },
   telegram: { label: "Telegram", mode: "webhook-proxied" },
-  discord: { label: "Discord", mode: "webhook-proxied" },
+  discord: { label: "Discord", mode: "unsupported" },
   whatsapp: { label: "WhatsApp", mode: "unsupported" },
 };
 
@@ -178,13 +179,19 @@ export async function buildChannelPrerequisite(
   const def = CHANNEL_DEFINITIONS[channel];
   const label = def.label;
   if (def.mode === "unsupported") {
+    const unavailableMessage =
+      channel === "discord"
+        ? HOSTED_DISCORD_UNAVAILABLE_MESSAGE
+        : HOSTED_WHATSAPP_UNAVAILABLE_MESSAGE;
     const issues: ChannelConnectabilityIssue[] = [
       {
         id: "hosted-transport-unavailable",
         status: "fail",
-        message: HOSTED_WHATSAPP_UNAVAILABLE_MESSAGE,
+        message: unavailableMessage,
         remediation:
-          "Use local OpenClaw linked-device WhatsApp support until the hosted transport contract is implemented end to end.",
+          channel === "discord"
+            ? "Use local OpenClaw Discord Gateway support."
+            : "Use local OpenClaw linked-device WhatsApp support until the hosted transport contract is implemented end to end.",
         env: [],
       },
     ];

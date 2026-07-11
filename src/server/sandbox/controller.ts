@@ -79,6 +79,8 @@ export interface SandboxHandle {
   stop(options?: { blocking?: boolean }): Promise<void>;
   delete(options?: { signal?: AbortSignal }): Promise<void>;
   extendTimeout(duration: number): Promise<void>;
+  /** Extend only the captured session; never resume a stopped transition. */
+  extendTimeoutWithoutResume(duration: number): Promise<void>;
   updateNetworkPolicy(policy: NetworkPolicy): Promise<NetworkPolicy>;
   runDetachedCommand(options: RunCommandOptions): Promise<{ cmdId: string }>;
   getCommand(cmdId: string): Promise<{ kill(signal?: string): Promise<void> }>;
@@ -162,6 +164,9 @@ function wrapSandbox(sandbox: Sandbox): SandboxHandle {
     },
     async extendTimeout(duration) {
       await sandbox.extendTimeout(duration);
+    },
+    async extendTimeoutWithoutResume(duration) {
+      await sandbox.currentSession().extendTimeout(duration);
     },
     async updateNetworkPolicy(policy) {
       await sandbox.update({ networkPolicy: policy });

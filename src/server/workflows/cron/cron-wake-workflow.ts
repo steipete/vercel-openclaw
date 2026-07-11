@@ -2,8 +2,10 @@ import { sleep } from "workflow";
 
 import type { CronWakeWorkflowEnvelopeV1 } from "@/server/cron/workflow-contract";
 import {
+  countCronSettlementRecoveryAttempt,
   getCronWakeDurableRetryMs,
   CRON_WAKE_MONITOR_INTERVAL_MS,
+  shouldContinueCronSettlementRecovery,
 } from "@/server/workflows/cron/cron-wake-contract";
 import {
   handoffCronWakeStep,
@@ -13,9 +15,12 @@ import {
 } from "@/server/workflows/cron/cron-wake-steps";
 
 export {
+  CRON_SETTLEMENT_MAX_RECOVERY_ATTEMPTS,
   CRON_WAKE_POST_DUE_SAFETY_MS,
   getCronWakeCredentialRetry,
   getCronWakeDurableRetryMs,
+  countCronSettlementRecoveryAttempt,
+  shouldContinueCronSettlementRecovery,
   shouldCancelCronWakeHandoff,
 } from "@/server/workflows/cron/cron-wake-contract";
 export {
@@ -40,10 +45,18 @@ export async function cronWakeWorkflow(
     if (outcome.status === "settled") return;
     if (outcome.status === "monitor") {
       let monitorAfterMs = CRON_WAKE_MONITOR_INTERVAL_MS;
+      let settlementRecoveryAttempts = 0;
       while (true) {
         await sleep(monitorAfterMs);
         const monitor = await settleCronWakeStep(envelope);
         if (monitor.status === "settled") return;
+        settlementRecoveryAttempts = countCronSettlementRecoveryAttempt(
+          settlementRecoveryAttempts,
+          monitor.settlementRecoveryAttempted,
+        );
+        if (!shouldContinueCronSettlementRecovery(settlementRecoveryAttempts)) {
+          return;
+        }
         monitorAfterMs = monitor.retryAfterMs;
       }
     }

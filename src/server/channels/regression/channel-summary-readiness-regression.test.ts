@@ -103,7 +103,7 @@ test("SUM-01 summary keeps configured-only distinct from route/delivery/user-vis
   });
 });
 
-test("SUM-02 Discord route-ready only does not imply native acceptance or user-visible reply", async () => {
+test("SUM-02 hosted Discord stays unavailable despite legacy route configuration", async () => {
   await withSummaryTestEnv(async () => {
     await mutateMeta((meta) => {
       meta.channels.discord = {
@@ -120,14 +120,14 @@ test("SUM-02 Discord route-ready only does not imply native acceptance or user-v
 
     const summary = await readSummary();
 
-    assert.equal(summary.discord.routeReady, true);
+    assert.equal(summary.discord.routeReady, false);
     assert.equal(summary.discord.nativeAccepted, false);
     assert.equal(summary.discord.userVisibleReplyVerified, false);
-    assert.equal(summary.discord.readiness.reason, "discord_native_acceptance_not_observed");
+    assert.equal(summary.discord.readiness.reason, "hosted_discord_transport_unavailable");
   });
 });
 
-test("SUM-03 accepted native forward stays separate from route readiness and user-visible reply", async () => {
+test("SUM-03 legacy Discord forward evidence cannot enable unsupported hosted delivery", async () => {
   await withSummaryTestEnv(async () => {
     await mutateMeta((meta) => {
       meta.channels.discord = {
@@ -151,13 +151,14 @@ test("SUM-03 accepted native forward stays separate from route readiness and use
 
     const summary = await readSummary();
 
-    assert.equal(summary.discord.nativeAccepted, true);
+    assert.equal(summary.discord.nativeAccepted, false);
     assert.equal(summary.discord.routeReady, false);
     assert.equal(summary.discord.userVisibleReplyVerified, false);
+    assert.equal(summary.discord.readiness.reason, "hosted_discord_transport_unavailable");
   });
 });
 
-test("SUM-04 user-visible reply failure does not become successful delivery", async () => {
+test("SUM-04 legacy Discord reply evidence cannot enable unsupported hosted delivery", async () => {
   await withSummaryTestEnv(async () => {
     const now = Date.now();
     await mutateMeta((meta) => {
@@ -192,9 +193,9 @@ test("SUM-04 user-visible reply failure does not become successful delivery", as
 
     const summary = await readSummary();
 
-    assert.equal(summary.discord.nativeAccepted, true);
+    assert.equal(summary.discord.nativeAccepted, false);
     assert.equal(summary.discord.userVisibleReplyVerified, false);
-    assert.equal(summary.discord.readiness.reason, "discord_user_visible_reply_not_observed");
+    assert.equal(summary.discord.readiness.reason, "hosted_discord_transport_unavailable");
   });
 });
 

@@ -11,8 +11,13 @@ import {
   buildChannelConnectability,
   buildChannelConnectBlockedResponse,
 } from "@/server/channels/connectability";
-import { applyChannelConfigChange } from "@/server/channels/admin/apply-channel-config-change";
+import { applyChannelConfigChangeUnderLifecycleLock } from "@/server/channels/admin/apply-channel-config-change";
 import { getPublicChannelState } from "@/server/channels/state";
+import {
+  buildHostIngressFencedResponse,
+  getHostMutationFence,
+} from "@/server/sandbox/host-suspension";
+import { withSandboxLifecycleMutationLock } from "@/server/sandbox/lifecycle";
 import { getInitializedMeta } from "@/server/store/store";
 
 type RouteAuth = Exclude<Awaited<ReturnType<typeof requireJsonRouteAuth>>, Response>;
@@ -24,6 +29,10 @@ export type ChannelRouteContext = {
   url: URL;
 };
 
+export type ChannelMutationRouteContext = ChannelRouteContext & {
+  assertMutationOwned: () => Promise<void>;
+};
+
 export type ChannelGetContext<TState> = ChannelRouteContext & {
   fullState: PublicChannelState;
   state: TState;
@@ -33,8 +42,8 @@ export type ChannelAdminRouteSpec<TState> = {
   channel: ChannelName;
   selectState(fullState: PublicChannelState): TState;
   get?(context: ChannelGetContext<TState>): Promise<unknown | Response>;
-  put(context: ChannelRouteContext): Promise<void | Response>;
-  delete(context: ChannelRouteContext): Promise<void | Response>;
+  put(context: ChannelMutationRouteContext): Promise<void | Response>;
+  delete(context: ChannelMutationRouteContext): Promise<void | Response>;
 };
 
 export function createChannelAdminRouteHandlers<TState>(
@@ -84,26 +93,37 @@ export function createChannelAdminRouteHandlers<TState>(
           return buildChannelConnectBlockedResponse(auth, connectability);
         }
 
-        const meta = await getInitializedMeta();
-        const result = await spec.put({
-          request,
-          auth,
-          meta,
-          url: new URL(request.url),
-        });
-        if (result instanceof Response) {
-          return result;
-        }
+        return await withSandboxLifecycleMutationLock(async (assertOwned) => {
+          await assertOwned();
+          const fence = await getHostMutationFence();
+          if (fence) return buildHostIngressFencedResponse(fence);
 
-        const { liveConfigSync } = await applyChannelConfigChange({
-          channel: spec.channel,
-          operation: "put",
-        });
+          await assertOwned();
+          const meta = await getInitializedMeta();
+          const result = await spec.put({
+            request,
+            auth,
+            meta,
+            url: new URL(request.url),
+            assertMutationOwned: assertOwned,
+          });
+          if (result instanceof Response) return result;
 
-        const nextState = spec.selectState(await getPublicChannelState(request));
-        const body = { ...nextState, liveConfigSync: toLiveConfigSyncPayload(liveConfigSync) };
-        const response = authJsonOk(body, auth);
-        return attachLiveConfigSyncHeaders(response, liveConfigSync);
+          await assertOwned();
+          const { liveConfigSync } =
+            await applyChannelConfigChangeUnderLifecycleLock({
+              channel: spec.channel,
+              operation: "put",
+            }, assertOwned);
+
+          const nextState = spec.selectState(await getPublicChannelState(request));
+          const body = {
+            ...nextState,
+            liveConfigSync: toLiveConfigSyncPayload(liveConfigSync),
+          };
+          const response = authJsonOk(body, auth);
+          return attachLiveConfigSyncHeaders(response, liveConfigSync);
+        });
       } catch (error) {
         return authJsonError(error, auth);
       }
@@ -116,26 +136,37 @@ export function createChannelAdminRouteHandlers<TState>(
       }
 
       try {
-        const meta = await getInitializedMeta();
-        const result = await spec.delete({
-          request,
-          auth,
-          meta,
-          url: new URL(request.url),
-        });
-        if (result instanceof Response) {
-          return result;
-        }
+        return await withSandboxLifecycleMutationLock(async (assertOwned) => {
+          await assertOwned();
+          const fence = await getHostMutationFence();
+          if (fence) return buildHostIngressFencedResponse(fence);
 
-        const { liveConfigSync } = await applyChannelConfigChange({
-          channel: spec.channel,
-          operation: "delete",
-        });
+          await assertOwned();
+          const meta = await getInitializedMeta();
+          const result = await spec.delete({
+            request,
+            auth,
+            meta,
+            url: new URL(request.url),
+            assertMutationOwned: assertOwned,
+          });
+          if (result instanceof Response) return result;
 
-        const nextState = spec.selectState(await getPublicChannelState(request));
-        const body = { ...nextState, liveConfigSync: toLiveConfigSyncPayload(liveConfigSync) };
-        const response = authJsonOk(body, auth);
-        return attachLiveConfigSyncHeaders(response, liveConfigSync);
+          await assertOwned();
+          const { liveConfigSync } =
+            await applyChannelConfigChangeUnderLifecycleLock({
+              channel: spec.channel,
+              operation: "delete",
+            }, assertOwned);
+
+          const nextState = spec.selectState(await getPublicChannelState(request));
+          const body = {
+            ...nextState,
+            liveConfigSync: toLiveConfigSyncPayload(liveConfigSync),
+          };
+          const response = authJsonOk(body, auth);
+          return attachLiveConfigSyncHeaders(response, liveConfigSync);
+        });
       } catch (error) {
         return authJsonError(error, auth);
       }

@@ -68,12 +68,15 @@ export const HOSTED_FEATURE_SUPPORT_ENTRIES = [
     area: "channels",
     feature: "Discord",
     userExpectation: "Connect Discord interactions and receive final replies.",
-    upstreamEvidence: "OpenClaw includes Discord channel support.",
-    hostedStatus: "experimental",
+    upstreamEvidence:
+      "OpenClaw's Discord integration requires a persistent Bot Gateway client; it does not expose a hosted HTTP interaction handler.",
+    hostedStatus: "not-supported",
     owningRepo: "vercel-openclaw",
-    verificationSignal: "Endpoint configured, /ask command registered, route ready, native accepted, and user-visible reply verified.",
-    nextAction: "Keep marked experimental until real platform delivery and user-visible replies are verified end to end.",
-    alternativePath: "Use local/upstream OpenClaw for unverified Discord behavior.",
+    verificationSignal:
+      "Hosted setup and delivery remain fail-closed until a supported persistent Gateway transport exists.",
+    nextAction:
+      "Do not accept hosted Discord setup or defer interactions to a nonexistent native HTTP route.",
+    alternativePath: "Use local/upstream OpenClaw Discord Gateway support.",
   },
   {
     id: "channel-whatsapp",

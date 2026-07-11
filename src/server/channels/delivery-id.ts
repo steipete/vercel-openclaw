@@ -45,7 +45,7 @@ export function deriveChannelDeliveryId(input: {
   receivedAtMs: number | null;
   telegramConfig?: Pick<
     TelegramChannelConfig,
-    "botUsername" | "configuredAt"
+    "botId" | "deliveryNamespace" | "botUsername" | "configuredAt"
   > | null;
 }): string {
   const platformId = extractChannelPlatformDeliveryId(
@@ -54,8 +54,12 @@ export function deriveChannelDeliveryId(input: {
   );
   if (platformId) {
     if (input.channel === "telegram" && input.telegramConfig) {
-      const generation = `${input.telegramConfig.botUsername || "unknown"}:${input.telegramConfig.configuredAt}`;
-      return `telegram:${generation}:${platformId.slice("telegram:".length)}`;
+      const botIdentity =
+        input.telegramConfig.deliveryNamespace ??
+        (input.telegramConfig.botId
+          ? `bot:${input.telegramConfig.botId}`
+          : `legacy:${input.telegramConfig.botUsername || "unknown"}:${input.telegramConfig.configuredAt}`);
+      return `telegram:${botIdentity}:${platformId.slice("telegram:".length)}`;
     }
     return platformId;
   }

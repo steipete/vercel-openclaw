@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { RetryableSendError } from "@/server/channels/core/types";
+import { deriveChannelDeliveryId } from "@/server/channels/delivery-id";
 import type { ChannelReply } from "@/server/channels/core/types";
 import {
   createTelegramAdapter,
@@ -14,9 +15,11 @@ test("isTelegramWebhookSecretValid accepts current and unexpired previous secret
   const now = Date.now();
   const config = {
     botToken: "bot-token",
+    botId: "123",
     webhookSecret: "current-secret",
     previousWebhookSecret: "previous-secret",
     previousSecretExpiresAt: now + 60_000,
+    previousBotId: "123",
     previousBotUsername: "previous_bot",
     previousConfiguredAt: now - 1,
     webhookUrl: "https://example.com/api/channels/telegram/webhook",
@@ -29,9 +32,38 @@ test("isTelegramWebhookSecretValid accepts current and unexpired previous secret
   assert.equal(isTelegramWebhookSecretValid(config, "previous-secret", now + 120_000), false);
   assert.deepEqual(matchTelegramWebhookSecret(config, "previous-secret", now), {
     generation: "previous",
+    botId: "123",
+    deliveryNamespace: null,
     botUsername: "previous_bot",
     configuredAt: now - 1,
   });
+});
+
+test("legacy Telegram bot upgrades preserve the delivery namespace", () => {
+  const payload = { update_id: 42 };
+  const legacy = deriveChannelDeliveryId({
+    channel: "telegram",
+    payload,
+    requestId: null,
+    receivedAtMs: null,
+    telegramConfig: {
+      botUsername: "legacy_bot",
+      configuredAt: 123,
+    },
+  });
+  const upgraded = deriveChannelDeliveryId({
+    channel: "telegram",
+    payload,
+    requestId: null,
+    receivedAtMs: null,
+    telegramConfig: {
+      botId: "999",
+      deliveryNamespace: "legacy:legacy_bot:123",
+      botUsername: "legacy_bot",
+      configuredAt: 456,
+    },
+  });
+  assert.equal(upgraded, legacy);
 });
 
 test("createTelegramAdapter extracts chat text updates", async () => {

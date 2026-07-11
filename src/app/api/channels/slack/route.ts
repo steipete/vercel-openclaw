@@ -36,7 +36,7 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
     return { ...state, diagnostics };
   },
 
-  async put({ request }) {
+  async put({ request, assertMutationOwned }) {
     const body = (await request.json()) as {
       signingSecret?: unknown;
       botToken?: unknown;
@@ -50,6 +50,7 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
       throw new ApiError(400, code, code);
     });
 
+    await assertMutationOwned();
     await setSlackChannelConfig({
       signingSecret,
       botToken,
@@ -57,10 +58,17 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
       team: authTest.team,
       user: authTest.user,
       botId: authTest.botId,
+      liveConfigSync: {
+        outcome: "skipped",
+        reason: "config_sync_pending",
+        liveConfigFresh: false,
+        checkedAt: Date.now(),
+      },
     });
   },
 
-  async delete() {
+  async delete({ assertMutationOwned }) {
+    await assertMutationOwned();
     await setSlackChannelConfig(null);
   },
 });

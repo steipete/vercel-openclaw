@@ -171,7 +171,7 @@ test("watchdog repairs a persisted firewall fail-closed handoff", async () => {
         sandboxId: "sbx-firewall-error",
         lastError: FIREWALL_FAIL_CLOSED_LAST_ERROR,
       }) as SingleMeta,
-      reconcileFailClosed: async () => {
+      reconcileLifecycleState: async () => {
         repairCalls += 1;
         return { status: "stopped", sandboxId: "sbx-firewall-error" } as SingleMeta;
       },
@@ -179,6 +179,27 @@ test("watchdog repairs a persisted firewall fail-closed handoff", async () => {
   );
 
   assert.equal(repairCalls, 1);
+});
+
+test("watchdog reconciles an interrupted host thaw before status classification", async () => {
+  let reconciliationCalls = 0;
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      getMeta: async () => ({
+        status: "error",
+        sandboxId: "sbx-thawing",
+        lastError: "worker exited during thaw",
+      }) as SingleMeta,
+      reconcileLifecycleState: async () => {
+        reconciliationCalls += 1;
+        return { status: "running", sandboxId: "sbx-thawing" } as SingleMeta;
+      },
+    }),
+  );
+
+  assert.equal(reconciliationCalls, 1);
+  assert.equal(report.status, "ok");
 });
 
 test("watchdog repairs the durable sandbox deadline owner on every running pass", async () => {
@@ -216,6 +237,33 @@ test("watchdog fails while deadline workflow attachment is unsettled", async () 
   assert.equal(report.status, "failed");
   assert.equal(findCheck(report, "sandbox.deadline")?.status, "fail");
   assert.match(report.lastError ?? "", /attachment has not settled/);
+});
+
+test("deadline repair failure does not suppress cron anti-entropy", async () => {
+  let cronCalls = 0;
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      armDeadline: async () => {
+        throw new Error("deadline owner unavailable");
+      },
+      reconcileCronProjection: async () => {
+        cronCalls += 1;
+        return {
+          status: "scheduled",
+          projectionRevision: 3,
+          nextRunAtMs: 1234,
+          workflowRunId: "wrun-cron-live",
+          repaired: false,
+        };
+      },
+    }),
+  );
+
+  assert.equal(cronCalls, 1);
+  assert.equal(report.status, "failed");
+  assert.equal(findCheck(report, "sandbox.deadline")?.status, "fail");
+  assert.equal(findCheck(report, "cron.wake")?.status, "pass");
 });
 
 test("running sandbox with healthy probe refreshes AI Gateway token", async () => {
@@ -337,6 +385,27 @@ test("watchdog fails while a cron dispatch start lease is unsettled", async () =
   assert.match(
     findCheck(report, "cron.wake")?.message ?? "",
     /start lease has not settled/,
+  );
+});
+
+test("watchdog surfaces exhausted cron settlement without replaying it", async () => {
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      reconcileCronProjection: async () => ({
+        status: "settlement-blocked",
+        projectionRevision: 3,
+        nextRunAtMs: 1234,
+        workflowRunId: "wrun-exhausted-parent",
+        repaired: false,
+      }),
+    }),
+  );
+  assert.equal(report.status, "failed");
+  assert.equal(findCheck(report, "cron.wake")?.status, "fail");
+  assert.match(
+    findCheck(report, "cron.wake")?.message ?? "",
+    /recovery budget is exhausted/,
   );
 });
 

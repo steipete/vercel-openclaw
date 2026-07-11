@@ -3,12 +3,17 @@ import {
   getCookieValue,
   isSecureRequest,
 } from "@/server/auth/session";
-import { applyChannelConfigChange } from "@/server/channels/admin/apply-channel-config-change";
+import { applyChannelConfigChangeUnderLifecycleLock } from "@/server/channels/admin/apply-channel-config-change";
 import { fetchSlackAuthIdentity } from "@/server/channels/slack/auth";
 import { getSlackInstallConfig } from "@/server/channels/slack/install-config";
 import { setSlackChannelConfig } from "@/server/channels/state";
 import { logInfo, logWarn } from "@/server/log";
 import { getPublicOrigin } from "@/server/public-url";
+import { getHostMutationFence } from "@/server/sandbox/host-suspension";
+import {
+  SandboxLifecycleLockContendedError,
+  withSandboxLifecycleMutationLock,
+} from "@/server/sandbox/lifecycle";
 import {
   SLACK_OAUTH_CTX_COOKIE,
   SLACK_OAUTH_STATE_COOKIE,
@@ -129,25 +134,58 @@ export async function GET(request: Request): Promise<Response> {
     return redirectToAdmin(request, "auth_test_failed", secure);
   }
 
-  // Persist config — intentionally overwrites existing Slack config (single-instance)
-  await setSlackChannelConfig({
-    signingSecret: installConfig.signingSecret!,
-    botToken,
-    configuredAt: Date.now(),
-    team: authIdentity.team,
-    user: authIdentity.user,
-    botId: authIdentity.botId,
-  });
+  let mutationResult: Awaited<ReturnType<
+    typeof applyChannelConfigChangeUnderLifecycleLock
+  >> | Response;
+  try {
+    mutationResult = await withSandboxLifecycleMutationLock(
+      async (assertOwned) => {
+        await assertOwned();
+        if (await getHostMutationFence()) {
+          return redirectToAdmin(request, "host_ingress_fenced", secure);
+        }
+
+        // Intentionally overwrite the single-instance Slack config only while
+        // the current lifecycle generation still owns runtime mutation.
+        await assertOwned();
+        await setSlackChannelConfig({
+          signingSecret: installConfig.signingSecret!,
+          botToken,
+          configuredAt: Date.now(),
+          team: authIdentity.team,
+          user: authIdentity.user,
+          botId: authIdentity.botId,
+          liveConfigSync: {
+            outcome: "skipped",
+            reason: "config_sync_pending",
+            liveConfigFresh: false,
+            checkedAt: Date.now(),
+          },
+        });
+
+        await assertOwned();
+        return applyChannelConfigChangeUnderLifecycleLock(
+          { channel: "slack", operation: "oauth-install" },
+          assertOwned,
+        );
+      },
+    );
+  } catch (error) {
+    const code = error instanceof SandboxLifecycleLockContendedError
+      ? "lifecycle_busy"
+      : "config_apply_failed";
+    logWarn("slack_install.config_apply_failed", {
+      code,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return redirectToAdmin(request, code, secure);
+  }
+  if (mutationResult instanceof Response) return mutationResult;
+  const { liveConfigSync } = mutationResult;
 
   logInfo("slack_install.connected", {
     team: authIdentity.team,
     botId: authIdentity.botId,
-  });
-
-  // Post-mutation: delegate to the shared channel config apply helper
-  const { liveConfigSync } = await applyChannelConfigChange({
-    channel: "slack",
-    operation: "oauth-install",
   });
 
   // Clear OAuth cookies and redirect to admin

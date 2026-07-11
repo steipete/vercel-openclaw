@@ -215,7 +215,7 @@ function buildDiscordSummaryEntry(
   lastDeliveryState: ChannelDeliverySnapshot | null | undefined,
   now: number,
 ): DiscordSummaryEntry {
-  const configured = config !== null && config !== undefined;
+  const legacyConfigPresent = config !== null && config !== undefined;
   const lastForwardSummary = projectChannelLastForward(lastForward, now);
   const lastDeliverySummary = projectChannelDeliveryState(
     lastDeliveryState,
@@ -226,11 +226,9 @@ function buildDiscordSummaryEntry(
   const userVisibleReply =
     lastForwardSummary?.userVisibleReply ??
     projectReplyFromDelivery(lastDeliverySummary?.reply, now);
-  const nativeAccepted =
-    lastForwardSummary?.ok === true &&
-    lastForwardSummary.classification === "accepted";
-  const userVisibleReplyVerified = userVisibleReply?.status === "observed";
-  const endpointConfigured = config?.endpointConfigured === true;
+  const nativeAccepted = false;
+  const userVisibleReplyVerified = false;
+  const endpointConfigured = false;
   const currentEndpointUrl = toDisplaySafeWebhookUrl(config?.endpointUrl ?? null);
   const compareDesiredEndpointUrl = toDisplaySafeWebhookUrl(desiredEndpointUrl) ?? desiredEndpointUrl;
   const endpointDrift = Boolean(
@@ -238,27 +236,13 @@ function buildDiscordSummaryEntry(
       (currentEndpointUrl !== compareDesiredEndpointUrl ||
         config?.endpointError?.toLowerCase().includes("different deployment") === true),
   );
-  const commandRegistered = config?.commandRegistered === true;
-
-  let reason: string | null = null;
-  if (!configured) {
-    reason = "discord_not_configured";
-  } else if (endpointDrift) {
-    reason = "discord_endpoint_drift";
-  } else if (!endpointConfigured) {
-    reason = "discord_endpoint_not_configured";
-  } else if (!commandRegistered) {
-    reason = "discord_ask_command_not_registered";
-  } else if (!nativeAccepted) {
-    reason = "discord_native_acceptance_not_observed";
-  } else if (!userVisibleReplyVerified) {
-    reason = "discord_user_visible_reply_not_observed";
-  }
+  const commandRegistered = false;
+  const reason = "hosted_discord_transport_unavailable";
 
   return {
-    connected: configured,
-    configured,
-    lastError: config?.endpointError ?? null,
+    connected: false,
+    configured: false,
+    lastError: legacyConfigPresent ? reason : null,
     lastForward: lastForwardSummary,
     lastDeliveryState: lastDeliverySummary,
     userVisibleReply,
@@ -268,14 +252,14 @@ function buildDiscordSummaryEntry(
     endpointDrift,
     commandRegistered,
     commandId: config?.commandId ?? null,
-    routeReady: configured && endpointConfigured && !endpointDrift && commandRegistered,
+    routeReady: false,
     nativeAccepted,
     userVisibleReplyVerified,
     readiness: {
       endpointConfigured,
       endpointDrift,
       commandRegistered,
-      routeReady: configured && endpointConfigured && !endpointDrift && commandRegistered,
+      routeReady: false,
       nativeAccepted,
       userVisibleReplyVerified,
       ackSemantics: "deferred-only",

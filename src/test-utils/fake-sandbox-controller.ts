@@ -77,6 +77,7 @@ export class FakeSandboxHandle implements SandboxHandle {
   writtenFiles: Array<{ path: string; content: Buffer }> = [];
   networkPolicies: NetworkPolicy[] = [];
   extendedTimeouts: number[] = [];
+  extendedTimeoutsWithoutResume: number[] = [];
   snapshotCalled = false;
   stopCalled = false;
   lastStopOptions?: { blocking?: boolean };
@@ -371,6 +372,11 @@ export class FakeSandboxHandle implements SandboxHandle {
       timestamp: Date.now(),
       detail: { duration, timeoutMs: this.timeoutMs },
     });
+  }
+
+  async extendTimeoutWithoutResume(duration: number): Promise<void> {
+    this.extendedTimeoutsWithoutResume.push(duration);
+    await this.extendTimeout(duration);
   }
 
   async updateNetworkPolicy(policy: NetworkPolicy): Promise<NetworkPolicy> {

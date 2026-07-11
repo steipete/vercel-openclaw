@@ -77,6 +77,7 @@ test("controller: FakeSandboxHandle conforms to SandboxHandle interface", async 
 
   // extendTimeout
   await handle.extendTimeout(60_000);
+  await handle.extendTimeoutWithoutResume!(60_000);
 
   // updateNetworkPolicy
   const policy = await handle.updateNetworkPolicy("allow-all");
@@ -196,6 +197,17 @@ test("controller: FakeSandboxHandle.extendTimeout is additive", async () => {
   await handle.extendTimeout(30_000);
   assert.equal(handle.timeout, 390_000, "second extension should be additive");
   assert.deepEqual(handle.extendedTimeouts, [60_000, 30_000]);
+});
+
+test("controller: FakeSandboxHandle non-resuming timeout extension is additive", async () => {
+  const events: SandboxEvent[] = [];
+  const handle = new FakeSandboxHandle("sbx-ext-session", events, 300_000);
+
+  await handle.extendTimeoutWithoutResume(60_000);
+
+  assert.equal(handle.timeout, 360_000);
+  assert.deepEqual(handle.extendedTimeouts, [60_000]);
+  assert.deepEqual(handle.extendedTimeoutsWithoutResume, [60_000]);
 });
 
 test("controller: FakeSandboxController.create passes timeout to handle", async () => {

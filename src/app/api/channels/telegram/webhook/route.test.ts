@@ -22,7 +22,10 @@ import {
   getTelegramWebhookRoute,
   resetAfterCallbacks,
 } from "@/test-utils/route-caller";
-import { telegramWebhookWorkflowRuntime } from "@/app/api/channels/telegram/webhook/route";
+import {
+  _setTelegramNativeFastPathForTesting,
+  telegramWebhookWorkflowRuntime,
+} from "@/app/api/channels/telegram/webhook/route";
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
 import {
@@ -61,6 +64,7 @@ async function configureTelegram(
   h: ScenarioHarness,
   options: { admitDurableAck?: boolean } = {},
 ) {
+  _setTelegramNativeFastPathForTesting(true);
   const admitDurableAck = options.admitDurableAck !== false;
   _setBundleAdmissionForTesting(
     admitDurableAck ? VERIFIED_BUNDLE_ADMISSION : null,
@@ -68,6 +72,7 @@ async function configureTelegram(
   await h.mutateMeta((meta) => {
     meta.channels.telegram = {
       botToken: "test-telegram-bot-token",
+      botId: "123",
       webhookSecret: TELEGRAM_WEBHOOK_SECRET,
       webhookUrl: "https://test.example.com/api/channels/telegram/webhook",
       botUsername: "test_bot",
@@ -1379,15 +1384,13 @@ test("Telegram webhook: fast path non-ok response falls through to workflow wake
         1,
         "workflow MUST start when native handler returned non-2xx so the update is not silently dropped",
       );
-      assert.equal(sendMessageCalls.length, 1, "fast-path fallback should send a Telegram waiting message");
-      assert.equal(workflowBootMessageId, bootMessageId, "workflow should receive the waiting message id");
+      assert.equal(sendMessageCalls.length, 0, "webhook route must not create a pre-handoff placeholder");
+      assert.equal(workflowBootMessageId, null, "durable workflow owns placeholder creation");
       const logs = getServerLogs();
       const bootMessageLog = logs.find(
         (entry) => entry.message === "channels.telegram_boot_message_sent",
       );
-      assert.ok(bootMessageLog, "boot message send should be logged on fast-path fallback");
-      assert.equal(bootMessageLog.data?.effectiveStatus, "running");
-      assert.equal(bootMessageLog.data?.fastPathFellBackToWorkflow, true);
+      assert.equal(bootMessageLog, undefined);
       const planLog = logs.find(
         (entry) =>
           entry.message === "channels.telegram_webhook_plan" &&
@@ -1446,8 +1449,7 @@ test("Telegram webhook: duplicate update_id is deduplicated", async () => {
     await configureTelegram(h);
     const config = (await h.getMeta()).channels.telegram;
     assert.ok(config);
-    const telegramDeliveryId =
-      `telegram:${config.botUsername}:${config.configuredAt}:99999`;
+    const telegramDeliveryId = `telegram:bot:${config.botId}:99999`;
     _resetLogBuffer();
     h.fakeFetch.onPost(/api\.telegram\.org/, () =>
       Response.json({ ok: true, result: { message_id: 1 } }),
@@ -1493,7 +1495,7 @@ test("Telegram webhook: duplicate update_id is deduplicated", async () => {
   });
 });
 
-test("Telegram webhook: the same update_id is distinct after config rotation", async () => {
+test("Telegram webhook: the same update_id stays deduplicated after same-bot config rotation", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
     const firstConfig = (await h.getMeta()).channels.telegram;
@@ -1537,20 +1539,7 @@ test("Telegram webhook: the same update_id is distinct after config rotation", a
         buildTelegramWebhook({ webhookSecret: secondSecret, payload }),
       );
       assert.equal(second.status, 200);
-      assert.equal(startMock.mock.callCount(), 2);
-
-      const deliveryIds = startMock.mock.calls.map((call) => {
-        const envelope = (call.arguments[1] as unknown[])[0] as {
-          workflowHandoff?: { fallbackTelegramConfig?: { configuredAt?: number } };
-        };
-        const configuredAt =
-          envelope.workflowHandoff?.fallbackTelegramConfig?.configuredAt;
-        return `telegram:test_bot:${configuredAt}:777`;
-      });
-      assert.deepEqual(deliveryIds, [
-        `telegram:test_bot:${firstConfig.configuredAt}:777`,
-        `telegram:test_bot:${firstConfig.configuredAt + 1}:777`,
-      ]);
+      assert.equal(startMock.mock.callCount(), 1);
       resetAfterCallbacks();
     } finally {
       startMock.mock.restore();
@@ -1595,8 +1584,10 @@ test("Telegram webhook: previous-secret retry keeps its original delivery genera
           ...meta.channels.telegram,
           webhookSecret: "current-secret-after-rotation",
           configuredAt: firstConfig.configuredAt + 1,
+          botId: firstConfig.botId ?? "123",
           previousWebhookSecret: firstConfig.webhookSecret,
           previousSecretExpiresAt: Date.now() + 60_000,
+          previousBotId: firstConfig.botId ?? "123",
           previousBotUsername: firstConfig.botUsername,
           previousConfiguredAt: firstConfig.configuredAt,
         };
@@ -1617,7 +1608,7 @@ test("Telegram webhook: previous-secret retry keeps its original delivery genera
         dedupSkip?.data?.dedupKey,
         channelDedupKey(
           "telegram",
-          `telegram:${firstConfig.botUsername}:${firstConfig.configuredAt}:778`,
+          `telegram:bot:${firstConfig.botId}:778`,
         ),
       );
     } finally {
@@ -1662,7 +1653,7 @@ test("Telegram webhook: unexpected enqueue failure returns 500", async () => {
   });
 });
 
-test("Telegram webhook: deletes boot message and releases dedup lock when workflow start fails", async () => {
+test("Telegram webhook: creates no boot message before a failed workflow start", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);
     const config = (await h.getMeta()).channels.telegram;
@@ -1707,8 +1698,8 @@ test("Telegram webhook: deletes boot message and releases dedup lock when workfl
         retryable: true,
       });
 
-      assert.equal(sendCalls.length, 1, "boot message should be sent once");
-      assert.equal(deleteCalls.length, 1, "boot message should be deleted once on workflow start failure");
+      assert.equal(sendCalls.length, 0, "webhook route must not create a placeholder");
+      assert.equal(deleteCalls.length, 0, "there is no pre-handoff placeholder to clean up");
 
       const reacquiredToken = await getStore().acquireLock(dedupKey, 60);
       assert.ok(reacquiredToken, "dedup lock should still be released when workflow start fails");

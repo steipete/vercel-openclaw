@@ -35,6 +35,7 @@ const CHANNEL_DLQ_POISON_THRESHOLD = 5;
 const CHANNEL_DLQ_POISON_WINDOW_MS = 15 * 60 * 1000;
 
 export type ChannelDlqPhase =
+  | "fast-path-acceptance-unknown"
   | "workflow-start-failed"
   | "workflow-step-failed";
 
@@ -129,6 +130,28 @@ export async function recordChannelDlqFailure(input: {
       error: error instanceof Error ? error.message : String(error),
     });
     return null;
+  });
+}
+
+export async function recordFastPathAcceptanceUnknown(input: {
+  channel: ChannelName;
+  deliveryId: string;
+  requestId: string | null;
+  receivedAtMs: number | null;
+  reason: string;
+  diag?: Record<string, unknown>;
+}): Promise<ChannelDlqRecord | null> {
+  return recordChannelDlqFailure({
+    channel: input.channel,
+    deliveryId: input.deliveryId,
+    phase: "fast-path-acceptance-unknown",
+    terminal: true,
+    retryable: false,
+    deliveryOutcome: "unknown",
+    requestId: input.requestId,
+    receivedAtMs: input.receivedAtMs,
+    error: new Error(input.reason),
+    diag: input.diag,
   });
 }
 

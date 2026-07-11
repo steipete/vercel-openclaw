@@ -9,7 +9,10 @@ import {
   getInitializedMeta,
   getStore,
 } from "@/server/store/store";
-import { channelConfigLockKey } from "@/server/store/keyspace";
+import {
+  channelBootMessageKey,
+  channelConfigLockKey,
+} from "@/server/store/keyspace";
 import {
   setSlackChannelConfig,
   setTelegramChannelConfig,
@@ -20,6 +23,7 @@ import {
 } from "@/server/channels/dlq";
 import {
   processChannelStep,
+  forwardToNativeHandlerWithRetry,
   buildExistingBootHandle,
   toWorkflowProcessingError,
   type DrainChannelWorkflowDependencies,
@@ -89,7 +93,6 @@ function createWorkflowDependencies(
     createSlackAdapter: () => ({}) as never,
     createTelegramAdapter: () => ({}) as never,
     createDiscordAdapter: () => ({}) as never,
-    reconcileDiscordIntegration: async () => null,
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "running", sandboxId: "sbx-stale" }),
       bootMessageSent: false,
@@ -646,7 +649,7 @@ test("processChannelStep settles a queued Telegram handoff after config deletion
   );
   const failure = await getChannelDlqRecord(
     "telegram",
-    `telegram:${fallbackTelegramConfig.botUsername}:${fallbackTelegramConfig.configuredAt}:1`,
+    `telegram:legacy:${fallbackTelegramConfig.botUsername}:${fallbackTelegramConfig.configuredAt}:1`,
   );
   assert.equal(failure?.terminal, true);
   assert.equal(failure?.deliveryOutcome, "not-accepted");
@@ -704,7 +707,7 @@ test("processChannelStep settles a queued Telegram handoff after config rotation
   );
   const failure = await getChannelDlqRecord(
     "telegram",
-    `telegram:${fallbackTelegramConfig.botUsername}:${fallbackTelegramConfig.configuredAt}:2`,
+    `telegram:legacy:${fallbackTelegramConfig.botUsername}:${fallbackTelegramConfig.configuredAt}:2`,
   );
   assert.equal(failure?.terminal, true);
   assert.equal(failure?.deliveryOutcome, "not-accepted");
@@ -764,7 +767,7 @@ test("processChannelStep rechecks Telegram config after sandbox wake", async () 
   );
 });
 
-test("processChannelStep forwards a queued Telegram handoff for the current generation", async () => {
+test("processChannelStep releases the Telegram config lease before native dispatch", async () => {
   const currentConfig = createFallbackTelegramConfig();
   let forwardedWebhookSecret: string | null = null;
 
@@ -804,10 +807,16 @@ test("processChannelStep forwards a queued Telegram handoff for the current gene
         90,
       );
       assert.equal(
-        competingConfigLock,
-        null,
-        "Telegram config must stay leased through native dispatch",
+        typeof competingConfigLock,
+        "string",
+        "admin config mutation must not wait for the native turn",
       );
+      if (competingConfigLock) {
+        await getStore().releaseLock(
+          channelConfigLockKey("telegram"),
+          competingConfigLock,
+        );
+      }
       forwardedWebhookSecret = meta.channels.telegram?.webhookSecret ?? null;
       return {
         ok: true,
@@ -836,18 +845,13 @@ test("processChannelStep forwards a queued Telegram handoff for the current gene
   );
 
   assert.equal(forwardedWebhookSecret, currentConfig.webhookSecret);
-  assert.ok(
-    (configLeaseTtls[0] ?? 0) >= 115,
-    "Telegram dispatch lease must cover the retry deadline and final fetch",
-  );
+  assert.equal(configLeaseTtls[0], 90);
   store.acquireLock = acquireLock;
 });
 
-test("processChannelStep closes Telegram delivery as unknown when its lease is lost after dispatch", async () => {
+test("processChannelStep closes Telegram delivery as unknown when config rotates during dispatch", async () => {
   const currentConfig = createFallbackTelegramConfig();
   await setTelegramChannelConfig(currentConfig);
-  const store = getStore();
-  const renewLock = store.renewLock.bind(store);
 
   const dependencies = createWorkflowDependencies({
     runWithBootMessages: async () => ({
@@ -865,7 +869,11 @@ test("processChannelStep closes Telegram delivery as unknown when its lease is l
       admissionReady: true,
     }),
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
-      store.renewLock = async () => false;
+      await setTelegramChannelConfig({
+        ...currentConfig,
+        botToken: "rotated-token",
+        configuredAt: currentConfig.configuredAt + 1,
+      });
       return {
         ok: true,
         acceptance: "accepted",
@@ -878,9 +886,7 @@ test("processChannelStep closes Telegram delivery as unknown when its lease is l
     },
   });
 
-  try {
-    await assert.rejects(
-      processChannelStep(
+  await processChannelStep(
         "telegram",
         { update_id: 88, message: { chat: { id: 789 } } },
         "test",
@@ -892,17 +898,13 @@ test("processChannelStep closes Telegram delivery as unknown when its lease is l
             fallbackTelegramConfig: currentConfig,
             telegramConfigGeneration: currentConfig.configuredAt,
           },
+          requireTelegramConfigGeneration: true,
         },
-      ),
-      (error: unknown) => error instanceof TestFatalError,
-    );
-  } finally {
-    store.renewLock = renewLock;
-  }
+      );
 
   const failure = await getChannelDlqRecord(
     "telegram",
-    `telegram:${currentConfig.botUsername}:${currentConfig.configuredAt}:88`,
+    `telegram:legacy:${currentConfig.botUsername}:${currentConfig.configuredAt}:88`,
   );
   assert.equal(failure?.deliveryOutcome, "unknown");
   assert.equal(failure?.terminal, true);
@@ -1113,7 +1115,7 @@ test("processChannelStep keeps native forward 404 fatal (Telegram retrying path)
   );
 });
 
-test("processChannelStep uses retrying forward for Telegram, Slack, and Discord", async () => {
+test("processChannelStep uses retrying forward for Telegram and Slack", async () => {
   let retryingCalled = false;
   let directCalled = false;
 
@@ -1149,31 +1151,6 @@ test("processChannelStep uses retrying forward for Telegram, Slack, and Discord"
   await processChannelStep("slack", { event: {} }, "test", "req-slack", null, { dependencies: slackDeps });
   assert.ok(retryingCalled, "Slack should use retrying forward");
   assert.ok(!directCalled, "Slack should not use direct forward");
-
-  retryingCalled = false;
-  directCalled = false;
-
-  const discordDeps = createWorkflowDependencies({
-    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
-      retryingCalled = true;
-      return { ok: true, status: 200, attempts: 1, totalMs: 50, transport: "public", retries: [] };
-    },
-    forwardToNativeHandler: async () => {
-      directCalled = true;
-      return { ok: true, status: 200, durationMs: 0, bodyLength: 0, bodyHead: "", headers: null };
-    },
-  });
-
-  await processChannelStep(
-    "discord",
-    { id: "interaction-retry-1", application_id: "app", token: "tok" },
-    "test",
-    "req-discord",
-    null,
-    { dependencies: discordDeps },
-  );
-  assert.ok(retryingCalled, "Discord should use retrying forward");
-  assert.ok(!directCalled, "Discord should not use direct forward");
 });
 
 test("processChannelStep converts retrying forward 504 (exhausted) into RetryableError", async () => {
@@ -2478,6 +2455,408 @@ test("Slack workflow retry reuses one persisted placeholder", async () => {
   }
 });
 
+test("Slack reconciles provider acceptance lost before the local sent record", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const clientMessageId = "5aa26f2b-52ee-5ef0-a512-d33969f4dabc";
+  const acceptedMessages = new Map<string, string>();
+  const postedClientMessageIds: string[] = [];
+  let loseFirstResponse = true;
+  let deleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      const url = String(input);
+      if (url.endsWith("chat.delete")) {
+        deleteCalls += 1;
+        return Response.json({ ok: true });
+      }
+      assert.ok(url.endsWith("chat.postMessage"));
+      const body = JSON.parse(String(init?.body)) as {
+        client_msg_id: string;
+      };
+      postedClientMessageIds.push(body.client_msg_id);
+      const messageTs =
+        acceptedMessages.get(body.client_msg_id) ?? "boot-accepted-once-ts";
+      acceptedMessages.set(body.client_msg_id, messageTs);
+      if (loseFirstResponse) {
+        loseFirstResponse = false;
+        throw new Error("socket closed after Slack accepted request");
+      }
+      return Response.json({ ok: true, ts: messageTs });
+    },
+  );
+
+  try {
+    await assert.rejects(
+      buildExistingBootHandle(
+        "slack",
+        { event: { channel: "C-crash-window" } },
+        null,
+        { slack: config },
+        { channel: "C-crash-window", threadTs: null },
+        clientMessageId,
+      ),
+      (error: unknown) => {
+        assert.equal((error as Error).name, "RetryableSendError");
+        return true;
+      },
+    );
+    assert.deepEqual(
+      await getStore().getValue(
+        channelBootMessageKey("slack", clientMessageId),
+      ),
+      {
+        channel: "C-crash-window",
+        configuredAt: config.configuredAt,
+        clientMessageId,
+        state: "posting",
+      },
+    );
+
+    const recoveredHandle = await buildExistingBootHandle(
+      "slack",
+      { event: { channel: "C-crash-window" } },
+      null,
+      { slack: config },
+      { channel: "C-crash-window", threadTs: null },
+      clientMessageId,
+    );
+    assert.ok(recoveredHandle);
+    assert.deepEqual(postedClientMessageIds, [clientMessageId, clientMessageId]);
+    assert.equal(acceptedMessages.size, 1);
+    assert.deepEqual(
+      await getStore().getValue(
+        channelBootMessageKey("slack", clientMessageId),
+      ),
+      {
+        channel: "C-crash-window",
+        configuredAt: config.configuredAt,
+        clientMessageId,
+        state: "sent",
+        messageId: "boot-accepted-once-ts",
+      },
+    );
+
+    await recoveredHandle.clear();
+    assert.equal(deleteCalls, 1);
+    assert.equal(
+      await getStore().getValue(
+        channelBootMessageKey("slack", clientMessageId),
+      ),
+      null,
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("Slack deletes an accepted placeholder when the sent record cannot persist", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const clientMessageId = "967748eb-2110-5e83-a534-17a266b708fc";
+  const recordKey = channelBootMessageKey("slack", clientMessageId);
+  const store = getStore();
+  const setValue = store.setValue.bind(store);
+  store.setValue = async <T>(key: string, value: T, ttlSeconds?: number) => {
+    if (
+      key === recordKey &&
+      (value as { state?: string }).state === "sent"
+    ) {
+      throw new Error("durable store unavailable after Slack accepted");
+    }
+    await setValue(key, value, ttlSeconds);
+  };
+  let deleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input);
+      if (url.endsWith("chat.postMessage")) {
+        return Response.json({ ok: true, ts: "boot-needs-cleanup-ts" });
+      }
+      assert.ok(url.endsWith("chat.delete"));
+      deleteCalls += 1;
+      return Response.json({ ok: true });
+    },
+  );
+
+  try {
+    await assert.rejects(
+      buildExistingBootHandle(
+        "slack",
+        { event: { channel: "C-store-failure" } },
+        null,
+        { slack: config },
+        { channel: "C-store-failure", threadTs: null },
+        clientMessageId,
+      ),
+      (error: unknown) => {
+        assert.equal((error as Error).name, "RetryableSendError");
+        return true;
+      },
+    );
+    assert.equal(deleteCalls, 1);
+  } finally {
+    store.setValue = setValue;
+    fetchMock.mock.restore();
+  }
+});
+
+test("Slack reconciles a posting intent with the rotated same-bot token", async () => {
+  const originalConfig = {
+    signingSecret: "original-signing-secret",
+    botToken: "xoxb-original-token",
+    configuredAt: Date.now(),
+    team: "T-same",
+    botId: "B-same",
+  };
+  const currentConfig = {
+    ...originalConfig,
+    signingSecret: "current-signing-secret",
+    botToken: "xoxb-current-token",
+    configuredAt: originalConfig.configuredAt + 1,
+  };
+  await setSlackChannelConfig(currentConfig);
+  const clientMessageId = "bfa76d1d-071d-54f3-a65e-412f908c1912";
+  await getStore().setValue(
+    channelBootMessageKey("slack", clientMessageId),
+    {
+      channel: "C-rotated-reconcile",
+      configuredAt: originalConfig.configuredAt,
+      clientMessageId,
+      team: originalConfig.team,
+      botId: originalConfig.botId,
+      state: "posting",
+    },
+    3600,
+  );
+  const authorizations: string[] = [];
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      authorizations.push(
+        new Headers(init?.headers).get("authorization") ?? "",
+      );
+      return String(input).endsWith("chat.postMessage")
+        ? Response.json({ ok: true, ts: "boot-rotated-reconcile-ts" })
+        : Response.json({ ok: true });
+    },
+  );
+
+  try {
+    const handle = await buildExistingBootHandle(
+      "slack",
+      { event: { channel: "C-rotated-reconcile" } },
+      null,
+      { slack: originalConfig },
+      { channel: "C-rotated-reconcile", threadTs: null },
+      clientMessageId,
+    );
+    assert.ok(handle);
+    await handle.clear();
+    assert.deepEqual(authorizations, [
+      "Bearer xoxb-current-token",
+      "Bearer xoxb-current-token",
+    ]);
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("Slack retains posting intent when reconciliation gets a definite 4xx", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const clientMessageId = "25a22523-462b-53f1-afbf-c00a6ddca5fc";
+  const recordKey = channelBootMessageKey("slack", clientMessageId);
+  await getStore().setValue(
+    recordKey,
+    {
+      channel: "C-reconcile-4xx",
+      configuredAt: config.configuredAt,
+      clientMessageId,
+      state: "posting",
+    },
+    3600,
+  );
+  const fetchMock = mock.method(globalThis, "fetch", async () =>
+    Response.json({ ok: false, error: "not_in_channel" }),
+  );
+
+  try {
+    await assert.rejects(
+      buildExistingBootHandle(
+        "slack",
+        { event: { channel: "C-reconcile-4xx" } },
+        null,
+        { slack: config },
+        { channel: "C-reconcile-4xx", threadTs: null },
+        clientMessageId,
+      ),
+      (error: unknown) => (error as Error).name === "RetryableSendError",
+    );
+    assert.equal(
+      (
+        await getStore().getValue<{ state: string }>(recordKey)
+      )?.state,
+      "posting",
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("Slack preserves a sent record when its read is unavailable", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const clientMessageId = "4703daa7-c26e-5727-a4ff-870ce75c65ef";
+  const recordKey = channelBootMessageKey("slack", clientMessageId);
+  const store = getStore();
+  const sentRecord = {
+    channel: "C-read-failure",
+    configuredAt: config.configuredAt,
+    clientMessageId,
+    state: "sent",
+    messageId: "boot-preserved-ts",
+  } as const;
+  await store.setValue(recordKey, sentRecord, 3600);
+  const getValue = store.getValue.bind(store);
+  let failRecordRead = true;
+  store.getValue = async <T>(key: string) => {
+    if (key === recordKey && failRecordRead) {
+      failRecordRead = false;
+      throw new Error("intent read unavailable");
+    }
+    return getValue<T>(key);
+  };
+  let fetchCalls = 0;
+  const fetchMock = mock.method(globalThis, "fetch", async () => {
+    fetchCalls += 1;
+    throw new Error("Slack must not be called when intent read is unavailable");
+  });
+
+  try {
+    await assert.rejects(
+      buildExistingBootHandle(
+        "slack",
+        { event: { channel: "C-read-failure" } },
+        null,
+        { slack: config },
+        { channel: "C-read-failure", threadTs: null },
+        clientMessageId,
+      ),
+      (error: unknown) => (error as Error).name === "RetryableSendError",
+    );
+    assert.equal(fetchCalls, 0);
+    assert.deepEqual(await getValue(recordKey), sentRecord);
+  } finally {
+    store.getValue = getValue;
+    fetchMock.mock.restore();
+  }
+});
+
+test("Telegram Workflow retry never posts a non-idempotent wake placeholder", async () => {
+  const config = createFallbackTelegramConfig();
+  await setTelegramChannelConfig(config);
+  let telegramApiCalls = 0;
+  const fetchMock = mock.method(globalThis, "fetch", async () => {
+    telegramApiCalls += 1;
+    throw new Error("Telegram API must not be called for a cold placeholder");
+  });
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-telegram-no-placeholder",
+        channels: {
+          telegram: config,
+          slack: null,
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      bootMessageSent: false,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return forwardCalls === 1
+        ? {
+            ok: false,
+            acceptance: "rejected",
+            status: 502,
+            attempts: 1,
+            totalMs: 50,
+            transport: "local",
+            retries: [],
+          }
+        : {
+            ok: true,
+            acceptance: "accepted",
+            status: 200,
+            attempts: 1,
+            totalMs: 50,
+            transport: "local",
+            retries: [],
+          };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "telegram",
+      { update_id: 801, message: { chat: { id: 42 } } },
+      "test",
+      "req-telegram-no-placeholder",
+      null,
+      {
+        dependencies,
+        requireTelegramConfigGeneration: true,
+        workflowHandoff: {
+          fallbackTelegramConfig: config,
+          telegramConfigGeneration: config.configuredAt,
+          telegramDeliveryId: "telegram:801",
+          telegramBootTarget: { chatId: 42, threadId: null },
+        },
+      },
+    );
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    await run();
+    assert.equal(forwardCalls, 2);
+    assert.equal(telegramApiCalls, 0);
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
 test("Slack placeholder construction failure is recorded by workflow catch", async () => {
   const config = {
     signingSecret: "slack-signing-secret",
@@ -2752,6 +3131,51 @@ test("processChannelStep keeps Slack 401 fatal (signature failure is unrecoverab
   assert.equal("replayToken" in (failureLog.data ?? {}), false);
 });
 
+test("generic 403 closes workflow forwarding as unknown without replay", async () => {
+  let fetchCalls = 0;
+  const fetchMock = mock.method(globalThis, "fetch", async () => {
+    fetchCalls += 1;
+    return new Response('{"type":"forbidden"}', { status: 403 });
+  });
+  try {
+    const result = await forwardToNativeHandlerWithRetry(
+      "slack",
+      { event_id: "Ev-403", event: {} },
+      asMeta({
+        status: "running",
+        sandboxId: "sbx-403",
+        channels: {
+          telegram: null,
+          slack: {
+            signingSecret: "signing-secret",
+            botToken: "xoxb-token",
+            configuredAt: Date.now(),
+          },
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      async () => "https://sandbox.example",
+      null,
+      false,
+      {
+        "x-slack-signature": "v0=sig",
+        "x-slack-request-timestamp": "1700000000",
+      },
+      '{"event_id":"Ev-403","event":{}}',
+      "slack:Ev-403",
+      false,
+      false,
+      "https://control.example",
+    );
+    assert.equal(fetchCalls, 1);
+    assert.equal(result.acceptance, "unknown");
+    assert.equal(result.status, 403);
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
 test("processChannelStep passes slackForwardHeaders from handoff through to the retry wrapper", async () => {
   let capturedHeaders: Record<string, string> | null | undefined;
   const dependencies = createWorkflowDependencies({
@@ -2855,7 +3279,7 @@ test("processChannelStep emits channels.slack_wake_summary for Slack requests", 
   assert.equal(telegramSummaryLogs.length, 0);
 });
 
-test("processChannelStep passes Discord raw body and signature headers to retrying forward", async () => {
+test("processChannelStep rejects hosted Discord before forwarding", async () => {
   let capturedHeaders: Record<string, string> | null = null;
   let capturedRawBody: string | null = null;
   let capturedDeliveryId: string | null = null;
@@ -2884,33 +3308,32 @@ test("processChannelStep passes Discord raw body and signature headers to retryi
     },
   });
 
-  await processChannelStep(
-    "discord",
-    { id: "interaction-handoff-1", application_id: "app", token: "tok" },
-    "test",
-    "req-discord-handoff",
-    null,
-    {
-      dependencies,
-      workflowHandoff: {
-        discordForwardHeaders: {
-          "x-signature-ed25519": "sig",
-          "x-signature-timestamp": "1700000000",
-          "content-type": "application/json",
-        },
-        discordRawBody: '{"id":"interaction-handoff-1"}',
-      } satisfies ChannelWorkflowHandoff,
-    },
+  await assert.rejects(
+    processChannelStep(
+      "discord",
+      { id: "interaction-handoff-1", application_id: "app", token: "tok" },
+      "test",
+      "req-discord-handoff",
+      null,
+      {
+        dependencies,
+        workflowHandoff: {
+          discordForwardHeaders: {
+            "x-signature-ed25519": "sig",
+            "x-signature-timestamp": "1700000000",
+            "content-type": "application/json",
+          },
+          discordRawBody: '{"id":"interaction-handoff-1"}',
+        } satisfies ChannelWorkflowHandoff,
+      },
+    ),
+    /hosted_discord_transport_unavailable/,
   );
 
-  assert.deepStrictEqual(capturedHeaders, {
-    "x-signature-ed25519": "sig",
-    "x-signature-timestamp": "1700000000",
-    "content-type": "application/json",
-  });
-  assert.equal(capturedRawBody, '{"id":"interaction-handoff-1"}');
-  assert.equal(capturedDeliveryId, "discord:interaction-handoff-1");
-  assert.equal(capturedGatewayAdmission, true);
+  assert.equal(capturedHeaders, null);
+  assert.equal(capturedRawBody, null);
+  assert.equal(capturedDeliveryId, null);
+  assert.equal(capturedGatewayAdmission, false);
 });
 
 test("processChannelStep rejects hosted WhatsApp before delivery side effects", async () => {
@@ -2965,7 +3388,7 @@ test("processChannelStep rejects hosted WhatsApp before delivery side effects", 
   assert.equal(rejectionLog?.data?.reason, "hosted-transport-unavailable");
 });
 
-test("processChannelStep emits a Discord wake summary", async () => {
+test("processChannelStep emits no Discord wake summary when hosted transport is unavailable", async () => {
   _resetLogBuffer();
   const dependencies = createWorkflowDependencies({
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
@@ -2978,16 +3401,18 @@ test("processChannelStep emits a Discord wake summary", async () => {
     }),
   });
 
-  await processChannelStep(
-    "discord",
-    { id: "interaction-summary-1", application_id: "app", token: "tok" },
-    "test",
-    "req-discord-summary",
-    null,
-    { dependencies, receivedAtMs: Date.now() - 20 },
+  await assert.rejects(
+    processChannelStep(
+      "discord",
+      { id: "interaction-summary-1", application_id: "app", token: "tok" },
+      "test",
+      "req-discord-summary",
+      null,
+      { dependencies, receivedAtMs: Date.now() - 20 },
+    ),
+    /hosted_discord_transport_unavailable/,
   );
   const logs = getServerLogs();
   const discordSummary = logs.find((entry) => entry.message === "channels.discord_wake_summary");
-  assert.ok(discordSummary, "Discord wake summary should be emitted");
-  assert.equal(discordSummary.data?.retryingForwardAttempts, 2);
+  assert.equal(discordSummary, undefined);
 });

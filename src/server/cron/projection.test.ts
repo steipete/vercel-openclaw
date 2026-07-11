@@ -650,6 +650,7 @@ test("sandbox startup repairs a reset fence after gateway-token commit failure",
 
   await normalizeResetCronProjectionGeneration({
     gatewayGeneration: "b".repeat(32),
+    expectedGatewayGeneration: "a".repeat(32),
     store,
   });
 
@@ -657,6 +658,57 @@ test("sandbox startup repairs a reset fence after gateway-token commit failure",
   assert.equal(record?.gatewayGeneration, "b".repeat(32));
   assert.equal(record?.source, null);
   assert.equal(record?.dispatch.status, "none");
+});
+
+test("sandbox startup normalization refuses a stale expected generation", async () => {
+  const store = new MemoryStore();
+  await fenceCronProjectionStateForReset({
+    gatewayGeneration: "a".repeat(32),
+    expectedGatewayGeneration: null,
+    store,
+    now: () => 1_000,
+  });
+
+  const unchanged = await normalizeResetCronProjectionGeneration({
+    gatewayGeneration: "c".repeat(32),
+    expectedGatewayGeneration: "b".repeat(32),
+    store,
+  });
+
+  assert.equal(unchanged?.gatewayGeneration, "a".repeat(32));
+  assert.equal((await readCronProjection(store))?.gatewayGeneration, "a".repeat(32));
+});
+
+test("sandbox startup normalization loses CAS to a successor generation", async () => {
+  const store = new MemoryStore();
+  const initial = await fenceCronProjectionStateForReset({
+    gatewayGeneration: "a".repeat(32),
+    expectedGatewayGeneration: null,
+    store,
+    now: () => 1_000,
+  });
+  const compare = store.compareAndSetValue.bind(store);
+  let injected = false;
+  store.compareAndSetValue = async (key, revision, next) => {
+    if (!injected) {
+      injected = true;
+      await store.setValue(key, {
+        ...initial.record,
+        gatewayGeneration: "c".repeat(32),
+        revision: initial.record.revision + 1,
+      });
+    }
+    return compare(key, revision, next);
+  };
+
+  const result = await normalizeResetCronProjectionGeneration({
+    gatewayGeneration: "b".repeat(32),
+    expectedGatewayGeneration: "a".repeat(32),
+    store,
+  });
+
+  assert.equal(result?.gatewayGeneration, "c".repeat(32));
+  assert.equal((await readCronProjection(store))?.gatewayGeneration, "c".repeat(32));
 });
 
 test("cron projection diagnostics hash dispatch tokens and omit source identities", async () => {

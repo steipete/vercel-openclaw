@@ -292,6 +292,47 @@ test("host mutation admission refuses while lifecycle lock is held", async () =>
   }
 });
 
+test("lifecycle-managed mutation routes leave lifecycle admission to their handlers", async () => {
+  setAuthMode(undefined);
+  const previousAdminAuth = process.env.ADMIN_SECRET;
+  process.env.ADMIN_SECRET = "fixture";
+  const store = getStore();
+  const acquireLock = store.acquireLock.bind(store);
+  const acquiredKeys: string[] = [];
+  store.acquireLock = async (key, ttlSeconds) => {
+    acquiredKeys.push(key);
+    return acquireLock(key, ttlSeconds);
+  };
+
+  try {
+    for (const path of [
+      "/api/admin/refresh-token",
+      "/api/channels/discord",
+      "/api/channels/slack",
+      "/api/channels/telegram",
+      "/api/channels/whatsapp",
+      "/api/status",
+    ]) {
+      const result = await requireMutationAuth(new Request(
+        `http://localhost:3000${path}`,
+        { method: "POST", headers: { authorization: "Bearer fixture" } },
+      ));
+      assert.equal(result instanceof Response, false, path);
+    }
+    assert.equal(
+      acquiredKeys.filter((key) => key === lifecycleLockKey()).length,
+      0,
+      "auth must not hold the lifecycle lock around a lifecycle-managed handler",
+    );
+  } finally {
+    store.acquireLock = acquireLock;
+    _resetStoreForTesting();
+    if (previousAdminAuth === undefined) delete process.env.ADMIN_SECRET;
+    else process.env.ADMIN_SECRET = previousAdminAuth;
+    setAuthMode(originalAuthMode);
+  }
+});
+
 test("host mutation admission rechecks a suspension that won before lock acquisition", async () => {
   setAuthMode(undefined);
   const previousAdminAuth = process.env.ADMIN_SECRET;

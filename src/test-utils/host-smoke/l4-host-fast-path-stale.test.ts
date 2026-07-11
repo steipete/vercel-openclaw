@@ -1,12 +1,10 @@
 /**
- * L4-host scenario 5: fast-path stale-running fallback.
+ * L4-host scenario 5: stale-running durable handoff.
  *
  * When meta says `status: running` + `sandboxId` is set but the sandbox is
  * actually dead (auto-stopped, snapshotted, or wedged), a Slack `app_mention`
- * must NOT be silently dropped. The webhook fast-path tries the in-band
- * forward to `<sandboxUrl>/slack/events`; on 5xx or network failure it must
- * call `reconcileStaleRunningStatus()` and fall through to the durable
- * workflow wake path so the user still gets a reply.
+ * must NOT be silently dropped. Production delivery hands off directly to the
+ * durable Workflow and never performs an ambiguous route-level native POST.
  *
  * Two scenarios cover the two failure modes the route distinguishes:
  *
@@ -15,8 +13,8 @@
  *   - Empty platform 200 fallback: gateway probe lacks the OpenClaw marker,
  *     so the route must not forward to the sandbox catch-all.
  *
- * Both must end with: response 200, workflow.start called exactly once,
- * fast-path forward attempted exactly once.
+ * Every scenario must end with response 200, workflow.start exactly once,
+ * and no route-level native forward.
  *
  * Catches: stale `running` metadata silently dropping events when the
  * sandbox has gone away under us.
@@ -66,7 +64,7 @@ function fastPathForwardAttempts(h: ScenarioHarness): number {
     ).length;
 }
 
-test("L4-host fast-path stale: not-listening 502 triggers workflow", async () => {
+test("L4-host Workflow-only delivery ignores stale native 502 surface", async () => {
   await withHarness(async (h) => {
     await configureRunningSandboxWithSlack(h);
 
@@ -86,11 +84,11 @@ test("L4-host fast-path stale: not-listening 502 triggers workflow", async () =>
       });
       const result = await callRoute(route.POST, req);
 
-      assert.equal(result.status, 200, "stale fast-path must not surface its 502 to Slack");
+      assert.equal(result.status, 200);
       assert.equal(
         fastPathForwardAttempts(h),
-        1,
-        "fast-path must be attempted exactly once before fallback",
+        0,
+        "production route must not attempt ambiguous native delivery",
       );
       assert.equal(
         startMock.mock.callCount(),
@@ -104,7 +102,7 @@ test("L4-host fast-path stale: not-listening 502 triggers workflow", async () =>
   });
 });
 
-test("L4-host fast-path stale: pre-admission network error triggers workflow", async () => {
+test("L4-host Workflow-only delivery ignores stale native network surface", async () => {
   await withHarness(async (h) => {
     await configureRunningSandboxWithSlack(h);
 
@@ -126,11 +124,11 @@ test("L4-host fast-path stale: pre-admission network error triggers workflow", a
       });
       const result = await callRoute(route.POST, req);
 
-      assert.equal(result.status, 200, "network failure must not surface to Slack");
+      assert.equal(result.status, 200);
       assert.equal(
         fastPathForwardAttempts(h),
-        1,
-        "fast-path must be attempted exactly once",
+        0,
+        "production route must not attempt ambiguous native delivery",
       );
       assert.equal(
         startMock.mock.callCount(),

@@ -6,7 +6,7 @@ import {
   withChannelConfigLease,
 } from "@/server/channels/config-lock";
 import { channelConfigLockKey } from "@/server/store/keyspace";
-import { getStore } from "@/server/store/store";
+import { getInitializedMeta, getStore } from "@/server/store/store";
 import { withHarness } from "@/test-utils/harness";
 
 test("channel config lease renews ownership and fences competitors", async () => {
@@ -102,5 +102,23 @@ test("channel config lease renews automatically before TTL expiry", async () => 
       store.renewLock = renewLock;
       await lease.release();
     }
+  });
+});
+
+test("channel config metadata commit is atomically fenced by lease ownership", async () => {
+  await withHarness(async () => {
+    const lease = await acquireChannelConfigLease("slack", { waitMs: 10 });
+    await lease.release();
+
+    await assert.rejects(
+      lease.mutateMeta((meta) => {
+        meta.channels.slack = {
+          signingSecret: "stale-secret",
+          botToken: "stale-token",
+          configuredAt: Date.now(),
+        };
+      }),
+    );
+    assert.equal((await getInitializedMeta()).channels.slack, null);
   });
 });

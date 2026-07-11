@@ -1,5 +1,6 @@
 import { authJsonError, authJsonOk, requireMutationAuth } from "@/server/auth/route-auth";
 import { extractRequestId, logInfo } from "@/server/log";
+import { getPublicOrigin } from "@/server/public-url";
 import { ensureFreshGatewayToken } from "@/server/sandbox/lifecycle";
 
 /**
@@ -18,7 +19,10 @@ export async function POST(request: Request): Promise<Response> {
 
   try {
     const requestId = extractRequestId(request);
-    const result = await ensureFreshGatewayToken({ force: true });
+    const result = await ensureFreshGatewayToken({
+      force: true,
+      controlPlaneOrigin: getPublicOrigin(request),
+    });
     logInfo("admin.refresh_token", {
       refreshed: result.refreshed,
       reason: result.reason,

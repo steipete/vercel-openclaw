@@ -22,6 +22,7 @@ import {
   ensureSandboxRunning,
   ensureSandboxReady,
   waitForSandboxReady,
+  ensureSandboxReadyForCron,
   ensureSandboxAliveThrough,
   ensureRunningSandboxDynamicConfigFresh,
   syncGatewayConfigToSandbox,
@@ -40,6 +41,7 @@ import {
   reconcileStaleRunningStatus,
   reconcileSnapshottingStatus,
   resetSandbox,
+  SandboxLifecycleGuardRejectedError,
 } from "@/server/sandbox/lifecycle";
 import {
   _resetSandboxSleepConfigCacheForTesting,
@@ -74,6 +76,7 @@ import {
 } from "@/server/observability/operation-context";
 import {
   OPENCLAW_BIN,
+  OPENCLAW_BUNDLE_PATH,
   OPENCLAW_CONFIG_PATH,
   OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
   OPENCLAW_GATEWAY_RESTART_SCRIPT_PATH,
@@ -107,6 +110,12 @@ const ENV_OVERRIDES: Record<string, string | undefined> = {
   KV_URL: undefined,
   AI_GATEWAY_API_KEY: undefined,
   VERCEL_OIDC_TOKEN: undefined,
+  NEXT_PUBLIC_APP_URL: undefined,
+  NEXT_PUBLIC_BASE_DOMAIN: undefined,
+  BASE_DOMAIN: undefined,
+  VERCEL_PROJECT_PRODUCTION_URL: undefined,
+  VERCEL_BRANCH_URL: undefined,
+  VERCEL_URL: undefined,
   OPENCLAW_SANDBOX_SLEEP_AFTER_MS: undefined,
   OPENCLAW_PACKAGE_SPEC: undefined,
   OPENCLAW_BUNDLE_URL: undefined,
@@ -1365,6 +1374,48 @@ test("persistent resume requests explicit SDK resume", async () => {
   });
 });
 
+test("guarded cron readiness preserves a stopped snapshot restore", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    const handle = preRegisterResumeHandle(fake);
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-cron-restore";
+      meta.snapshotConfigHash = "snapshot-config";
+      meta.gatewayToken = "gw-cron";
+    });
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+    _setAiGatewayTokenOverrideForTesting("test-ai-key");
+
+    try {
+      const result = await ensureSandboxReadyForCron({
+        origin: "https://test.example.com",
+        reason: "cron-snapshot-restore-test",
+        aliveThroughMs: Date.now() + 60_000,
+        lifecycleGuard: async () => true,
+      });
+
+      assert.equal(result.meta.status, "running");
+      assert.equal(result.meta.snapshotId, "snap-cron-restore");
+      assert.equal(result.meta.snapshotConfigHash, "snapshot-config");
+      assert.ok(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash" &&
+            command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+        ),
+        "guarded readiness should use the restore path",
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 test("restoreSandboxFromSnapshot writes all files + manifest on first restore (no existing manifest)", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
@@ -1786,7 +1837,6 @@ test("persistent bundle identity mismatch quiesces and requires explicit migrati
       meta.gatewayToken = "gw-test";
       meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
     });
-
     const staleHandle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
     staleHandle.responders.push(...fake.defaultResponders);
     staleHandle.responders.push((cmd, args) => {
@@ -1809,7 +1859,6 @@ test("persistent bundle identity mismatch quiesces and requires explicit migrati
       return undefined;
     });
     fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, staleHandle);
-
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
 
@@ -2123,7 +2172,6 @@ test("failed external plugin install deletes its bundle candidate before retry",
       assert.deepEqual(meta.bundleIdentity, BUNDLE_ADMISSION.identity);
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
-      globalThis.fetch = originalFetch;
     }
   });
 });
@@ -2724,6 +2772,10 @@ test("restoreSandboxFromSnapshot records successful firewall sync before running
       assert.ok(policy.allow["api.openai.com"], "should include api.openai.com");
       assert.ok(policy.allow["registry.npmjs.org"], "should include registry.npmjs.org");
       assert.ok(policy.allow["ai-gateway.vercel.sh"], "should include ai-gateway with transform");
+      assert.ok(
+        policy.allow["test.example.com"],
+        "should include the cron projection control plane",
+      );
       // v2: resume path applies firewall but doesn't record detailed sync outcome
       assert.ok(
         (meta.lastRestoreMetrics?.firewallSyncMs ?? 0) >= 0,
@@ -2821,6 +2873,18 @@ test("createAndBootstrapSandbox records successful firewall sync before running"
     try {
       const meta = await runCreatePath();
       assert.equal(meta.status, "running");
+      const handle = fake.created.at(-1);
+      assert.ok(handle);
+      const createPolicy = handle.createTimeNetworkPolicy as {
+        allow: string[] | Record<string, unknown[]>;
+      };
+      const createDomains = Array.isArray(createPolicy.allow)
+        ? createPolicy.allow
+        : Object.keys(createPolicy.allow);
+      assert.ok(
+        createDomains.includes("test.example.com"),
+        "create policy must admit the cron projection control plane before Gateway starts",
+      );
       assert.equal(meta.firewall.lastSyncOutcome?.applied, true);
       assert.equal(meta.firewall.lastSyncReason, "create-policy-applied");
       assert.ok(meta.firewall.lastSyncAppliedAt);
@@ -3820,7 +3884,35 @@ test("[lifecycle] cron alive-through uses aged session remaining time, not defau
     const deadlineMs = now + 10 * 60_000;
     await ensureSandboxAliveThrough(deadlineMs);
     assert.ok(handle.extendedTimeouts[0]! >= 8 * 60_000);
-    assert.ok(handle.timeoutRemainingMs >= deadlineMs - Date.now() - 1_000);
+    assert.ok(handle.timeoutRemaining >= deadlineMs - Date.now() - 1_000);
+  });
+});
+
+test("[lifecycle] cron alive-through accounts for extension request latency", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const now = Date.now();
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-cron-delayed-extension";
+      meta.lastAccessedAt = now;
+    });
+    const handle = new FakeSandboxHandle(
+      "sbx-cron-delayed-extension",
+      fake.events,
+      30_000,
+    );
+    const extendTimeout = handle.extendTimeout.bind(handle);
+    handle.extendTimeout = async (duration) => {
+      await extendTimeout(duration);
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+    };
+    fake.handlesByIds.set("sbx-cron-delayed-extension", handle);
+
+    const deadlineMs = now + 4 * 60_000;
+    const result = await ensureSandboxAliveThrough(deadlineMs);
+    assert.equal(result.status, "running");
+    assert.ok(handle.timeoutRemaining >= deadlineMs - Date.now() - 1_000);
   });
 });
 
@@ -3979,6 +4071,47 @@ test("[lifecycle] ensureFreshGatewayToken: updates network policy with fresh tok
       assert.ok(
         meta.lastTokenRefreshAt !== null && meta.lastTokenRefreshAt > Date.now() - 5000,
         "lastTokenRefreshAt should be updated to recent time",
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("[lifecycle] token refresh preserves an explicit control-plane origin", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    _setAiGatewayTokenOverrideForTesting("fresh-token");
+    const handle = new FakeSandboxHandle("sbx-origin-refresh", fake.events);
+    fake.handlesByIds.set(handle.sandboxId, handle);
+
+    try {
+      await mutateMeta((meta) => {
+        meta.status = "running";
+        meta.sandboxId = handle.sandboxId;
+        meta.firewall.mode = "enforcing";
+        meta.firewall.allowlist = ["registry.npmjs.org"];
+        meta.lastTokenRefreshAt = Date.now() - 15 * 60_000;
+        meta.lastTokenExpiresAt = Math.floor(Date.now() / 1000) - 5 * 60;
+        meta.lastTokenSource = "oidc";
+      });
+
+      await ensureFreshGatewayToken({
+        force: true,
+        controlPlaneOrigin: "https://wake.example.com",
+      });
+
+      const policy = handle.networkPolicies.at(-1) as {
+        allow: Record<string, unknown[]>;
+      };
+      assert.deepEqual(Object.keys(policy.allow).sort(), [
+        "ai-gateway.vercel.sh",
+        "registry.npmjs.org",
+        "wake.example.com",
+      ]);
+      assert.deepEqual(
+        (await getInitializedMeta()).firewall.allowlist,
+        ["registry.npmjs.org"],
       );
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
@@ -6644,6 +6777,76 @@ test("resetSandbox adopts a durable reset interrupted before delete", async () =
       await getStore().getValue(hostSuspensionOperationKey()),
       null,
     );
+  });
+});
+
+test("ensureSandboxReady fails closed when its lifecycle guard is already revoked", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    await assert.rejects(
+      ensureSandboxReady({
+        origin: "https://app.example.com",
+        reason: "cron-projection:wake",
+        lifecycleGuard: async () => false,
+      }),
+      SandboxLifecycleGuardRejectedError,
+    );
+    assert.equal(fake.createCalls.length, 0);
+    assert.equal((await getInitializedMeta()).status, "uninitialized");
+  });
+});
+
+test("mid-bootstrap guard revocation removes the bundle candidate", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    let authorized = true;
+    let revokeOnce = true;
+    fake.defaultResponders.push((cmd, args) => {
+      if (
+        cmd === "node"
+        && args?.[0] === OPENCLAW_BUNDLE_PATH
+        && args[1] === "--version"
+      ) {
+        if (revokeOnce) {
+          revokeOnce = false;
+          authorized = false;
+        }
+        return {
+          exitCode: 0,
+          output: async (stream?: "stdout" | "stderr" | "both") =>
+            stream === "stderr" ? "" : `openclaw ${BUNDLE_VERSION}\n`,
+        };
+      }
+      return undefined;
+    });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await assert.rejects(
+        ensureSandboxReady({
+          origin: "https://app.example.com",
+          reason: "cron-projection:wake",
+          lifecycleGuard: async () => authorized,
+        }),
+        SandboxLifecycleGuardRejectedError,
+      );
+
+      const rejected = fake.created[0];
+      assert.ok(rejected);
+      assert.equal(rejected.deleteCalled, true);
+      assert.equal(
+        rejected.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === OPENCLAW_STARTUP_SCRIPT_PATH,
+        ),
+        false,
+      );
+      assert.equal((await getInitializedMeta()).status, "uninitialized");
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
   });
 });
 

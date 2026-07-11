@@ -739,6 +739,7 @@ export async function processChannelStep(
       const tokenResult = await ensureUsableAiGatewayCredential({
         minRemainingMs: 10 * 60 * 1000,
         reason: `channel:${channel}:pre-forward`,
+        controlPlaneOrigin: origin,
       });
       diag.preForwardTokenRefreshed = tokenResult.refreshed;
       diag.preForwardTokenReason = tokenResult.reason;
@@ -2603,6 +2604,7 @@ async function forwardToNativeHandlerWithRetry(
           const recovery = await ensureUsableAiGatewayCredential({
             minRemainingMs: Number.POSITIVE_INFINITY,
             reason: `channel:${channel}:forward-recovery`,
+            controlPlaneOrigin: origin,
           });
           logInfo("channels.ai_gateway_credential_recovery", {
             channel,

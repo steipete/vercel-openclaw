@@ -1,6 +1,7 @@
 import { requireJsonRouteAuth } from "@/server/auth/route-auth";
 import { getFirewallReport } from "@/server/firewall/state";
 import { extractRequestId, logInfo } from "@/server/log";
+import { getPublicOrigin } from "@/server/public-url";
 
 export async function GET(request: Request): Promise<Response> {
   const auth = await requireJsonRouteAuth(request);
@@ -9,7 +10,9 @@ export async function GET(request: Request): Promise<Response> {
   }
 
   const requestId = extractRequestId(request);
-  const report = await getFirewallReport();
+  const report = await getFirewallReport({
+    controlPlaneOrigin: getPublicOrigin(request),
+  });
   logInfo("firewall.report_generated", {
     operation: "report",
     policyHash: report.policyHash,

@@ -51,6 +51,29 @@ redis.call("set", KEYS[1], ARGV[2])
 return 1
 `;
 
+const CAS_VALUE_LUA = `
+local current = redis.call("get", KEYS[1])
+local expected = ARGV[1]
+
+if expected == "absent" then
+  if current then
+    return 0
+  end
+else
+  if not current then
+    return 0
+  end
+
+  local ok, decoded = pcall(cjson.decode, current)
+  if not ok or type(decoded) ~= "table" or tonumber(decoded["revision"]) ~= tonumber(expected) then
+    return 0
+  end
+end
+
+redis.call("set", KEYS[1], ARGV[2])
+return 1
+`;
+
 function toNumber(value: unknown): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -175,6 +198,11 @@ export class RedisStore {
     }
   }
 
+  async hasValue(key: string): Promise<boolean> {
+    assertScopedRedisKey(key);
+    return (await this.redis.exists(key)) === 1;
+  }
+
   async setValue<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
     assertScopedRedisKey(key);
     const payload = JSON.stringify(value);
@@ -184,6 +212,22 @@ export class RedisStore {
     }
 
     await this.redis.set(key, payload);
+  }
+
+  async compareAndSetValue<T extends { revision: number }>(
+    key: string,
+    expectedRevision: number | null,
+    next: T,
+  ): Promise<boolean> {
+    assertScopedRedisKey(key);
+    const result = await this.redis.eval(
+      CAS_VALUE_LUA,
+      1,
+      key,
+      expectedRevision === null ? "absent" : String(expectedRevision),
+      JSON.stringify(next),
+    );
+    return toNumber(result) === 1;
   }
 
   async deleteValue(key: string): Promise<void> {

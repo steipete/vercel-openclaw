@@ -122,6 +122,10 @@ export class FakeSandboxHandle implements SandboxHandle {
     return Math.max(0, this.timeoutExpiresAtMs - Date.now());
   }
 
+  setSessionAgeMsForTesting(ageMs: number): void {
+    this.timeoutExpiresAtMs = Date.now() + this.timeoutMs - ageMs;
+  }
+
   get status(): SandboxStatus {
     return this._status;
   }

@@ -14,6 +14,7 @@ import { logInfo, logWarn, logError } from "@/server/log";
 import type { SingleMeta } from "@/shared/types";
 import { createDefaultHotSpareState } from "@/shared/types";
 import type { SandboxHandle } from "@/server/sandbox/controller";
+import type { NetworkPolicy } from "@vercel/sandbox";
 
 // Re-export types for convenience.
 export type { HotSpareStatus, HotSpareState } from "@/shared/types";
@@ -55,10 +56,12 @@ export async function preCreateHotSpare(
       ports: number[];
       timeout: number;
       resources: { vcpus: number };
+      networkPolicy: NetworkPolicy;
     }) => Promise<SandboxHandle>;
     getSandboxVcpus: () => number;
     getSandboxSleepAfterMs: () => number;
     sandboxPorts: number[];
+    networkPolicy: NetworkPolicy;
   },
 ): Promise<PreCreateResult> {
   if (!isHotSpareEnabled()) {
@@ -103,6 +106,7 @@ export async function preCreateHotSpare(
       ports: deps.sandboxPorts,
       timeout: deps.getSandboxSleepAfterMs(),
       resources: { vcpus: deps.getSandboxVcpus() },
+      networkPolicy: deps.networkPolicy,
     });
 
     logInfo("hot_spare.pre_create.complete", {
@@ -142,11 +146,13 @@ export type SnapshotBackedCreateDeps = {
     resources: { vcpus: number };
     source: { type: "snapshot"; snapshotId: string };
     env?: Record<string, string>;
+    networkPolicy: NetworkPolicy;
   }) => Promise<SandboxHandle>;
   getSandboxVcpus: () => number;
   getSandboxSleepAfterMs: () => number;
   sandboxPorts: number[];
   restoreEnv: Record<string, string>;
+  networkPolicy: NetworkPolicy;
 };
 
 /**
@@ -214,6 +220,7 @@ export async function preCreateHotSpareFromSnapshot(
       resources: { vcpus: deps.getSandboxVcpus() },
       source: { type: "snapshot", snapshotId: meta.snapshotId },
       env: deps.restoreEnv,
+      networkPolicy: deps.networkPolicy,
     });
 
     logInfo("hot_spare.pre_create_from_snapshot.complete", {

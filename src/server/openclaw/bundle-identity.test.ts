@@ -7,6 +7,7 @@ import {
   admitConfiguredOpenClawBundle,
   bundleIdentityFromAdmission,
   hydrateVerifiedBundleIdentity,
+  matchesConfiguredBundleIdentity,
   REQUIRED_OPENCLAW_BUNDLE_ASSETS,
 } from "@/server/openclaw/bundle-identity";
 
@@ -460,6 +461,38 @@ test("hydrates only the persisted identity admitted by current configuration", a
       ),
       null,
     );
+  } finally {
+    restore();
+  }
+});
+
+test("matches persisted bundle identity against static deployment pins", () => {
+  const restore = configureVerifiedBundle();
+  try {
+    const identity = {
+      packageSpec: `openclaw@${VERSION}`,
+      version: VERSION,
+      forkSha: FORK_SHA,
+      upstreamSha: UPSTREAM_SHA,
+      canonicalSha256: CANONICAL_SHA,
+      capabilities: [
+        "admin-http-rpc-v1",
+        "cron-projection-v1",
+        "gateway-suspend-v1",
+        "telegram-durable-ack-v1",
+      ],
+      verified: true as const,
+    };
+    assert.equal(matchesConfiguredBundleIdentity(identity), true);
+    assert.equal(
+      matchesConfiguredBundleIdentity({
+        ...identity,
+        canonicalSha256: "9".repeat(64),
+      }),
+      false,
+    );
+    delete process.env.OPENCLAW_BUNDLE_SOURCE_SHA;
+    assert.equal(matchesConfiguredBundleIdentity(identity), false);
   } finally {
     restore();
   }

@@ -420,6 +420,7 @@ export async function POST(request: Request): Promise<Response> {
           requestId: requestId ?? null,
           sandboxId: effectiveMeta.sandboxId,
           op,
+          controlPlaneOrigin: getPublicOrigin(request),
         });
         const fastPathHeaders: Record<string, string> = {
           "content-type": "application/json",

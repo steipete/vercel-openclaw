@@ -6,6 +6,7 @@ import {
   setFirewallMode,
 } from "@/server/firewall/state";
 import { extractRequestId } from "@/server/log";
+import { getPublicOrigin } from "@/server/public-url";
 
 export async function GET(request: Request): Promise<Response> {
   const auth = await requireJsonRouteAuth(request);
@@ -34,7 +35,10 @@ export async function PUT(request: Request): Promise<Response> {
       throw new ApiError(400, "INVALID_MODE", "Invalid firewall mode.");
     }
 
-    const firewall = await setFirewallMode(body.mode, { requestId });
+    const firewall = await setFirewallMode(body.mode, {
+      requestId,
+      controlPlaneOrigin: getPublicOrigin(request),
+    });
     const response = Response.json({ firewall });
     if (auth.setCookieHeader) {
       response.headers.append("Set-Cookie", auth.setCookieHeader);

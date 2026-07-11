@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   CRON_WAKE_POST_DUE_SAFETY_MS,
   getCronWakeCredentialRetry,
+  getCronWakeDurableRetryMs,
   handoffCronWakeStep,
   processCronWakeStep,
 } from "@/server/workflows/cron/cron-wake-workflow";
@@ -15,6 +16,14 @@ test("cron wake step retry budget reaches the explicit terminal attempt", () => 
 
 test("cron wake covers the default command timeout after the due time", () => {
   assert.equal(CRON_WAKE_POST_DUE_SAFETY_MS, 15 * 60_000);
+});
+
+test("cron wake keeps terminal recovery durable with bounded backoff", () => {
+  assert.equal(getCronWakeDurableRetryMs(0), 60_000);
+  assert.equal(getCronWakeDurableRetryMs(1), 120_000);
+  assert.equal(getCronWakeDurableRetryMs(2), 240_000);
+  assert.equal(getCronWakeDurableRetryMs(10), 15 * 60_000);
+  assert.equal(getCronWakeDurableRetryMs(0, 30 * 60_000), 15 * 60_000);
 });
 
 test("cron wake retries every credential outcome without a usable credential", () => {

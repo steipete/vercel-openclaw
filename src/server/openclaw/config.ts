@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 
 import { getProtectionBypassSecret } from "@/server/public-url";
 import { logInfo } from "@/server/log";
+import { CRON_PROJECTION_CAPABILITY } from "@/server/cron/compatibility";
+import {
+  OPENCLAW_CRON_PROJECTION_PLUGIN_DIR,
+  OPENCLAW_CRON_PROJECTION_PLUGIN_ID,
+} from "@/server/openclaw/cron-projection-plugin";
 
 const OPENCLAW_PORT = 3000;
 
@@ -476,6 +481,37 @@ export function buildGatewayConfig(
   telegramWebhookSecret?: string,
   bundleCapabilities: readonly string[] = [],
 ): string {
+  const cronProjectionEnabled = bundleCapabilities.includes(
+    CRON_PROJECTION_CAPABILITY,
+  );
+  const adminHttpRpcEnabled = bundleCapabilities.includes("admin-http-rpc-v1");
+  const pluginAllow = ["slack", "telegram", "discord"];
+  const pluginEntries: Record<string, { enabled: boolean; config?: unknown }> = {};
+  const pluginLoadPaths: string[] = [];
+  if (adminHttpRpcEnabled) {
+    pluginAllow.push("admin-http-rpc");
+    pluginEntries["admin-http-rpc"] = { enabled: true };
+  }
+  if (cronProjectionEnabled) {
+    if (!proxyOrigin) {
+      throw new Error("Cron projection requires a canonical proxy origin.");
+    }
+    const endpoint = new URL(
+      "/api/internal/cron-projection",
+      `${proxyOrigin.replace(/\/+$/, "")}/`,
+    );
+    const bypassValue = getProtectionBypassSecret();
+    if (bypassValue) {
+      endpoint.searchParams.set("x-vercel-protection-bypass", bypassValue);
+    }
+    pluginAllow.push(OPENCLAW_CRON_PROJECTION_PLUGIN_ID);
+    pluginLoadPaths.push(OPENCLAW_CRON_PROJECTION_PLUGIN_DIR);
+    pluginEntries[OPENCLAW_CRON_PROJECTION_PLUGIN_ID] = {
+      enabled: true,
+      config: { endpoint: endpoint.toString() },
+    };
+  }
+
   const controlUi: Record<string, unknown> = {
     // The proxy enforces auth before any request reaches the sandbox gateway,
     // so the control UI can trust the proxied origin and skip its own login gate.
@@ -507,12 +543,6 @@ export function buildGatewayConfig(
     controlUi.allowedOrigins = Array.from(allowedOriginsSet);
   }
 
-  const adminHttpRpcEnabled = bundleCapabilities.includes("admin-http-rpc-v1");
-  const allowedPlugins = ["slack", "telegram", "discord"];
-  if (adminHttpRpcEnabled) {
-    allowedPlugins.push("admin-http-rpc");
-  }
-
   const config: Record<string, unknown> = {
     gateway: {
       mode: "local",
@@ -532,14 +562,12 @@ export function buildGatewayConfig(
     update: {
       checkOnStart: false,
     },
-    // Explicitly allow bundled channel plugins so handlers lazy-activate from
-    // per-channel config. Older OpenClaw builds also accepted
-    // `plugins.bundledDiscovery`, but current bundles reject that legacy key.
+    // Channel plugins remain bundle-owned. The host projection plugin is
+    // written before Gateway start and loaded only for hook-capable pins.
     plugins: {
-      allow: allowedPlugins,
-      ...(adminHttpRpcEnabled
-        ? { entries: { "admin-http-rpc": { enabled: true } } }
-        : {}),
+      allow: pluginAllow,
+      ...(pluginLoadPaths.length > 0 ? { load: { paths: pluginLoadPaths } } : {}),
+      ...(Object.keys(pluginEntries).length > 0 ? { entries: pluginEntries } : {}),
     },
   };
 
@@ -3513,7 +3541,7 @@ openclaw cron status                  # Scheduler status
 - For requests like "send here" or "the current Slack channel", bind \\\`--to\\\` to the current Slack channel as \\\`channel:<id>\\\`. Do not ask for a Slack user ID for current-channel delivery.
 - The scheduled prompt should ask the agent to produce content only. The cron runner owns final Slack delivery, so do not tell the agent to DM or resolve a person by name.
 - Jobs survive sandbox restarts via snapshot persistence.
-- The host watchdog checks every 5 minutes and wakes the sandbox if a job is due.
+- When the host reports an exact verified bundle with \`cron-projection-v1\`, it arms a token-revalidating Workflow for the earliest wake. The daily watchdog only repairs missing or stale dispatch.
 - Minimum interval for \\\`--every\\\` is 1 minute.
 `;
 }

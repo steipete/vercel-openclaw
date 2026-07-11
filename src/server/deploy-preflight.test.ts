@@ -13,9 +13,13 @@ function withEnv<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const runWithPatchedEnv = async (): Promise<T> => {
+    const effectivePatch = {
+      OPENCLAW_BUNDLE_URL: undefined,
+      ...patch,
+    };
     const previous = new Map<string, string | undefined>();
 
-    for (const [key, value] of Object.entries(patch)) {
+    for (const [key, value] of Object.entries(effectivePatch)) {
       previous.set(key, process.env[key]);
       if (value === undefined) {
         delete process.env[key];
@@ -1229,6 +1233,152 @@ test("webhook-bypass check is never 'fail' — missing bypass is warn, not a blo
           "webhook-bypass action must be 'recommended', not 'required'",
         );
       }
+    },
+  );
+});
+
+test("detected protection without a bundle adds no cron launch blocker", async () => {
+  await withEnv(
+    {
+      VERCEL: "1",
+      VERCEL_AUTH_MODE: "admin-secret",
+      NEXT_PUBLIC_APP_URL: "https://app.example.com",
+      VERCEL_AUTOMATION_BYPASS_SECRET: undefined,
+      REDIS_URL: "redis://default:token@example.com:6379",
+      OPENCLAW_PACKAGE_SPEC: "openclaw@1.0.0",
+      CRON_SECRET: "cron-secret",
+    },
+    async () => {
+      _setAiGatewayTokenOverrideForTesting("oidc-token");
+      _setProbeResultForTesting({ status: "detected", probeError: null });
+
+      const payload = await buildDeployPreflight(
+        new Request("https://app.example.com/api/admin/preflight"),
+      );
+
+      assert.equal(payload.ok, false, "existing channel checks still fail");
+      assert.equal(
+        payload.checks.some(
+          (check) => check.id === "cron-projection-connectivity",
+        ),
+        false,
+      );
+      assert.equal(getLaunchVerifyBlocking(payload).blocking, false);
+    },
+  );
+});
+
+test("detected protection blocks an unreachable verified bundle projection", async () => {
+  await withEnv(
+    {
+      VERCEL: "1",
+      VERCEL_AUTH_MODE: "admin-secret",
+      NEXT_PUBLIC_APP_URL: "https://app.example.com",
+      VERCEL_AUTOMATION_BYPASS_SECRET: undefined,
+      REDIS_URL: "redis://default:token@example.com:6379",
+      OPENCLAW_PACKAGE_SPEC: "openclaw@1.0.0",
+      OPENCLAW_BUNDLE_URL:
+        "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/openclaw.bundle.mjs",
+      CRON_SECRET: "cron-secret",
+    },
+    async () => {
+      _setAiGatewayTokenOverrideForTesting("oidc-token");
+      _setProbeResultForTesting({ status: "detected", probeError: null });
+
+      const payload = await buildDeployPreflight(
+        new Request("https://app.example.com/api/admin/preflight"),
+      );
+      const connectivity = payload.checks.find(
+        (check) => check.id === "cron-projection-connectivity",
+      );
+
+      assert.equal(connectivity?.status, "fail");
+      assert.equal(payload.ok, false);
+      const blocking = getLaunchVerifyBlocking(payload);
+      assert.equal(blocking.blocking, true);
+      assert.ok(
+        blocking.failingCheckIds.includes("cron-projection-connectivity"),
+      );
+      assert.ok(
+        payload.actions.some(
+          (action) =>
+            action.id === "configure-webhook-bypass" &&
+            action.status === "required",
+        ),
+      );
+    },
+  );
+});
+
+test("clear protection needs no bypass for verified bundle projection", async () => {
+  await withEnv(
+    {
+      VERCEL: "1",
+      VERCEL_AUTH_MODE: "admin-secret",
+      NEXT_PUBLIC_APP_URL: "https://app.example.com",
+      VERCEL_AUTOMATION_BYPASS_SECRET: undefined,
+      REDIS_URL: "redis://default:token@example.com:6379",
+      OPENCLAW_PACKAGE_SPEC: "openclaw@1.0.0",
+      OPENCLAW_BUNDLE_URL:
+        "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/openclaw.bundle.mjs",
+      CRON_SECRET: "cron-secret",
+    },
+    async () => {
+      _setAiGatewayTokenOverrideForTesting("oidc-token");
+      _setProbeResultForTesting({ status: "clear", probeError: null });
+
+      const payload = await buildDeployPreflight(
+        new Request("https://app.example.com/api/admin/preflight"),
+      );
+
+      assert.equal(
+        payload.checks.find(
+          (check) => check.id === "cron-projection-connectivity",
+        )?.status,
+        "pass",
+      );
+      assert.equal(payload.ok, true);
+      assert.equal(getLaunchVerifyBlocking(payload).blocking, false);
+    },
+  );
+});
+
+test("detected protection rejects a configured bypass that failed its self-probe", async () => {
+  await withEnv(
+    {
+      VERCEL: "1",
+      VERCEL_AUTH_MODE: "admin-secret",
+      NEXT_PUBLIC_APP_URL: "https://app.example.com",
+      VERCEL_AUTOMATION_BYPASS_SECRET: "bypass",
+      REDIS_URL: "redis://default:token@example.com:6379",
+      OPENCLAW_PACKAGE_SPEC: "openclaw@1.0.0",
+      OPENCLAW_BUNDLE_URL:
+        "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/openclaw.bundle.mjs",
+      CRON_SECRET: "cron-secret",
+    },
+    async () => {
+      _setAiGatewayTokenOverrideForTesting("oidc-token");
+      _setProbeResultForTesting({ status: "detected", probeError: null });
+
+      const payload = await buildDeployPreflight(
+        new Request("https://app.example.com/api/admin/preflight"),
+      );
+
+      assert.equal(
+        payload.checks.find(
+          (check) => check.id === "cron-projection-connectivity",
+        )?.status,
+        "fail",
+      );
+      assert.equal(payload.ok, false);
+      assert.ok(
+        payload.actions.some(
+          (action) =>
+            action.id === "configure-webhook-bypass" &&
+            action.status === "required" &&
+            /did not clear/i.test(action.message),
+        ),
+      );
     },
   );
 });

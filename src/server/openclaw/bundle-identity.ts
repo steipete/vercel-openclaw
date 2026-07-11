@@ -712,6 +712,42 @@ export function getConfiguredBundleFingerprint(): string | null {
     .digest("hex");
 }
 
+export function matchesConfiguredBundleIdentity(
+  storedIdentity: unknown,
+): storedIdentity is VerifiedBundleIdentity {
+  if (!isVerifiedBundleIdentity(storedIdentity)) return false;
+  try {
+    const configured = readConfiguredBundle();
+    if (!configured) return false;
+    const manifestLocation = parseOfficialReleaseAssetUrl(
+      configured.manifestUrl,
+      BUNDLE_MANIFEST_NAME,
+    );
+    const bundleLocation = parseOfficialReleaseAssetUrl(
+      configured.bundleUrl,
+      "openclaw.bundle.mjs",
+    );
+    const uiLocation = parseOfficialReleaseAssetUrl(
+      configured.bundleUiUrl,
+      "control-ui.tar.gz",
+    );
+    return (
+      bundleLocation.ref === manifestLocation.ref &&
+      uiLocation.ref === manifestLocation.ref &&
+      configured.bundleUrl ===
+        siblingAssetUrl(configured.manifestUrl, "openclaw.bundle.mjs") &&
+      configured.bundleUiUrl ===
+        siblingAssetUrl(configured.manifestUrl, "control-ui.tar.gz") &&
+      configured.sourceSha === storedIdentity.forkSha &&
+      configured.canonicalSha256 === storedIdentity.canonicalSha256 &&
+      (!configured.packageSpec ||
+        configured.packageSpec === storedIdentity.packageSpec)
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function admitConfiguredBundleUncached(
   configured: ConfiguredBundle | null,
   fetchImpl: FetchLike,

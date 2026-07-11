@@ -67,6 +67,10 @@ export function cronJobsKey(): string {
   return buildKey("cron-jobs-json");
 }
 
+export function cronProjectionKey(): string {
+  return buildKey("cron:projection");
+}
+
 export function adminSecretKey(): string {
   return buildKey("admin-secret");
 }

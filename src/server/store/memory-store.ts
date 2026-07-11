@@ -99,12 +99,50 @@ export class MemoryStore {
     }
   }
 
+  async hasValue(key: string): Promise<boolean> {
+    this.gc();
+    return this.values.has(key);
+  }
+
   async setValue<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
     this.gc();
     this.values.set(key, {
       value: JSON.stringify(value),
       expiresAt: typeof ttlSeconds === "number" ? Date.now() + ttlSeconds * 1000 : null,
     });
+  }
+
+  async compareAndSetValue<T extends { revision: number }>(
+    key: string,
+    expectedRevision: number | null,
+    next: T,
+  ): Promise<boolean> {
+    this.gc();
+    const current = this.values.get(key);
+    if (expectedRevision === null) {
+      if (current) return false;
+    } else {
+      if (!current) return false;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(current.value);
+      } catch {
+        return false;
+      }
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        (parsed as { revision?: unknown }).revision !== expectedRevision
+      ) {
+        return false;
+      }
+    }
+
+    this.values.set(key, {
+      value: JSON.stringify(next),
+      expiresAt: null,
+    });
+    return true;
   }
 
   async deleteValue(key: string): Promise<void> {

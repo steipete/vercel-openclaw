@@ -8,8 +8,11 @@ import {
 } from "@/app/api/internal/cron-projection/route";
 import {
   CRON_PROJECTION_CAPABILITY,
-  cronProjectionCompatibilityRuntime,
 } from "@/server/cron/compatibility";
+import {
+  _resetBundleIdentityForTesting,
+  _setBundleAdmissionForTesting,
+} from "@/server/openclaw/bundle-identity";
 import { cronDispatchWorkflowRuntime } from "@/server/cron/dispatch";
 import { readCronProjection } from "@/server/cron/projection";
 import {
@@ -21,6 +24,33 @@ import {
 import { cronProjectionKey } from "@/server/store/keyspace";
 
 const gatewayValue = "cron-projection-test-gateway-value";
+const bundleIdentity = {
+  packageSpec: "openclaw@2026.7.2",
+  version: "2026.7.2",
+  forkSha: "a".repeat(40),
+  upstreamSha: "b".repeat(40),
+  canonicalSha256: "c".repeat(64),
+  capabilities: [CRON_PROJECTION_CAPABILITY],
+  verified: true as const,
+};
+const bundleReleaseUrl =
+  "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2";
+
+function configureBundleEnvironment(): void {
+  process.env.OPENCLAW_BUNDLE_URL = `${bundleReleaseUrl}/openclaw.bundle.mjs`;
+  process.env.OPENCLAW_BUNDLE_UI_URL = `${bundleReleaseUrl}/control-ui.tar.gz`;
+  process.env.OPENCLAW_BUNDLE_MANIFEST_URL = `${bundleReleaseUrl}/asset-manifest.json`;
+  process.env.OPENCLAW_BUNDLE_SOURCE_SHA = bundleIdentity.forkSha;
+  process.env.OPENCLAW_BUNDLE_SHA256 = bundleIdentity.canonicalSha256;
+}
+
+function clearBundleEnvironment(): void {
+  delete process.env.OPENCLAW_BUNDLE_URL;
+  delete process.env.OPENCLAW_BUNDLE_UI_URL;
+  delete process.env.OPENCLAW_BUNDLE_MANIFEST_URL;
+  delete process.env.OPENCLAW_BUNDLE_SOURCE_SHA;
+  delete process.env.OPENCLAW_BUNDLE_SHA256;
+}
 
 function projectionRequest(
   authorization: string,
@@ -64,30 +94,29 @@ function input(revision: number, wakes: Array<{ jobId: string; runAtMs: number }
 
 test.beforeEach(async () => {
   (process.env as Record<string, string | undefined>).NODE_ENV = "test";
-  process.env.OPENCLAW_PACKAGE_SPEC = "openclaw@2026.7.2";
-  mock.method(
-    cronProjectionCompatibilityRuntime,
-    "getVerifiedBundleIdentity",
-    () => ({
-      packageSpec: "openclaw@2026.7.2",
-      version: "2026.7.2",
-      forkSha: "a".repeat(40),
-      upstreamSha: "b".repeat(40),
-      canonicalSha256: "c".repeat(64),
-      capabilities: [CRON_PROJECTION_CAPABILITY],
-      verified: true,
-    }),
-  );
+  delete process.env.OPENCLAW_PACKAGE_SPEC;
+  configureBundleEnvironment();
+  _resetBundleIdentityForTesting();
+  _setBundleAdmissionForTesting({
+    identity: bundleIdentity,
+    canonicalTarball: "openclaw-sandbox-bundle.tar.gz",
+    canonicalTarballUrl: "https://bundle.invalid/openclaw-sandbox-bundle.tar.gz",
+    assets: {},
+    externalPlugins: [],
+  });
   _resetStoreForTesting();
   await getInitializedMeta();
   await mutateMeta((meta) => {
     meta.gatewayToken = gatewayValue;
+    meta.bundleIdentity = bundleIdentity;
   });
 });
 
 test.afterEach(() => {
   mock.restoreAll();
   delete process.env.OPENCLAW_PACKAGE_SPEC;
+  clearBundleEnvironment();
+  _resetBundleIdentityForTesting();
   _resetStoreForTesting();
 });
 
@@ -111,7 +140,7 @@ test("cron projection endpoint binds the body to the authenticated gateway gener
 });
 
 test("cron projection endpoint fails closed without verified bundle capability", async () => {
-  mock.restoreAll();
+  delete process.env.OPENCLAW_BUNDLE_SOURCE_SHA;
   const response = await POST(
     projectionRequest(`Bearer ${gatewayValue}`, input(1, [])),
   );

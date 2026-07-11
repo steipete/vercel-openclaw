@@ -29,7 +29,13 @@ export type Store = {
   createMetaIfAbsent(meta: SingleMeta): Promise<boolean>;
   compareAndSetMeta(expectedVersion: number, next: SingleMeta): Promise<boolean>;
   getValue<T>(key: string): Promise<T | null>;
+  hasValue(key: string): Promise<boolean>;
   setValue<T>(key: string, value: T, ttlSeconds?: number): Promise<void>;
+  compareAndSetValue<T extends { revision: number }>(
+    key: string,
+    expectedRevision: number | null,
+    next: T,
+  ): Promise<boolean>;
   deleteValue(key: string): Promise<void>;
   acquireLock(key: string, ttlSeconds: number): Promise<string | null>;
   renewLock(key: string, token: string, ttlSeconds: number): Promise<boolean>;

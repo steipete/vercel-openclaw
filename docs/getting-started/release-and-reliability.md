@@ -34,7 +34,7 @@ Dashboard bootstrap admits only exact schema-v2 assets from one official `vercel
 
 Required capabilities are `admin-http-rpc-v1`, `cron-projection-v1`, `gateway-suspend-v1`, and `telegram-durable-ack-v1`; required plugin IDs include `admin-http-rpc`, `slack`, and `telegram`. Hosted code gates these paths on admitted capability identity, never release-version guesses.
 
-The sandbox downloads only the manifest-named canonical tarball, verifies its exact bytes and SHA-256, verifies every contained asset before extraction, and installs the verified Slack tarball offline through the OpenClaw plugin installer. It writes the bundle identity receipt only after config and external-plugin installation succeed. Persistent resume requires that receipt, stored metadata, and the currently configured release identity to match exactly; otherwise the sandbox is deleted and rebuilt.
+The sandbox downloads only the manifest-named canonical tarball, verifies its exact bytes and SHA-256, verifies every contained asset before extraction, and installs the verified Slack tarball offline through the OpenClaw plugin installer. It writes the bundle identity receipt only after config and external-plugin installation succeed. Persistent resume requires that receipt and stored metadata to match exactly. An existing sandbox with missing or stale identity fails closed with `OPENCLAW_BUNDLE_MIGRATION_REQUIRED`; the dashboard never deletes sandbox-owned cron or other state as an implicit upgrade step.
 
 Release order matters: publish the exact `@openclaw/slack@<bundle-version>` package before assembling the bundle, then publish and verify the marker-producing bundle, then deploy `vclaw` and dashboard consumers. No older plugin or unverified bundle fallback is supported.
 
@@ -77,6 +77,6 @@ The workflow should check tag/version agreement, run tests, and publish with npm
 
 - Deployment Protection can block webhooks before dashboard auth runs.
 - Redis env vars can exist before an integration secret is usable at runtime.
-- Persistent sandboxes preserve filesystem state across code changes, so old sandboxes may need reset or restore-script regeneration.
+- Persistent sandboxes preserve filesystem state across code changes. Moving an existing npm-backed or identity-mismatched sandbox to bundle mode requires an explicit data migration; reset is the destructive fallback only when its state can be discarded.
 - AI Gateway auth depends on Vercel OIDC in deployed environments; tokens should be injected through network policy transforms, not written into sandbox config.
 - Channel delivery has layered states; connected, delivery-ready, route-ready, accepted, and user-visible are not interchangeable.

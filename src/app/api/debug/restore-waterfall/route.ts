@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
-
 import { jsonOk } from "@/shared/http";
+import { computePolicyHash } from "@/shared/types";
 import { requireMutationAuth } from "@/server/auth/route-auth";
 import { requireDebugEnabled } from "@/server/auth/debug-guard";
 import {
@@ -21,7 +20,10 @@ import {
   buildRestoreAssetManifest,
   buildDynamicRestoreFiles,
 } from "@/server/openclaw/restore-assets";
-import { toNetworkPolicy } from "@/server/firewall/policy";
+import {
+  controlPlaneDomains,
+  toNetworkPolicy,
+} from "@/server/firewall/policy";
 import { getSandboxVcpus } from "@/server/sandbox/resources";
 import { getSandboxSleepAfterMs } from "@/server/sandbox/timeout";
 import { getPublicOrigin } from "@/server/public-url";
@@ -123,8 +125,17 @@ export async function POST(request: Request): Promise<Response> {
 
     stepSync("buildRestoreAssetManifest", () => buildRestoreAssetManifest());
 
+    const requiredDomains =
+      latest.firewall.mode === "enforcing"
+        ? controlPlaneDomains(origin)
+        : [];
     const firewallPolicy = stepSync("toNetworkPolicy", () =>
-      toNetworkPolicy(latest.firewall.mode, latest.firewall.allowlist),
+      toNetworkPolicy(
+        latest.firewall.mode,
+        latest.firewall.allowlist,
+        freshApiKey,
+        requiredDomains,
+      ),
     );
 
     const vcpus = getSandboxVcpus();
@@ -149,6 +160,7 @@ export async function POST(request: Request): Promise<Response> {
         resources: { vcpus },
         source: { type: "snapshot", snapshotId: meta.snapshotId! },
         env: restoreEnv,
+        networkPolicy: firewallPolicy,
       });
     });
 
@@ -230,9 +242,11 @@ export async function POST(request: Request): Promise<Response> {
     const exitCode = restoreResult.exitCode;
 
     // Phase 13: Firewall sync — must succeed before marking running in enforcing mode
-    const firewallPolicyHash = createHash("sha256")
-      .update(JSON.stringify(firewallPolicy))
-      .digest("hex");
+    const firewallPolicyHash = computePolicyHash(
+      latest.firewall.mode,
+      latest.firewall.allowlist,
+      requiredDomains,
+    );
 
     const firewallResult = await step("firewallSync", async () => {
       try {

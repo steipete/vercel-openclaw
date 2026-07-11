@@ -134,7 +134,9 @@ async function handleProxy(request: Request, path: string): Promise<Response> {
   }
 
   // Proactively refresh the OIDC token if stale (throttled to every 5 min).
-  await ensureFreshGatewayToken();
+  await ensureFreshGatewayToken({
+    controlPlaneOrigin: getPublicOrigin(request),
+  });
 
   const meta = await touchRunningSandbox();
   if (meta.status !== "running" || !meta.sandboxId || !meta.gatewayToken) {
@@ -210,7 +212,10 @@ async function handleProxy(request: Request, path: string): Promise<Response> {
   if (upstream.status === 401) {
     logWarn("gateway.upstream_401_token_expired", reqCtx);
     try {
-      await ensureFreshGatewayToken({ force: true });
+      await ensureFreshGatewayToken({
+        force: true,
+        controlPlaneOrigin: getPublicOrigin(request),
+      });
       upstream = await fetch(targetUrl, buildFetchInit(bodyBytes));
       logInfo("gateway.upstream_401_retry_succeeded", {
         ...reqCtx,

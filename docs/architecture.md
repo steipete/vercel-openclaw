@@ -35,6 +35,8 @@ The enforcement plane is the actual Vercel Sandbox plus its network policy. The 
 
 The network policy also handles **credential brokering**: AI Gateway tokens are injected as `Authorization` headers via `transform` rules at the firewall layer, and token refresh is a single `sandbox.update({ networkPolicy })` call with no gateway restart. Current bootstrap still has a compatibility exception where `buildRuntimeEnv()` may pass AI Gateway tokens into sandbox env, so the security model is host-controlled policy plus a documented bootstrap fallback, not a blanket claim that the credential never exists in the VM.
 
+In enforcing mode, a configured or request-resolved canonical control-plane hostname is permitted as an internal system domain. OpenClaw uses it for durable cron projection and other host-owned control-plane calls. This exception is applied to create, resume, hot-spare, diagnostic restore, and policy-refresh paths, but is not copied into the operator-managed allowlist or included in its displayed count. Local background operations without a resolvable canonical origin retain the operator policy unchanged.
+
 ## Request flow to `/gateway`
 
 1. The browser requests `/gateway`.

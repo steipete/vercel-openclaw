@@ -3,16 +3,40 @@ import type { FirewallEvent, FirewallIngestOutcome, FirewallReport, FirewallStat
 import { computePolicyHash } from "@/shared/types";
 import { getInitializedMeta, getStore, mutateMeta } from "@/server/store/store";
 import { learningLockKey } from "@/server/store/keyspace";
-import { applyFirewallPolicyToSandbox } from "@/server/firewall/policy";
+import {
+  applyFirewallPolicyToSandbox,
+  controlPlaneDomains,
+} from "@/server/firewall/policy";
 import { extractDomainsWithContext, groupByRegistrableDomain, normalizeDomainList } from "@/server/firewall/domains";
 import { logDebug, logInfo, logWarn } from "@/server/log";
 import { getSandboxController } from "@/server/sandbox/controller";
 import { resolveAiGatewayCredentialOptional } from "@/server/env";
+import { getPublicOrigin } from "@/server/public-url";
 
 const EVENT_RETENTION = 1000;
 const LEARNED_RETENTION = 500;
 const LEARNING_LOG_PATH = "/tmp/shell-commands-for-learning.log";
 const LEARNING_INGEST_INTERVAL_MS = 10_000;
+
+type FirewallPolicyContext = {
+  requestId?: string;
+  controlPlaneOrigin?: string;
+};
+
+function requiredControlPlaneDomains(
+  mode: FirewallState["mode"],
+  origin?: string,
+): string[] {
+  if (mode !== "enforcing") return [];
+  try {
+    return controlPlaneDomains(origin ?? getPublicOrigin());
+  } catch {
+    // Local deployments may intentionally omit a canonical origin. Keep the
+    // existing operator policy usable; host-owned egress requires an explicit
+    // canonical origin before it can be added safely.
+    return [];
+  }
+}
 
 export async function getFirewallState(): Promise<FirewallState> {
   const firewall = (await getInitializedMeta()).firewall;
@@ -41,7 +65,7 @@ export function computeWouldBlock(firewall: FirewallState): string[] {
 
 export async function setFirewallMode(
   mode: FirewallState["mode"],
-  options?: { requestId?: string },
+  options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   const current = (await getInitializedMeta()).firewall.mode;
   if (current === mode) {
@@ -76,7 +100,7 @@ export async function setFirewallMode(
       logInfo("firewall.mode_change_learning_started", { operation: "mode_change", learningStartedAt: now, requestId: options?.requestId });
     }
   });
-  await syncFirewallPolicyAfterMutation("setFirewallMode", options?.requestId);
+  await syncFirewallPolicyAfterMutation("setFirewallMode", options);
   logInfo("firewall.mode_change_applied", {
     operation: "mode_change",
     from: current,
@@ -88,7 +112,7 @@ export async function setFirewallMode(
 
 export async function approveDomains(
   domains: string[],
-  options?: { requestId?: string },
+  options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   logInfo("firewall.domains_approved_requested", { operation: "approve", count: domains.length, requestId: options?.requestId });
   const normalized = normalizeDomainList(domains);
@@ -125,7 +149,7 @@ export async function approveDomains(
       source: "api",
     });
   });
-  await syncFirewallPolicyAfterMutation("approveDomains", options?.requestId);
+  await syncFirewallPolicyAfterMutation("approveDomains", options);
   logInfo("firewall.domains_approved_applied", {
     operation: "approve",
     count: normalized.valid.length,
@@ -136,7 +160,7 @@ export async function approveDomains(
 
 export async function removeDomains(
   domains: string[],
-  options?: { requestId?: string },
+  options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   logInfo("firewall.remove_started", { operation: "remove", count: domains.length, requestId: options?.requestId });
   const normalized = normalizeDomainList(domains);
@@ -183,12 +207,12 @@ export async function removeDomains(
     });
   });
   logInfo("firewall.remove_completed", { operation: "remove", count: normalized.valid.length, requestId: options?.requestId });
-  await syncFirewallPolicyAfterMutation("removeDomains", options?.requestId);
+  await syncFirewallPolicyAfterMutation("removeDomains", options);
   return meta.firewall;
 }
 
 export async function promoteLearnedDomainsToEnforcing(
-  options?: { requestId?: string },
+  options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   logInfo("firewall.promote_started", { operation: "promote", requestId: options?.requestId });
   const meta = await mutateMeta((meta) => {
@@ -225,7 +249,10 @@ export async function promoteLearnedDomainsToEnforcing(
     });
   });
   logInfo("firewall.promote_completed", { operation: "promote", requestId: options?.requestId });
-  await syncFirewallPolicyAfterMutation("promoteLearnedDomainsToEnforcing", options?.requestId);
+  await syncFirewallPolicyAfterMutation(
+    "promoteLearnedDomainsToEnforcing",
+    options,
+  );
   return meta.firewall;
 }
 
@@ -266,16 +293,19 @@ export async function dismissLearnedDomains(
   return meta.firewall;
 }
 
-async function syncFirewallPolicyAfterMutation(mutation: string, requestId?: string): Promise<void> {
+async function syncFirewallPolicyAfterMutation(
+  mutation: string,
+  options?: FirewallPolicyContext,
+): Promise<void> {
   try {
-    await syncFirewallPolicyIfRunning({ requestId });
+    await syncFirewallPolicyIfRunning(options);
   } catch (error) {
     logWarn("firewall.sync_failed_after_mutation", {
       operation: "sync",
       code: "FIREWALL_SYNC_FAILED",
       reason: error instanceof Error ? error.message : String(error),
       mutation,
-      requestId,
+      requestId: options?.requestId,
     });
     throw new ApiError(
       502,
@@ -286,12 +316,25 @@ async function syncFirewallPolicyAfterMutation(mutation: string, requestId?: str
 }
 
 export async function syncFirewallPolicyIfRunning(
-  options?: { requestId?: string },
+  options?: FirewallPolicyContext,
 ): Promise<FirewallSyncOutcome> {
   const meta = await getInitializedMeta();
-  const hash = computePolicyHash(meta.firewall.mode, meta.firewall.allowlist);
+  const sandboxActive =
+    Boolean(meta.sandboxId) &&
+    (meta.status === "running" || meta.status === "booting");
+  const requiredDomains = sandboxActive
+    ? requiredControlPlaneDomains(
+        meta.firewall.mode,
+        options?.controlPlaneOrigin,
+      )
+    : [];
+  const hash = computePolicyHash(
+    meta.firewall.mode,
+    meta.firewall.allowlist,
+    requiredDomains,
+  );
 
-  if (!meta.sandboxId || (meta.status !== "running" && meta.status !== "booting")) {
+  if (!sandboxActive || !meta.sandboxId) {
     const reason = "sandbox-not-running";
     const outcome: FirewallSyncOutcome = {
       timestamp: Date.now(),
@@ -317,7 +360,12 @@ export async function syncFirewallPolicyIfRunning(
     // typically expires after ~1h and causes AI Gateway 401s with no recovery.
     const credential = await resolveAiGatewayCredentialOptional();
     const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
-    await applyFirewallPolicyToSandbox(sandbox, meta, credential?.token);
+    await applyFirewallPolicyToSandbox(
+      sandbox,
+      meta,
+      credential?.token,
+      requiredDomains,
+    );
     const now = Date.now();
     const durationMs = now - syncStart;
     const outcome: FirewallSyncOutcome = {
@@ -643,10 +691,16 @@ const FIREWALL_LIMITATIONS: string[] = [
   "Learning log is truncated on each read — domains only appear once per ingest cycle.",
 ];
 
-export async function getFirewallReport(): Promise<FirewallReport> {
+export async function getFirewallReport(
+  options?: Pick<FirewallPolicyContext, "controlPlaneOrigin">,
+): Promise<FirewallReport> {
   const fw = await getFirewallState();
   const diagnostics = await getFirewallDiagnostics();
-  const hash = computePolicyHash(fw.mode, fw.allowlist);
+  const requiredDomains = requiredControlPlaneDomains(
+    fw.mode,
+    options?.controlPlaneOrigin,
+  );
+  const hash = computePolicyHash(fw.mode, fw.allowlist, requiredDomains);
 
   return {
     schemaVersion: 1,

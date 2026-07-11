@@ -154,15 +154,21 @@ This separation makes it easy to tell whether a failure is inside the sandbox or
 
 ## Cron wake behavior
 
-OpenClaw has a built-in cron scheduler that persists jobs to `~/.openclaw/cron/jobs.json`. When the sandbox sleeps, the scheduler dies. The app bridges that gap:
+OpenClaw remains the only authority for cron jobs and due checks. The hosted app projects only wake times:
 
-1. **Before stop:** the app reads `jobs.json` from the sandbox, extracts the earliest next run time, and saves both the wake time and the full jobs payload to the durable store.
-2. **On heartbeat:** the same data is refreshed in the store so it survives even if the sandbox times out naturally without an explicit stop.
-3. **On each watchdog run:** the watchdog cron (`/api/cron/watchdog`) checks if the saved wake time has passed. If it has and the sandbox is stopped, the watchdog resumes the sandbox. OpenClaw's native cron takes over from there. The default schedule is daily (Hobby-compatible); Pro users can increase up to every minute in `vercel.json` for more timely auto-wake.
-4. **After resume:** if `jobs.json` is empty on the resumed sandbox but the store has a copy, the app writes the stored jobs back and restarts the gateway so the cron module reloads them.
-5. **After wake:** the wake key is cleared only when the cron restore outcome is confirmed successful. If resume fails, the key is retained so the next watchdog run can retry.
+1. **After scheduler reconciliation:** a trusted plugin receives `cron_reconciled`, adopts that exact scheduler, lists its jobs, and posts a bounded snapshot of the earliest 4,096 wake times plus credential-keyed job hashes to the authenticated host endpoint.
+2. **After job changes:** `cron_changed` is a coalesced hint to reread the adopted scheduler. Event deltas are never treated as ordered state.
+3. **On host acceptance:** the endpoint atomically replaces the sanitized Redis projection. Job IDs are keyed-hashed inside the sandbox before transmission; job names, prompts, payloads, delivery targets, and other job configuration never enter the host store.
+4. **For the earliest wake:** Vercel Workflow sleeps until the projected time. Its step rereads the Redis projection and atomically claims the current revision and dispatch token before resuming the sandbox. Superseded workflows become no-ops.
+5. **On watchdog runs:** the watchdog repairs a missing, failed, or stale Workflow dispatch and exposes sanitized projection diagnostics. It does not independently decide that a cron job is due.
 
-The watchdog never runs chat completions, delivers messages, or interacts with channels. It only wakes the sandbox.
+The wake extends the current sandbox session through a 15-minute post-due safety window, covering OpenClaw's default 10-minute command timeout. Longer agent runs remain constrained by the Vercel plan's per-session maximum and are not yet a supported hosted cron guarantee.
+
+The migration from the former `cron-next-wake-ms` / `cron-jobs-json` keys is gated on an exact verified bundle identity declaring `cron-projection-v1`. It imports only the old earliest wake as a temporary fallback. If only the legacy jobs key exists for a resumable sleeping sandbox, key presence can arm one immediate bootstrap wake without reading or importing its payload. An authoritative plugin baseline retires the old wake key, but the jobs backup remains until an explicit verified data migration or destructive reset owns its removal.
+
+Enabling bundle mode does not authorize replacing an existing persistent sandbox. Missing or stale bundle identity fails with `OPENCLAW_BUNDLE_MIGRATION_REQUIRED` so OpenClaw-owned cron state stays intact; use an explicit verified migration, or reset only when discarding the sandbox is intentional.
+
+Sandbox reset rotates the internal gateway credential and generation-fences the projection before a replacement sandbox can start. Delayed snapshots from the destroyed sandbox therefore remain stale even when host and sandbox clocks differ.
 
 ## Resume-prepared state
 

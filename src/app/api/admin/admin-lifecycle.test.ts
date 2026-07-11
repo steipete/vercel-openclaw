@@ -177,7 +177,7 @@ function makeFakeHandle(
   return {
     sandboxId,
     get timeout() { return 1800000; },
-    get timeoutRemainingMs() { return 1800000; },
+    get timeoutRemaining() { return 1800000; },
     get status() { return "running" as const; },
     async runCommand(commandOrOptions) {
       if (

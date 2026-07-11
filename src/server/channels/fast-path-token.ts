@@ -12,12 +12,14 @@ export async function refreshChannelFastPathGatewayToken(options: {
   sandboxId: string;
   requestId: string | null;
   op: OperationContext;
+  controlPlaneOrigin: string;
 }): Promise<void> {
-  const { channel, sandboxId, requestId, op } = options;
+  const { channel, sandboxId, requestId, op, controlPlaneOrigin } = options;
   try {
     const result = await ensureUsableAiGatewayCredential({
       minRemainingMs: CHANNEL_FAST_PATH_MIN_TOKEN_REMAINING_MS,
       reason: `channel:${channel}:fast-path-pre-forward`,
+      controlPlaneOrigin,
     });
     logInfo("channels.fast_path_token_refresh", withOperationContext(op, {
       channel,

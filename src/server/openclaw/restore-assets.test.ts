@@ -179,7 +179,6 @@ test("static restore files stage the host-owned cron projection plugin before bo
   assert.match(source, /api\.on\("cron_reconciled"/);
   assert.match(source, /api\.on\("cron_changed"/);
   assert.match(source, /cron\.list\(\{ includeDisabled: true \}\)/);
-  assert.match(source, /jobKey: createHash\("sha256"\)/);
   assert.doesNotMatch(source, /jobId: job\.id/);
   assert.match(source, /reconciliationSignal = ctx\.abortSignal/);
   assert.match(source, /return requestProjection\(event\.reason\)/);
@@ -189,6 +188,12 @@ test("static restore files stage the host-owned cron projection plugin before bo
   assert.match(source, /AbortSignal\.timeout\(attemptTimeoutMs\)/);
   assert.match(source, /Promise\.race\(\[/);
   assert.match(source, /response\.body\?\.cancel\(\)/);
+  assert.match(source, /const settlementGraceMs = 5 \* 60_000/);
+  assert.match(source, /const overdueSafetyIntervalMs = 15 \* 60_000/);
+  assert.match(source, /const maxTimerDelayMs = 2_147_000_000/);
+  assert.match(source, /scheduleSettlementSafety\(wakes\)/);
+  assert.match(source, /return requestProjection\("changed"\)/);
+  assert.match(source, /settlementTimer\?\.abort\(\)/);
   assert.match(
     source,
     /restartPrefixes:[\s\S]*plugins\.entries\.vercel-cron-projection/,

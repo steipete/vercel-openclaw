@@ -25,7 +25,11 @@ export function toNetworkPolicy(
   mode: SingleMeta["firewall"]["mode"],
   allowlist: string[],
   aiGatewayToken?: string,
+  requiredDomains: readonly string[] = [],
 ): NetworkPolicy {
+  const enforcingDomains = [...new Set([...allowlist, ...requiredDomains])].sort(
+    (left, right) => left.localeCompare(right),
+  );
   // When a token is provided, always use the object form so the transform
   // injects the Authorization header at the firewall layer — the credential
   // never enters the sandbox.
@@ -44,7 +48,7 @@ export function toNetworkPolicy(
       }
       case "enforcing": {
         const allow: Record<string, NetworkPolicyRule[]> = {};
-        for (const domain of [...allowlist].sort((a, b) => a.localeCompare(b))) {
+        for (const domain of enforcingDomains) {
           allow[domain] =
             domain === AI_GATEWAY_DOMAIN ? transformRules : [];
         }
@@ -60,7 +64,7 @@ export function toNetworkPolicy(
   // Legacy path: no token — return the simple form.
   switch (mode) {
     case "enforcing":
-      return { allow: [...allowlist].sort((left, right) => left.localeCompare(right)) };
+      return { allow: enforcingDomains };
     case "disabled":
     case "learning":
       return "allow-all";
@@ -71,17 +75,20 @@ export async function applyFirewallPolicyToSandbox(
   sandbox: SandboxHandle,
   meta: SingleMeta,
   aiGatewayToken?: string,
+  requiredDomains: readonly string[] = [],
 ): Promise<NetworkPolicy> {
   const policy = toNetworkPolicy(
     meta.firewall.mode,
     meta.firewall.allowlist,
     aiGatewayToken,
+    requiredDomains,
   );
   logInfo("firewall.policy_requested", {
     operation: "sync",
     mode: meta.firewall.mode,
     allowlistCount: meta.firewall.allowlist.length,
     hasAiGatewayTransform: !!aiGatewayToken,
+    requiredDomainCount: requiredDomains.length,
   });
   await sandbox.updateNetworkPolicy(policy);
   logInfo("firewall.policy_applied", {
@@ -89,6 +96,15 @@ export async function applyFirewallPolicyToSandbox(
     mode: meta.firewall.mode,
     allowlistCount: meta.firewall.allowlist.length,
     hasAiGatewayTransform: !!aiGatewayToken,
+    requiredDomainCount: requiredDomains.length,
   });
   return policy;
+}
+
+export function controlPlaneDomains(origin: string): string[] {
+  const url = new URL(origin);
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("Control-plane origin must use HTTP or HTTPS.");
+  }
+  return [url.hostname];
 }

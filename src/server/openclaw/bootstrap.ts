@@ -14,7 +14,6 @@ import {
   BUN_DOWNLOAD_URL,
   BUN_INSTALL_DIR,
   getOpenclawBundleUrl,
-  getOpenclawGatewayCmd,
   OPENCLAW_BIN,
   OPENCLAW_BUNDLE_PATH,
   OPENCLAW_BUNDLED_PLUGINS_DIR_PATH,
@@ -379,6 +378,7 @@ export async function setupOpenClaw(
     slackCredentials?: { botToken: string; signingSecret: string };
     telegramWebhookSecret?: string;
     progress?: SetupProgressWriter;
+    beforeGatewayStart?: () => Promise<void>;
   },
 ): Promise<{
   startupScript: string;
@@ -697,6 +697,7 @@ export async function setupOpenClaw(
     drift,
   });
 
+  await options.beforeGatewayStart?.();
   progress?.setPhase("starting-gateway", "Launching gateway");
   const startupResult = await sandbox.runCommand({
     cmd: "bash",

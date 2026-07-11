@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { getConfiguredBundleFingerprint } from "@/server/openclaw/bundle-identity";
 
+import { buildCronProjectionPluginFiles } from "@/server/openclaw/cron-projection-plugin";
 import {
   OPENCLAW_AI_GATEWAY_API_KEY_PATH,
   OPENCLAW_GATEWAY_TOKEN_PATH,
@@ -91,6 +92,7 @@ export function buildWorkerSandboxRestoreFiles(): { path: string; content: Buffe
 
 export function buildStaticRestoreFiles(): { path: string; content: Buffer }[] {
   return [
+    ...buildCronProjectionPluginFiles(),
     { path: OPENCLAW_FORCE_PAIR_SCRIPT_PATH, content: Buffer.from(buildForcePairScript()) },
     { path: OPENCLAW_STARTUP_SCRIPT_PATH, content: Buffer.from(buildStartupScript()) },
     { path: OPENCLAW_FAST_RESTORE_SCRIPT_PATH, content: Buffer.from(buildFastRestoreScript()) },

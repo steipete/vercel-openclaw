@@ -2,7 +2,10 @@ import { jsonOk } from "@/shared/http";
 import { requireDebugEnabled } from "@/server/auth/debug-guard";
 import { requireMutationAuth } from "@/server/auth/route-auth";
 import { resolveAiGatewayCredentialOptional } from "@/server/env";
-import { toNetworkPolicy } from "@/server/firewall/policy";
+import {
+  controlPlaneDomains,
+  toNetworkPolicy,
+} from "@/server/firewall/policy";
 import { extractRequestId, logError, logInfo } from "@/server/log";
 import { buildGatewayConfig } from "@/server/openclaw/config";
 import { buildRestoreAssetManifest } from "@/server/openclaw/restore-assets";
@@ -58,12 +61,20 @@ export async function POST(request: Request): Promise<Response> {
       getInitializedMeta(),
     );
 
+    const origin = getPublicOrigin(request);
     await mark("buildGatewayConfig", () =>
-      buildGatewayConfig(credential?.token, getPublicOrigin(request)),
+      buildGatewayConfig(credential?.token, origin),
     );
 
     await mark("toNetworkPolicy", () =>
-      toNetworkPolicy(latest.firewall.mode, latest.firewall.allowlist),
+      toNetworkPolicy(
+        latest.firewall.mode,
+        latest.firewall.allowlist,
+        credential?.token,
+        latest.firewall.mode === "enforcing"
+          ? controlPlaneDomains(origin)
+          : [],
+      ),
     );
 
     await mark("buildRestoreAssetManifest", () =>

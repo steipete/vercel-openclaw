@@ -4,12 +4,12 @@ import { APIError as VercelSandboxApiError } from "@vercel/sandbox";
 
 import { pollUntil } from "@/server/async/poll";
 import { ApiError } from "@/shared/http";
-import type {
-  OperationContext,
-  RestorePhaseMetrics,
-  RestorePreparedReason,
-  SingleMeta,
-  StoredCronRecord,
+import {
+  computePolicyHash,
+  type OperationContext,
+  type RestorePhaseMetrics,
+  type RestorePreparedReason,
+  type SingleMeta,
 } from "@/shared/types";
 import {
   withOperationContext,
@@ -19,8 +19,13 @@ import {
   resolveAiGatewayCredentialOptional,
   isVercelDeployment,
 } from "@/server/env";
-import { applyFirewallPolicyToSandbox, toNetworkPolicy } from "@/server/firewall/policy";
+import {
+  applyFirewallPolicyToSandbox,
+  controlPlaneDomains,
+  toNetworkPolicy,
+} from "@/server/firewall/policy";
 import { logError, logInfo, logWarn } from "@/server/log";
+import { getPublicOrigin } from "@/server/public-url";
 import {
   setupOpenClaw,
   CommandFailedError,
@@ -29,6 +34,7 @@ import {
 import {
   admitConfiguredOpenClawBundle,
   hydrateVerifiedBundleIdentity,
+  matchesConfiguredBundleIdentity,
   verifiedBundleIdentitiesEqual,
 } from "@/server/openclaw/bundle-identity";
 import { isVerifiedBundleIdentity } from "@/shared/bundle-identity";
@@ -105,11 +111,16 @@ import {
 } from "@/server/store/store";
 import {
   cronJobsKey,
-  cronNextWakeKey,
   lifecycleLockKey,
   startLockKey,
   tokenRefreshLockKey,
 } from "@/server/store/keyspace";
+import {
+  clearLegacyCronStateForReset,
+  fenceCronProjectionStateForReset,
+  normalizeResetCronProjectionGeneration,
+} from "@/server/cron/projection";
+import { cancelSupersededCronWake } from "@/server/cron/dispatch";
 import {
   isHotSpareEnabled,
   preCreateHotSpare,
@@ -128,16 +139,6 @@ import {
 const OPENCLAW_PORT = 3000;
 const SANDBOX_PORTS = [OPENCLAW_PORT, OPENCLAW_TELEGRAM_WEBHOOK_PORT];
 const BUNDLE_CANDIDATE_OWNERSHIP_TAG = "openclaw-bundle-candidate";
-export function CRON_NEXT_WAKE_KEY(): string {
-  return cronNextWakeKey();
-}
-
-export function CRON_JOBS_KEY(): string {
-  return cronJobsKey();
-}
-const CRON_JOBS_PATH = `${OPENCLAW_STATE_DIR}/cron/jobs.json`;
-const CRON_JOBS_STATE_PATH = `${OPENCLAW_STATE_DIR}/cron/jobs-state.json`;
-const CRON_JOBS_MAX_BYTES = 256 * 1024; // 256 KB size cap for store value
 
 function sandboxApiStatus(error: unknown): number | null {
   if (error instanceof VercelSandboxApiError) {
@@ -167,56 +168,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function extractCronRuntimeState(value: unknown): Record<string, unknown> | null {
-  if (!isRecord(value)) return null;
-  if (isRecord(value.state)) return value.state;
-
-  const runtimeKeys = new Set([
-    "nextRunAtMs",
-    "lastRunAtMs",
-    "lastRunStatus",
-    "lastStatus",
-    "lastDeliveryStatus",
-    "lastDelivered",
-    "consecutiveErrors",
-  ]);
-  const entries = Object.entries(value).filter(([key]) => runtimeKeys.has(key));
-  return entries.length > 0 ? Object.fromEntries(entries) : null;
-}
-
-function mergeCronRuntimeState(rawJobsJson: string, rawStateJson: string | null): string {
-  if (!rawStateJson) return rawJobsJson;
-
-  const jobsPayload = JSON.parse(rawJobsJson) as {
-    jobs?: Array<{ id?: string; state?: Record<string, unknown> }>;
-  };
-
-  let statePayload: { jobs?: Record<string, unknown> };
-  try {
-    statePayload = JSON.parse(rawStateJson) as { jobs?: Record<string, unknown> };
-  } catch (error) {
-    logWarn("sandbox.cron_state_merge_skipped", {
-      reason: "invalid-jobs-state-json",
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return rawJobsJson;
-  }
-
-  if (!Array.isArray(jobsPayload.jobs) || !isRecord(statePayload.jobs)) {
-    return rawJobsJson;
-  }
-
-  let changed = false;
-  for (const job of jobsPayload.jobs) {
-    if (!job.id) continue;
-    const state = extractCronRuntimeState(statePayload.jobs[job.id]);
-    if (!state || Object.keys(state).length === 0) continue;
-    job.state = { ...(job.state ?? {}), ...state };
-    changed = true;
-  }
-
-  return changed ? JSON.stringify(jobsPayload) : rawJobsJson;
-}
 
 function computeMetaGatewayConfigHash(meta: SingleMeta): string {
   const slack = meta.channels.slack;
@@ -230,53 +181,6 @@ function computeMetaGatewayConfigHash(meta: SingleMeta): string {
   });
 }
 
-/** Build a structured cron record from raw jobs JSON. Returns null if invalid. */
-function buildCronRecord(
-  rawJobsJson: string,
-  source: "stop" | "heartbeat",
-): StoredCronRecord | null {
-  try {
-    const parsed = JSON.parse(rawJobsJson) as {
-      jobs?: Array<{ id?: string; enabled?: boolean }>;
-    };
-    if (!Array.isArray(parsed.jobs) || parsed.jobs.length === 0) return null;
-    if (rawJobsJson.length > CRON_JOBS_MAX_BYTES) return null;
-    return {
-      version: 1,
-      capturedAt: Date.now(),
-      source,
-      sha256: createHash("sha256").update(rawJobsJson).digest("hex"),
-      jobCount: parsed.jobs.length,
-      jobIds: parsed.jobs.map((j) => j.id ?? "").filter(Boolean).sort(),
-      jobsJson: rawJobsJson,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/** Parse a stored cron record, handling both structured and legacy raw string formats. */
-function parseStoredCronRecord(
-  raw: unknown,
-): StoredCronRecord | null {
-  if (!raw) return null;
-  // Structured record (has version field)
-  if (typeof raw === "object" && raw !== null && "version" in raw && "jobsJson" in raw) {
-    return raw as StoredCronRecord;
-  }
-  // Legacy: raw string or object without version field
-  let jobsJson: string;
-  if (typeof raw === "string") {
-    jobsJson = raw;
-  } else if (typeof raw === "object" && raw !== null && "jobs" in raw) {
-    // Object form (legacy deserialization of raw jobs JSON)
-    jobsJson = JSON.stringify(raw);
-  } else {
-    return null;
-  }
-  // Wrap legacy format into a structured record for uniform handling
-  return buildCronRecord(jobsJson, "stop") ?? null;
-}
 
 // Lock base TTLs are kept short so a Vercel Function killed mid-operation
 // leaves a stuck lock behind for at most TTL seconds. The auto-renewer
@@ -555,10 +459,7 @@ async function waitForConfiguredChannelRoutesReady(params: {
 
 export type BackgroundScheduler = (callback: () => Promise<void> | void) => void;
 
-export type CronWakeReadResult =
-  | { status: "ok"; nextWakeMs: number; rawJobsJson: string }
-  | { status: "no-jobs"; rawJobsJson?: string }
-  | { status: "error"; error: string };
+export type SandboxLifecycleGuard = () => Promise<boolean>;
 
 type AutoRenewedLockOptions = {
   key: string;
@@ -592,6 +493,13 @@ class LifecycleAttemptFailedError extends Error {
   ) {
     super(failure instanceof Error ? failure.message : String(failure));
     this.name = "LifecycleAttemptFailedError";
+  }
+}
+
+export class SandboxLifecycleGuardRejectedError extends Error {
+  constructor() {
+    super("Sandbox lifecycle guard rejected the operation.");
+    this.name = "SandboxLifecycleGuardRejectedError";
   }
 }
 
@@ -914,6 +822,14 @@ async function quiesceSandboxForBundleMigration(input: {
   }
 }
 
+async function assertLifecycleGuardCurrent(
+  lifecycleGuard?: SandboxLifecycleGuard,
+): Promise<void> {
+  if (lifecycleGuard && !(await lifecycleGuard())) {
+    throw new SandboxLifecycleGuardRejectedError();
+  }
+}
+
 export class SandboxLifecycleLockContendedError extends ApiError {
   constructor() {
     super(409, "LIFECYCLE_LOCK_CONTENDED", "Sandbox lifecycle work is already in progress.");
@@ -1020,6 +936,8 @@ export type EnsureUsableCredentialOptions = {
   required?: boolean;
   /** Human-readable reason for logging. */
   reason?: string;
+  /** Canonical host origin that must remain reachable after policy refresh. */
+  controlPlaneOrigin?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +948,7 @@ export async function ensureSandboxRunning(options: {
   origin: string;
   reason: string;
   schedule?: BackgroundScheduler;
+  lifecycleGuard?: SandboxLifecycleGuard;
   op?: OperationContext;
 }): Promise<{ state: "running" | "waiting"; meta: SingleMeta }> {
   let meta = await getInitializedMeta();
@@ -1095,6 +1014,7 @@ export async function ensureSandboxRunning(options: {
       origin: options.origin,
       reason: options.reason,
       schedule: options.schedule,
+      lifecycleGuard: options.lifecycleGuard,
       op: options.op,
     });
     if (health.status === "ready") {
@@ -1143,6 +1063,7 @@ export type WaitForSandboxReadyOptions = {
   timeoutMs?: number;
   pollIntervalMs?: number;
   reconcile?: boolean;
+  lifecycleGuard?: SandboxLifecycleGuard;
   op?: OperationContext;
 };
 
@@ -1199,7 +1120,6 @@ function terminalBundleReadyFailure(lastError: string | null): ApiError | null {
     ? null
     : failure;
 }
-
 function sandboxReadyFailure(
   lastError: string | null,
   context: "reconciling" | "waiting",
@@ -1238,6 +1158,7 @@ export async function waitForSandboxReady(
     const health = await reconcileSandboxHealth({
       origin: options.origin,
       reason: options.reason,
+      lifecycleGuard: options.lifecycleGuard,
       op: options.op,
     });
 
@@ -1265,6 +1186,7 @@ export async function waitForSandboxReady(
         const result = await ensureSandboxRunning({
           origin: options.origin,
           reason: options.reason,
+          lifecycleGuard: options.lifecycleGuard,
           op: options.op,
         });
 
@@ -1281,7 +1203,6 @@ export async function waitForSandboxReady(
             },
           };
         }
-
         return {
           done: false,
           state: await getInitializedMeta(),
@@ -1310,10 +1231,130 @@ export async function ensureSandboxReady(options: {
   reason: string;
   timeoutMs?: number;
   pollIntervalMs?: number;
+  lifecycleGuard?: SandboxLifecycleGuard;
   op?: OperationContext;
 }): Promise<SingleMeta> {
+  const lifecycleGuard = options.lifecycleGuard;
+  if (lifecycleGuard) {
+    const guardedOptions = { ...options, lifecycleGuard };
+    return withGuardedLifecycleLock(guardedOptions, async (lease) =>
+      ensureSandboxReadyWithinLifecycleLock({ ...guardedOptions, lease }),
+    );
+  }
   const result = await waitForSandboxReady({ ...options, reconcile: true });
   return result.meta;
+}
+
+export async function ensureSandboxReadyForCron(options: {
+  origin: string;
+  reason: string;
+  aliveThroughMs: number;
+  lifecycleGuard: SandboxLifecycleGuard;
+}): Promise<{ meta: SingleMeta; credential: TokenRefreshResult }> {
+  return withGuardedLifecycleLock(options, async (lease) => {
+    const meta = await ensureSandboxReadyWithinLifecycleLock({
+      ...options,
+      refreshGatewayToken: false,
+      lease,
+    });
+    await assertLifecycleGuardCurrent(options.lifecycleGuard);
+    await ensureSandboxAliveThrough(options.aliveThroughMs);
+    await assertLifecycleGuardCurrent(options.lifecycleGuard);
+    const credential = await ensureUsableAiGatewayCredential({
+      force: true,
+      required: true,
+      reason: options.reason,
+      controlPlaneOrigin: options.origin,
+    });
+    await assertLifecycleGuardCurrent(options.lifecycleGuard);
+    return { meta, credential };
+  });
+}
+
+async function withGuardedLifecycleLock<T>(
+  options: {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    lifecycleGuard: SandboxLifecycleGuard;
+    reason?: string;
+  },
+  action: (lease: AutoRenewedLockLease) => Promise<T>,
+): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? READY_WAIT_TIMEOUT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? READY_WAIT_POLL_MS;
+  const deadlineMs = Date.now() + timeoutMs;
+  let reportedContention = false;
+  while (true) {
+    try {
+      return await withLifecycleLock(async (lease) => {
+        await assertLifecycleGuardCurrent(options.lifecycleGuard);
+        return action(lease);
+      });
+    } catch (error) {
+      if (!(error instanceof LifecycleLockUnavailableError)) throw error;
+      if (!reportedContention) {
+        reportedContention = true;
+        logInfo("sandbox.lifecycle_lock_contended", {
+          reason: options.reason ?? "guarded-lifecycle",
+          guarded: true,
+        });
+      }
+      if (Date.now() >= deadlineMs) {
+        throw new SandboxLifecycleLockContendedError();
+      }
+      await wait(pollIntervalMs);
+    }
+  }
+}
+
+async function ensureSandboxReadyWithinLifecycleLock(options: {
+  origin: string;
+  reason: string;
+  lifecycleGuard: SandboxLifecycleGuard;
+  refreshGatewayToken?: boolean;
+  op?: OperationContext;
+  lease: AutoRenewedLockLease;
+}): Promise<SingleMeta> {
+  let current = await getInitializedMeta();
+  if (current.status === "running" && current.sandboxId) {
+    const probe = await probeGatewayReady();
+    if (probe.ready) {
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      if (options.refreshGatewayToken !== false) {
+        await ensureFreshGatewayToken({
+          force: true,
+          controlPlaneOrigin: options.origin,
+        });
+      }
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      return mutateMeta((meta) => {
+        meta.lastAccessedAt = Date.now();
+      });
+    }
+    await assertLifecycleGuardCurrent(options.lifecycleGuard);
+    await markSandboxUnavailable(
+      `Guarded health reconciliation: gateway unreachable (${options.reason})`,
+      current.sandboxId,
+    );
+    current = await getInitializedMeta();
+  }
+  const ready = await createAndBootstrapSandboxWithinLifecycleLock(
+    options.origin,
+    {
+      lifecycleGuard: options.lifecycleGuard,
+      op: options.op,
+      lease: options.lease,
+    },
+  );
+  if (ready.status !== "running" || !ready.sandboxId) {
+    throw new ApiError(
+      502,
+      "SANDBOX_READY_FAILED",
+      `Sandbox entered ${ready.status} during guarded readiness.`,
+    );
+  }
+  await assertLifecycleGuardCurrent(options.lifecycleGuard);
+  return ready;
 }
 
 export async function resetSandbox(
@@ -1553,70 +1594,6 @@ async function cleanupBeforeSnapshot(
   }
 }
 
-/**
- * Read OpenClaw's cron jobs from the sandbox and return the earliest
- * `nextRunAtMs` across all enabled jobs.  Used to persist a wake-up
- * time in the host store before the sandbox is snapshotted.
- */
-async function readCronNextWakeFromSandbox(
-  sandbox: SandboxHandle,
-): Promise<CronWakeReadResult> {
-  try {
-    const buf = await sandbox.readFileToBuffer({ path: CRON_JOBS_PATH });
-    if (!buf) {
-      return { status: "no-jobs" };
-    }
-    const rawJobs = buf.toString("utf8");
-    let rawState: string | null = null;
-    try {
-      const stateBuf = await sandbox.readFileToBuffer({ path: CRON_JOBS_STATE_PATH });
-      rawState = stateBuf?.toString("utf8") ?? null;
-    } catch (error) {
-      logWarn("sandbox.cron_state_read_failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-    const raw = mergeCronRuntimeState(rawJobs, rawState);
-    const data = JSON.parse(raw) as {
-      jobs?: Array<{
-        enabled?: boolean;
-        state?: { nextRunAtMs?: number };
-      }>;
-    };
-    if (!Array.isArray(data.jobs)) {
-      const errorMessage = `Invalid cron jobs payload at ${CRON_JOBS_PATH}: missing jobs array.`;
-      logWarn("sandbox.cron_next_wake_read_failed", {
-        error: errorMessage,
-      });
-      return { status: "error", error: errorMessage };
-    }
-    let earliest: number | null = null;
-    for (const job of data.jobs) {
-      if (job.enabled === false) continue;
-      const ms = job.state?.nextRunAtMs;
-      if (typeof ms === "number" && ms > 0) {
-        if (earliest === null || ms < earliest) earliest = ms;
-      }
-    }
-    if (earliest) {
-      logInfo("sandbox.cron_next_wake_read", { earliest, jobCount: data.jobs.length });
-      return { status: "ok", nextWakeMs: earliest, rawJobsJson: raw };
-    }
-    // Return raw even when no wake time — jobs may exist but have no
-    // nextRunAtMs yet (e.g. freshly created, not yet scheduled).
-    if (data.jobs.length > 0) {
-      return { status: "no-jobs", rawJobsJson: raw };
-    }
-    return { status: "no-jobs" };
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    logWarn("sandbox.cron_next_wake_read_failed", {
-      error: errorMessage,
-    });
-    return { status: "error", error: errorMessage };
-  }
-}
-
 type StopSandboxInternalOptions = {
   deadlineAtMs?: number;
   pendingAutoSave?: PersistentAutoSaveInput;
@@ -1669,64 +1646,43 @@ async function stopSandboxWithOptions(
           deadlineAtMs: options.deadlineAtMs,
           pendingAutoSave: options.pendingAutoSave,
           afterPrepare: async () => {
-          await cleanupBeforeSnapshot(sandbox, meta.firewall.mode);
-          const cronWakeRead = await readCronNextWakeFromSandbox(sandbox);
-
-          logInfo("sandbox.status_transition", {
-            from: meta.status,
-            to: "snapshotting",
-            sandboxId: meta.sandboxId,
-            cronWakeRead,
-          });
-
-          if (cronWakeRead.status === "ok") {
-            await getStore().setValue(cronNextWakeKey(), cronWakeRead.nextWakeMs);
-            logInfo("sandbox.cron_wake_saved", { cronNextWakeMs: cronWakeRead.nextWakeMs });
-          } else if (cronWakeRead.status === "no-jobs") {
-            await getStore().deleteValue(cronNextWakeKey());
-          }
-
-          // Persist structured cron record as a safety net for resumes.
-          // The stop path is authoritative — if there are 0 jobs, the user
-          // intentionally deleted them. Clear the store so a future resume
-          // does not resurrect old jobs.
-          const rawJobs = cronWakeRead.status !== "error" ? cronWakeRead.rawJobsJson : undefined;
-          if (rawJobs) {
-            const record = buildCronRecord(rawJobs, "stop");
-            if (record) {
-              await getStore().setValue(cronJobsKey(), record);
-              logInfo("sandbox.cron_jobs_persisted", {
-                source: "stop", jobCount: record.jobCount, sha256: record.sha256,
-              });
-            }
-          } else if (cronWakeRead.status === "no-jobs") {
-            await getStore().deleteValue(cronJobsKey());
-            logInfo("sandbox.cron_jobs_cleared", { reason: "no-jobs-on-stop" });
-          }
+            await cleanupBeforeSnapshot(sandbox, meta.firewall.mode);
+            logInfo("sandbox.status_transition", {
+              from: meta.status,
+              to: "snapshotting",
+              sandboxId: meta.sandboxId,
+            });
           },
         });
 
-          // Hot-spare: best-effort pre-create a candidate sandbox after stop.
-          if (
-            isHotSpareEnabled()
-            && !process.env.OPENCLAW_BUNDLE_URL?.trim()
-          ) {
-            try {
-              const result = await preCreateHotSpare(stoppedMeta, {
-                create: (opts) => getSandboxController().create(opts),
-                getSandboxVcpus,
-                getSandboxSleepAfterMs: getSandboxPlatformTimeoutMs,
-                sandboxPorts: SANDBOX_PORTS,
-              });
-              if (result.status !== "skipped") {
-                await mutateMeta((m) => applyPreCreateToMeta(m, result));
-              }
-            } catch (err) {
-              logWarn("hot_spare.post_stop_pre_create_failed", {
-                error: err instanceof Error ? err.message : String(err),
-              });
+        // Hot-spare: best-effort pre-create a candidate sandbox after stop.
+        if (
+          isHotSpareEnabled()
+          && !process.env.OPENCLAW_BUNDLE_URL?.trim()
+        ) {
+          try {
+            const hotSpareApiKey = await getAiGatewayBearerTokenOptional();
+            const result = await preCreateHotSpare(stoppedMeta, {
+              create: (opts) => getSandboxController().create(opts),
+              getSandboxVcpus,
+              getSandboxSleepAfterMs: getSandboxPlatformTimeoutMs,
+              sandboxPorts: SANDBOX_PORTS,
+              networkPolicy: toNetworkPolicy(
+                stoppedMeta.firewall.mode,
+                stoppedMeta.firewall.allowlist,
+                hotSpareApiKey ?? undefined,
+                requiredControlPlaneDomains(stoppedMeta),
+              ),
+            });
+            if (result.status !== "skipped") {
+              await mutateMeta((m) => applyPreCreateToMeta(m, result));
             }
+          } catch (err) {
+            logWarn("hot_spare.post_stop_pre_create_failed", {
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
+        }
 
         return stoppedMeta;
       } catch (err) {
@@ -1981,6 +1937,11 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
 
   const { getPublicOrigin } = await import("@/server/public-url");
   const proxyOrigin = getPublicOrigin();
+  const verifiedBundleIdentity = matchesConfiguredBundleIdentity(
+    meta.bundleIdentity,
+  )
+    ? meta.bundleIdentity
+    : null;
 
   const slack = meta.channels.slack;
   const files = buildDynamicRestoreFiles({
@@ -1990,7 +1951,7 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
     slackCredentials: slack
       ? { botToken: slack.botToken, signingSecret: slack.signingSecret }
       : undefined,
-    bundleCapabilities: meta.bundleIdentity?.capabilities,
+    bundleCapabilities: verifiedBundleIdentity?.capabilities,
   });
 
   const sandboxId = meta.sandboxId;
@@ -2121,6 +2082,11 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
   }
 
   const sandboxId = meta.sandboxId;
+  const verifiedBundleIdentity = matchesConfiguredBundleIdentity(
+    meta.bundleIdentity,
+  )
+    ? meta.bundleIdentity
+    : null;
 
   // Compute expected hash from current channel state.
   const configHashInput: GatewayConfigHashInput = {
@@ -2132,7 +2098,7 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
           signingSecret: meta.channels.slack.signingSecret,
         }
       : undefined,
-    bundleCapabilities: meta.bundleIdentity?.capabilities,
+    bundleCapabilities: verifiedBundleIdentity?.capabilities,
   };
   const expectedHash = computeGatewayConfigHash(configHashInput);
 
@@ -2167,7 +2133,7 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
     slackCredentials: slack
       ? { botToken: slack.botToken, signingSecret: slack.signingSecret }
       : undefined,
-    bundleCapabilities: meta.bundleIdentity?.capabilities,
+    bundleCapabilities: verifiedBundleIdentity?.capabilities,
   });
 
   let sandbox: SandboxHandle;
@@ -2407,6 +2373,11 @@ export async function prepareRestoreTarget(input: {
   const syncDeadlineAtMs = Date.now() + PREPARE_RESTORE_SYNC_BUDGET_MS;
   const actions: PrepareRestoreAction[] = [];
   const meta = await getInitializedMeta();
+  const verifiedBundleIdentity = matchesConfiguredBundleIdentity(
+    meta.bundleIdentity,
+  )
+    ? meta.bundleIdentity
+    : null;
   const isDestructive = input.destructive ?? false;
   const ownsPrepareTarget = (candidate: SingleMeta): boolean =>
     candidate.sandboxId === meta.sandboxId
@@ -2582,7 +2553,11 @@ export async function prepareRestoreTarget(input: {
       slackCredentials: slack
         ? { botToken: slack.botToken, signingSecret: slack.signingSecret }
         : undefined,
-      bundleCapabilities: assetMeta.bundleIdentity?.capabilities,
+      bundleCapabilities: matchesConfiguredBundleIdentity(
+        assetMeta.bundleIdentity,
+      )
+        ? assetMeta.bundleIdentity.capabilities
+        : undefined,
     });
     actions.push({ id: "sync-static-assets", status: "completed", message: "runtime assets fresh" });
   } catch (err) {
@@ -2825,6 +2800,12 @@ export async function prepareHotSpareFromPreparedRestore(options?: {
     getSandboxSleepAfterMs: getSandboxPlatformTimeoutMs,
     sandboxPorts: SANDBOX_PORTS,
     restoreEnv,
+    networkPolicy: toNetworkPolicy(
+      meta.firewall.mode,
+      meta.firewall.allowlist,
+      hotSpareApiKey ?? undefined,
+      requiredControlPlaneDomains(meta),
+    ),
   });
 
   await mutateMeta((next) => {
@@ -2967,39 +2948,6 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
     }
   }
 
-  // Piggyback on the heartbeat to keep the cron wake time fresh in the
-  // store.  When the sandbox naturally sleeps (platform timeout),
-  // stopSandbox() never runs, so this is the only path that persists the
-  // next wake time before the sandbox disappears.
-  try {
-    const cronWakeRead = await readCronNextWakeFromSandbox(sandbox);
-    if (cronWakeRead.status === "ok") {
-      await getStore().setValue(cronNextWakeKey(), cronWakeRead.nextWakeMs);
-    } else if (cronWakeRead.status === "no-jobs") {
-      await getStore().deleteValue(cronNextWakeKey());
-    }
-    // Persist structured cron record as a safety net.  IMPORTANT: only
-    // overwrite the store when we read valid, non-empty, changed jobs.
-    // A heartbeat can catch jobs.json during a transient empty/partial-
-    // write window — blindly writing that would clobber a good backup.
-    const rawJobs = cronWakeRead.status !== "error" ? cronWakeRead.rawJobsJson : undefined;
-    if (rawJobs) {
-      const record = buildCronRecord(rawJobs, "heartbeat");
-      if (record) {
-        // Only write if the hash changed — avoids redundant Redis writes.
-        const existing = parseStoredCronRecord(
-          await getStore().getValue<unknown>(cronJobsKey()),
-        );
-        if (!existing || existing.sha256 !== record.sha256) {
-          await getStore().setValue(cronJobsKey(), record);
-        }
-      }
-      // If record is null (empty/invalid), do NOT clear — may be transient.
-    }
-  } catch {
-    // Non-critical — don't let cron-wake bookkeeping break the heartbeat.
-  }
-
   await armSandboxDeadline(meta, undefined, {
     activityAtMs: Date.now(),
     nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
@@ -3007,6 +2955,72 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
   // The deadline stop may have won while this request waited for admission.
   // Return current lifecycle truth so callers never proxy stale running meta.
   return getInitializedMeta();
+}
+
+export async function ensureSandboxAliveThrough(deadlineMs: number): Promise<SingleMeta> {
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= Date.now()) {
+    throw new Error("sandbox alive-through deadline must be a future timestamp");
+  }
+  const meta = await getInitializedMeta();
+  if (!meta.sandboxId || meta.status !== "running") {
+    throw new Error("sandbox is not running for alive-through extension");
+  }
+  const sandboxId = meta.sandboxId;
+  // Read-only lookup: ensureSandboxReady owns intentional session resume.
+  const sandbox = await getSandboxController().get({ sandboxId, resume: false });
+  if (sandbox.status !== "running") {
+    throw new Error(`sandbox is ${sandbox.status} during alive-through extension`);
+  }
+
+  const requiredRemainingMs = deadlineMs - Date.now();
+  const remainingMs = sandbox.timeoutRemaining;
+  const extendByMs = Math.max(0, requiredRemainingMs + 2_000 - remainingMs);
+  if (extendByMs > 0) {
+    await sandbox.extendTimeout(extendByMs);
+  }
+  const requiredVerifiedRemainingMs = Math.max(0, deadlineMs - Date.now());
+  const verifiedRemainingMs = sandbox.timeoutRemaining;
+  if (verifiedRemainingMs + 1_000 < requiredVerifiedRemainingMs) {
+    throw new Error("sandbox timeout extension did not reach cron deadline");
+  }
+
+  const latest = await getInitializedMeta();
+  if (
+    latest.sandboxId !== sandboxId
+    || latest.status !== "running"
+    || (latest.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+  ) {
+    throw new Error("sandbox changed during alive-through extension");
+  }
+  const deadline = await armSandboxDeadline(latest, undefined, {
+    activityAtMs: Date.now(),
+    nativeTimeoutRemainingMs: verifiedRemainingMs,
+  });
+  if (
+    !deadline
+    || deadline.sandboxId !== sandboxId
+    || deadline.lifecycleAttemptId !== (meta.lifecycleAttemptId ?? null)
+    || deadline.deadlineAtMs < deadlineMs
+  ) {
+    throw new Error("sandbox deadline coordinator cannot keep cron work alive through deadline");
+  }
+  const committed = await getInitializedMeta();
+  if (
+    committed.status !== "running"
+    || committed.sandboxId !== sandboxId
+    || (committed.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+  ) {
+    throw new Error("sandbox changed before alive-through commit");
+  }
+  logInfo("sandbox.timeout_extended_for_cron", {
+    sandboxId,
+    deadlineMs,
+    remainingMs,
+    extendByMs,
+    requiredVerifiedRemainingMs,
+    verifiedRemainingMs,
+  });
+  return committed;
 }
 
 export async function getRunningSandboxTimeoutRemainingMs(): Promise<number | null> {
@@ -3867,7 +3881,11 @@ export async function ensureUsableAiGatewayCredential(
 
     const sandbox = await getSandboxController().get({ sandboxId: currentMeta.sandboxId! });
     try {
-      await refreshAiGatewayToken(sandbox, currentMeta.sandboxId!);
+      await refreshAiGatewayToken(
+        sandbox,
+        currentMeta.sandboxId!,
+        opts?.controlPlaneOrigin,
+      );
 
       // Success — reset breaker state.
       await mutateMeta((m) => {
@@ -3927,10 +3945,12 @@ export async function ensureUsableAiGatewayCredential(
  */
 export async function ensureFreshGatewayToken(options?: {
   force?: boolean;
+  controlPlaneOrigin?: string;
 }): Promise<TokenRefreshResult> {
   return ensureUsableAiGatewayCredential({
     force: options?.force,
     reason: "ensureFreshGatewayToken",
+    controlPlaneOrigin: options?.controlPlaneOrigin,
   });
 }
 
@@ -4052,7 +4072,25 @@ export async function writeRestoreCredentialFiles(
 // injected as an Authorization header transform at the firewall layer, so
 // refreshing it is a single SDK call with no gateway restart required.
 
-async function refreshAiGatewayToken(sandbox: SandboxHandle, sandboxId: string): Promise<void> {
+function requiredControlPlaneDomains(
+  meta: SingleMeta,
+  origin?: string,
+): string[] {
+  if (meta.firewall.mode !== "enforcing") return [];
+  try {
+    return controlPlaneDomains(origin ?? getPublicOrigin());
+  } catch {
+    // Background operations in local deployments may have neither a request
+    // origin nor a configured canonical hostname.
+    return [];
+  }
+}
+
+async function refreshAiGatewayToken(
+  sandbox: SandboxHandle,
+  sandboxId: string,
+  controlPlaneOrigin?: string,
+): Promise<void> {
   const credential = await resolveAiGatewayCredentialOptional();
 
   // If source is api-key, skip refresh entirely — static keys don't expire.
@@ -4078,7 +4116,12 @@ async function refreshAiGatewayToken(sandbox: SandboxHandle, sandboxId: string):
   // injects the Authorization header on outbound requests to ai-gateway.
   // No file writes or gateway restarts needed.
   const meta = await getInitializedMeta();
-  await applyFirewallPolicyToSandbox(sandbox, meta, freshToken);
+  await applyFirewallPolicyToSandbox(
+    sandbox,
+    meta,
+    freshToken,
+    requiredControlPlaneDomains(meta, controlPlaneOrigin),
+  );
 
   logInfo("sandbox.token_refresh.policy_updated", { sandboxId });
 
@@ -4252,6 +4295,7 @@ export async function reconcileSandboxHealth(options: {
   origin: string;
   reason: string;
   schedule?: BackgroundScheduler;
+  lifecycleGuard?: SandboxLifecycleGuard;
   op?: OperationContext;
 }): Promise<SandboxHealthResult> {
   const meta = await getInitializedMeta();
@@ -4306,7 +4350,10 @@ export async function reconcileSandboxHealth(options: {
     // Force-refresh the OIDC token on the network policy. After a timeout
     // the platform may have auto-resumed the sandbox with a stale token,
     // causing AI Gateway 401s even though the gateway process is alive.
-    await ensureFreshGatewayToken({ force: true });
+    await ensureFreshGatewayToken({
+      force: true,
+      controlPlaneOrigin: options.origin,
+    });
     return { status: "ready", meta: freshMeta, repaired: false };
   }
 
@@ -4358,6 +4405,7 @@ async function scheduleLifecycleWork(options: {
   reason: string;
   meta: SingleMeta;
   schedule?: BackgroundScheduler;
+  lifecycleGuard?: SandboxLifecycleGuard;
   op?: OperationContext;
 }): Promise<void> {
   const store = getStore();
@@ -4415,8 +4463,23 @@ async function scheduleLifecycleWork(options: {
       },
       async () => {
         try {
-          await createAndBootstrapSandbox(options.origin, { op: options.op });
+          await createAndBootstrapSandbox(options.origin, {
+            lifecycleGuard: options.lifecycleGuard,
+            op: options.op,
+          });
         } catch (error) {
+          if (error instanceof SandboxLifecycleGuardRejectedError) {
+            logInfo("sandbox.lifecycle_guard_rejected", {
+              reason: options.reason,
+            });
+            await mutateMeta((meta) => {
+              if (meta.status === nextStatus && meta.lifecycleAttemptId === null) {
+                meta.status = meta.snapshotId ? "stopped" : "uninitialized";
+                meta.lastError = null;
+              }
+            });
+            throw error;
+          }
           if (error instanceof LifecycleLockOwnershipLostError) {
             logWarn("sandbox.lifecycle_lock_ownership_lost", options.op
               ? withOperationContext(options.op, { lock: "lifecycle" })
@@ -4471,6 +4534,10 @@ async function scheduleLifecycleWork(options: {
 
   if (options.schedule) {
     options.schedule(run);
+  } else if (options.lifecycleGuard) {
+    // Guarded wake work must surface a rejected authorization to its caller;
+    // backgrounding here would otherwise turn a stale wake into a timeout.
+    await run();
   } else {
     void run();
   }
@@ -4482,7 +4549,10 @@ async function scheduleLifecycleWork(options: {
 
 async function createAndBootstrapSandbox(
   origin: string,
-  options?: { op?: OperationContext },
+  options?: {
+    lifecycleGuard?: SandboxLifecycleGuard;
+    op?: OperationContext;
+  },
 ): Promise<SingleMeta> {
   return withLifecycleLock((lease) =>
     createAndBootstrapSandboxWithinLifecycleLock(origin, {
@@ -4493,9 +4563,20 @@ async function createAndBootstrapSandbox(
 
 async function createAndBootstrapSandboxWithinLifecycleLock(
   origin: string,
-  options?: { op?: OperationContext; lease?: AutoRenewedLockLease },
+  options?: {
+    lifecycleGuard?: SandboxLifecycleGuard;
+    op?: OperationContext;
+    lease?: AutoRenewedLockLease;
+  },
 ): Promise<SingleMeta> {
+  await assertLifecycleGuardCurrent(options?.lifecycleGuard);
   const current = await getInitializedMeta();
+  await normalizeResetCronProjectionGeneration({
+    gatewayGeneration: createHash("sha256")
+      .update(current.gatewayToken)
+      .digest("hex")
+      .slice(0, 32),
+  });
   if (current.status === "running" && current.sandboxId) {
     return current;
   }
@@ -4505,10 +4586,13 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     options?.op ? withOperationContext(options.op, extra) : (extra ?? {});
   const attemptId = randomUUID();
   const instanceId = current.id;
-  const isRestoreAttempt = Boolean(current.snapshotId) && current.status === "restoring";
+  // Snapshot metadata is the durable restore authority. Guarded cron wakes
+  // enter here without the background scheduler's status transition.
+  const isRestoreAttempt = Boolean(current.snapshotId);
 
   // Auth-required boot: on Vercel, require a usable AI Gateway credential.
   const credential = await resolveAiGatewayCredentialOptional();
+  await assertLifecycleGuardCurrent(options?.lifecycleGuard);
   if (isVercelDeployment() && !credential) {
     logError("sandbox.create.no_ai_gateway_credential", ctx({
       message: "Cannot create sandbox on Vercel without AI Gateway credential. OIDC may be temporarily unavailable.",
@@ -4799,12 +4883,19 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         } else {
           await options?.lease?.assertOwned();
         }
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
         const handle = await getSandboxController().create({
           name: sandboxName,
           persistent: true,
           ports: SANDBOX_PORTS,
           timeout: sleepAfterMs,
           resources: { vcpus },
+          networkPolicy: toNetworkPolicy(
+            current.firewall.mode,
+            current.firewall.allowlist,
+            credential?.token,
+            requiredControlPlaneDomains(current, origin),
+          ),
           ...runtimeEnv,
           ...(candidateOwner
             ? { tags: { [BUNDLE_CANDIDATE_OWNERSHIP_TAG]: candidateOwner } }
@@ -4841,7 +4932,6 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
 
         logWarn("sandbox.create.name_conflict_recovery", ctx({
           sandboxName,
-          conflictMode,
           error: createErr instanceof Error ? createErr.message : String(createErr),
           ...(apiJson ? { apiJson } : {}),
         }));
@@ -4852,6 +4942,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
 
         if (conflictMode === "resume") {
           try {
+            await assertLifecycleGuardCurrent(options?.lifecycleGuard);
             const recovered = await getSandboxController().get({
               sandboxId: sandboxName,
               resume: false,
@@ -4883,6 +4974,9 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
               replaceBeforeBootstrap: interruptedBundleCandidate,
             };
           } catch (getErr) {
+            if (getErr instanceof SandboxLifecycleGuardRejectedError) {
+              throw getErr;
+            }
             logError("sandbox.create.name_conflict_get_fallback_failed", ctx({
               sandboxName,
               error: getErr instanceof Error ? getErr.message : String(getErr),
@@ -5016,6 +5110,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     }
     if (!sandbox && !bundleMode && isHotSpareEnabled()) {
       try {
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
         const promoteResult = await promoteHotSpare(current, {
           get: (opts) => getSandboxController().get(opts),
         });
@@ -5024,6 +5119,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           const promoted = await getSandboxController().get({
             sandboxId: promotedLookupId,
           });
+          await assertLifecycleGuardCurrent(options?.lifecycleGuard);
           await mutateMeta((meta) => applyPromoteToMeta(meta, promoteResult));
           sandbox = promoted;
           sandboxIsBundleCandidate = false;
@@ -5040,6 +5136,9 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           }));
         }
       } catch (err) {
+        if (err instanceof SandboxLifecycleGuardRejectedError) {
+          throw err;
+        }
         logWarn("sandbox.create.hot_spare_promote_error", ctx({
           error: err instanceof Error ? err.message : String(err),
         }));
@@ -5052,10 +5151,12 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     if (!sandbox) {
     try {
       progress.appendLine("system", `Resuming persistent sandbox: ${sandboxName}`);
+      await assertLifecycleGuardCurrent(options?.lifecycleGuard);
       const resumedHandle = await getSandboxController().get({
         sandboxId: sandboxName,
         resume: !bundleMode && !persistedRuntimeModeMismatch,
       });
+      await assertLifecycleGuardCurrent(options?.lifecycleGuard);
       const resumedBundleCandidate = bundleMode
         && candidateAuthorizesCleanup(
           activeBundleCandidate,
@@ -5091,6 +5192,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           `Discarding unhealthy sandbox ${resumedHandle.sandboxId} (status=${resumedHandle.status}) — forcing fresh create`,
         );
         try {
+          await assertLifecycleGuardCurrent(options?.lifecycleGuard);
           await resumedHandle.delete();
         } catch (deleteErr) {
           logWarn("sandbox.create.resume_unhealthy_delete_failed", ctx({
@@ -5102,10 +5204,11 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           `resume_unhealthy_handle:${resumedHandle.status}:${resumedHandle.sandboxId}`,
         );
       }
-      sandbox = resumedHandle;
       progress.appendLine("system", `Resumed: ${sandbox.sandboxId} status=${sandbox.status}`);
     } catch (resumeError) {
       if (
+        resumeError instanceof SandboxLifecycleGuardRejectedError
+        ||
         resumeError instanceof SandboxBundleMigrationRequiredError
         || resumeError instanceof ApiError
       ) {
@@ -5136,10 +5239,11 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         });
       }
       progress.appendLine("system", `No existing sandbox — creating: ${sandboxName}`);
-      const createResult = await createPersistentSandbox("resume");
+      const createResult = await createPersistentSandbox();
       sandbox = createResult.handle;
       sandboxIsBundleCandidate = createResult.bundleCandidate;
       sandboxNeedsCandidateReplacement = createResult.replaceBeforeBootstrap;
+      await assertLifecycleGuardCurrent(options?.lifecycleGuard);
       if (createResult.created) {
         progress.appendLine("system", `Created: ${sandbox.sandboxId}`);
       }
@@ -5267,10 +5371,10 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     // A persisted sandbox may have been created before the durable stop
     // coordinator added its safety runway. Establish the current platform
     // deadline before running restore/setup commands.
-    const timeoutRemainingMs = initialSandbox.timeoutRemaining;
+    const currentRemainingMs = initialSandbox.timeoutRemaining;
     const timeoutExtensionMs = getSandboxTimeoutExtensionMs({
       currentTotalMs: initialSandbox.timeout,
-      currentRemainingMs: timeoutRemainingMs,
+      currentRemainingMs,
       targetRemainingMs: sleepAfterMs,
     });
     if (timeoutExtensionMs > 0) {
@@ -5303,11 +5407,15 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     }
 
     let isResumed: boolean;
+    let verifiedBundleCapabilities: readonly string[] = [];
     if (process.env.OPENCLAW_BUNDLE_URL?.trim()) {
       const latest = await getInitializedMeta();
-      const currentIdentity = await hydrateVerifiedBundleIdentity(
+      const currentIdentity = matchesConfiguredBundleIdentity(
         latest.bundleIdentity,
-      );
+      )
+        ? latest.bundleIdentity
+        : null;
+      verifiedBundleCapabilities = currentIdentity?.capabilities ?? [];
       let markerIdentity: unknown = null;
       let markerPresent = false;
       try {
@@ -5403,6 +5511,35 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         apiKey: freshApiKey,
       });
 
+      // A resumed scheduler can observe past-due jobs as soon as Gateway
+      // starts. Install the fresh credential transform before that boundary.
+      const firewallStart = Date.now();
+      try {
+        progress.setPhase(
+          "applying-firewall",
+          `Applying ${latest.firewall.mode} firewall policy`,
+        );
+        await applyFirewallPolicyToSandbox(
+          sandbox,
+          latest,
+          freshApiKey,
+          requiredControlPlaneDomains(latest, origin),
+        );
+      } catch (err) {
+        const firewallError = err instanceof Error ? err.message : String(err);
+        logWarn("sandbox.create.persistent_resume.firewall_sync_failed", ctx({
+          sandboxId: sandbox.sandboxId,
+          mode: latest.firewall.mode,
+          error: firewallError,
+        }));
+        if (latest.firewall.mode === "enforcing") {
+          throw new Error(
+            `Firewall sync failed during persistent resume: ${firewallError}`,
+          );
+        }
+      }
+      const firewallSyncMs = Date.now() - firewallStart;
+
       const assetSyncStart = Date.now();
       const slackConfig = latest.channels.slack;
       const tg = latest.channels.telegram;
@@ -5412,7 +5549,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         telegramBotToken: tg?.botToken,
         telegramWebhookSecret: tg?.webhookSecret,
         slackCredentials: validatedSlackCreds ?? undefined,
-        bundleCapabilities: latest.bundleIdentity?.capabilities,
+        bundleCapabilities: verifiedBundleCapabilities,
       });
       const assetSyncMs = Date.now() - assetSyncStart;
 
@@ -5441,6 +5578,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       }
 
       const fastRestoreStart = Date.now();
+      await assertLifecycleGuardCurrent(options?.lifecycleGuard);
       const restoreResult = await sandbox.runCommand({
         cmd: "bash",
         args: [
@@ -5449,6 +5587,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         ],
         env: restoreEnv,
       });
+      await assertLifecycleGuardCurrent(options?.lifecycleGuard);
       const startupScriptMs = Date.now() - fastRestoreStart;
 
       if (restoreResult.exitCode !== 0) {
@@ -5494,24 +5633,6 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         telegramListenerError =
           typeof parsed.telegramError === "string" ? parsed.telegramError : null;
       } catch { /* best effort */ }
-
-      // Apply firewall policy
-      const firewallStart = Date.now();
-      try {
-        progress.setPhase("applying-firewall", `Applying ${latest.firewall.mode} firewall policy`);
-        await applyFirewallPolicyToSandbox(sandbox, latest, freshApiKey);
-      } catch (err) {
-        const firewallError = err instanceof Error ? err.message : String(err);
-        logWarn("sandbox.create.persistent_resume.firewall_sync_failed", ctx({
-          sandboxId: sandbox.sandboxId,
-          mode: latest.firewall.mode,
-          error: firewallError,
-        }));
-        if (latest.firewall.mode === "enforcing") {
-          throw new Error(`Firewall sync failed during persistent resume: ${firewallError}`);
-        }
-      }
-      const firewallSyncMs = Date.now() - firewallStart;
 
       const sandboxResumeMs = Date.now() - resumeStart - assetSyncMs - startupScriptMs - firewallSyncMs;
       const totalMs = Date.now() - resumeStart;
@@ -5565,6 +5686,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       );
 
       // Record token metadata and restore metrics.
+      await assertLifecycleGuardCurrent(options?.lifecycleGuard);
       await assertSandboxGenerationOwnership(
         initialSandbox,
         bundleMode && sandboxIsBundleCandidate,
@@ -5614,7 +5736,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       await progress.completeSetupProgress("Sandbox resumed");
 
       logInfo("sandbox.create.persistent_resume.complete", ctx({
-        sandboxId: sandbox.sandboxId,
+        sandboxId: initialSandbox.sandboxId,
         totalMs,
         assetSyncMs,
         startupScriptMs,
@@ -5632,10 +5754,20 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
 
     // Fresh sandbox — run full bootstrap
     const latest = await getInitializedMeta();
+    if (
+      process.env.OPENCLAW_BUNDLE_URL?.trim() &&
+      (await getStore().hasValue(cronJobsKey()))
+    ) {
+      // The old host backup may be the last recoverable cron authority after
+      // a missing/unhealthy npm sandbox. Do not let an empty bundle baseline
+      // erase it before OpenClaw owns and verifies an explicit migration.
+      throw new SandboxBundleMigrationRequiredError();
+    }
     // Reuse the already-resolved credential for firewall policy transforms.
     const apiKey = credential?.token;
     const slackCfg = await validateSlackCredentialsForRestore(latest.channels.slack);
-    const setupResult = await setupOpenClaw(sandbox, {
+    await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+    const setupResult = await setupOpenClaw(initialSandbox, {
       gatewayToken: latest.gatewayToken,
       apiKey,
       proxyOrigin: origin,
@@ -5643,7 +5775,10 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       telegramWebhookSecret: latest.channels.telegram?.webhookSecret,
       slackCredentials: slackCfg ?? undefined,
       progress,
+      beforeGatewayStart: () =>
+        assertLifecycleGuardCurrent(options?.lifecycleGuard),
     });
+    await assertLifecycleGuardCurrent(options?.lifecycleGuard);
 
     await assertSandboxGenerationOwnership(
       initialSandbox,
@@ -5715,14 +5850,11 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     };
 
     // Apply firewall policy and record structured outcome before marking running.
-    const firewallPolicy = toNetworkPolicy(
+    const firewallPolicyHash = computePolicyHash(
       pending.firewall.mode,
       pending.firewall.allowlist,
-      apiKey,
+      requiredControlPlaneDomains(pending, origin),
     );
-    const firewallPolicyHash = createHash("sha256")
-      .update(JSON.stringify(firewallPolicy))
-      .digest("hex");
 
     let firewallApplied = false;
     let firewallError: string | null = null;
@@ -5730,7 +5862,12 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     try {
       await assertCommittedSandboxOwnership();
       progress.setPhase("applying-firewall", `Applying ${pending.firewall.mode} firewall policy`);
-      await applyFirewallPolicyToSandbox(sandbox, pending, apiKey);
+      await applyFirewallPolicyToSandbox(
+        sandbox,
+        pending,
+        apiKey,
+        requiredControlPlaneDomains(pending, origin),
+      );
       await assertCommittedSandboxOwnership();
       firewallApplied = true;
     } catch (err) {
@@ -5827,6 +5964,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       sandboxId: sandbox.sandboxId,
     }));
 
+    await assertLifecycleGuardCurrent(options?.lifecycleGuard);
     const runningMeta = await mutateMeta((meta) => {
       if (!metaOwnsCommittedSandbox(meta)) return;
       meta.status = "running";
@@ -5887,16 +6025,23 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           meta.lifecycleAttemptId !== attemptId
           || !sameBundleCandidate(meta.bundleCandidate, activeBundleCandidate)
         ) return;
-        meta.status = "error";
+        const guardRejected = error instanceof SandboxLifecycleGuardRejectedError;
+        meta.status = guardRejected && cleanupMessage === null
+          ? current.status
+          : "error";
         meta.portUrls = null;
         if (cleanupMessage === null) {
-          meta.sandboxId = null;
-          meta.bundleIdentity = null;
-          meta.bundleCandidate = null;
-          meta.lifecycleAttemptId = null;
+          meta.sandboxId = guardRejected ? current.sandboxId : null;
+          meta.bundleIdentity = guardRejected ? current.bundleIdentity : null;
+          meta.bundleCandidate = guardRejected ? current.bundleCandidate : null;
+          meta.lifecycleAttemptId = guardRejected
+            ? current.lifecycleAttemptId
+            : null;
         }
-        meta.lastError = cleanupMessage === null
-          ? error instanceof Error ? error.message : String(error)
+        meta.lastError = guardRejected && cleanupMessage === null
+          ? null
+          : cleanupMessage === null
+            ? error instanceof Error ? error.message : String(error)
           : `OPENCLAW_BUNDLE_CANDIDATE_CLEANUP_FAILED: ${cleanupMessage}`;
       });
       if (
@@ -5930,6 +6075,9 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           ? progressError.message
           : String(progressError),
       });
+    }
+    if (terminalError instanceof SandboxLifecycleGuardRejectedError) {
+      throw terminalError;
     }
     throw new LifecycleAttemptFailedError(attemptId, terminalError);
   }
@@ -6213,6 +6361,7 @@ async function destroyCurrentSandboxWithoutSnapshot(
         sandboxId: lookupSandboxId,
         error: message,
       }));
+      markSandboxDestroyed();
       return;
     }
     if (error instanceof ApiError) throw error;
@@ -6269,11 +6418,40 @@ async function deleteTrackedSnapshotsForReset(
 async function clearResetCronState(
   ctx: (extra?: Record<string, unknown>) => Record<string, unknown>,
 ): Promise<void> {
-  await Promise.all([
-    getStore().deleteValue(cronNextWakeKey()),
-    getStore().deleteValue(cronJobsKey()),
-  ]);
-  logInfo("sandbox.reset.cron_state_cleared", ctx());
+  const current = await getInitializedMeta();
+  const previousGatewayGeneration = createHash("sha256")
+    .update(current.gatewayToken)
+    .digest("hex")
+    .slice(0, 32);
+  const nextGatewayValue = randomUUID();
+  const gatewayGeneration = createHash("sha256")
+    .update(nextGatewayValue)
+    .digest("hex")
+    .slice(0, 32);
+  const fenced = await fenceCronProjectionStateForReset({ gatewayGeneration });
+  try {
+    await mutateMeta((meta) => {
+      if (meta.gatewayToken !== current.gatewayToken) {
+        throw new Error("sandbox_reset_gateway_token_changed");
+      }
+      meta.gatewayToken = nextGatewayValue;
+    });
+  } catch (error) {
+    try {
+      await normalizeResetCronProjectionGeneration({
+        gatewayGeneration: previousGatewayGeneration,
+      });
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [error, rollbackError],
+        "Sandbox reset gateway-token commit and projection rollback failed.",
+      );
+    }
+    throw error;
+  }
+  await clearLegacyCronStateForReset();
+  await cancelSupersededCronWake(fenced.supersededWorkflowRunId);
+  logInfo("sandbox.reset.cron_state_fenced", ctx());
 }
 
 function clearSandboxRuntimeStateForReset(meta: SingleMeta): void {

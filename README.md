@@ -198,7 +198,7 @@ See [Hosted Feature Support](docs/getting-started/hosted-feature-support.md) for
 - **Slack, Telegram, and Discord (experimental)** channels with durable delivery. WhatsApp remains available through local/upstream OpenClaw linked-device setups, not this hosted wrapper.
 - **Bundled OpenClaw plugins and skills only.** Arbitrary plugin, skill, ClawHub, MCP, and tool installation is a local/upstream OpenClaw path until a hosted lifecycle contract exists.
 - **Egress firewall.** Learn which domains your agent talks to, then lock it down.
-- **Auto-wake.** A cron watchdog wakes your sandbox when scheduled OpenClaw jobs are due.
+- **Auto-wake (experimental).** Verified bundles declaring `cron-projection-v1` can arm a durable, token-revalidating Workflow from a sanitized OpenClaw wake projection; the watchdog repairs stale dispatch.
 
 ## Built with
 
@@ -208,9 +208,9 @@ See [Hosted Feature Support](docs/getting-started/hosted-feature-support.md) for
 | [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) | Runs the OpenClaw instance (persistent sandboxes, auto-snapshot on stop, auto-resume on get) |
 | [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) | OIDC-authenticated model access for the agent |
 | [Redis Cloud](https://vercel.com/marketplace/redis) | Persistent state for metadata, snapshots, and channel config (any Redis-wire-protocol endpoint works) |
-| [Vercel Workflow](https://vercel.com/docs/workflow) | Durable channel message delivery (Slack and Telegram; Discord experimental) |
+| [Vercel Workflow](https://vercel.com/docs/workflow) | Durable channel message delivery (Slack and Telegram; Discord experimental) and scheduled sandbox wake |
 | [Vercel Queues](https://vercel.com/docs/queues) | Launch verification probe delivery |
-| [Vercel Cron](https://vercel.com/docs/cron-jobs) | Watchdog health checks and scheduled wake |
+| [Vercel Cron](https://vercel.com/docs/cron-jobs) | Watchdog health checks and cron-projection anti-entropy |
 
 ## Configuration
 
@@ -219,7 +219,7 @@ For the default path (`VERCEL_AUTH_MODE=admin-secret`), the only value you must 
 - **Redis.** Provisioned by `vclaw` (or the Deploy button) via the Redis Cloud Marketplace integration, which sets `REDIS_URL`.
 - **AI Gateway auth.** Handled via Vercel OIDC on deployed environments.
 - **Cron secret.** Falls back to `ADMIN_SECRET` when `CRON_SECRET` is unset. Set `CRON_SECRET` separately on deployed environments if you want cron auth to rotate independently from admin login. `vclaw --cron-secret` sets this for you.
-- **Watchdog cron.** Runs once daily by default so Hobby-plan deploys succeed. Pro plans can increase the schedule in `vercel.json` up to every minute for more responsive auto-wake.
+- **Watchdog cron.** Runs once daily by default so Hobby-plan deploys succeed. Cron wake timing comes from Workflow; increasing the watchdog frequency only shortens repair time for failed or stale dispatch.
 
 Switching to `VERCEL_AUTH_MODE=sign-in-with-vercel` also requires `NEXT_PUBLIC_VERCEL_APP_CLIENT_ID`, `VERCEL_APP_CLIENT_SECRET`, and `SESSION_SECRET`.
 
@@ -291,7 +291,7 @@ Channel delivery is only one slice of the wrapper. For cron, lifecycle, proxy, f
 
 | Area | Agent | Primary skill | Focus |
 | ---- | ----- | ------------- | ----- |
-| Cron/watchdog | `cron_watchdog` | `cron-watchdog-debug` | Vercel Cron auth, watchdog reports, cron wake keys, token refresh, OpenClaw job evidence |
+| Cron/watchdog | `cron_watchdog` | `cron-watchdog-debug` | projection revision/digest, Workflow dispatch token hash, watchdog anti-entropy, OpenClaw hook evidence |
 | Sandbox lifecycle | `sandbox_lifecycle` | `sandbox-lifecycle-debug` | create/resume/stop/snapshot/reset, stale-running reconciliation, locks, hot spares |
 | Gateway/proxy | `gateway_proxy` | `gateway-proxy-debug` | `/gateway`, HTML injection, WebSocket rewrite, waiting page, gateway-token handoff |
 | Firewall/AI Gateway | `firewall_ai_gateway` | `firewall-ai-gateway-debug` | network policy, OIDC token refresh, transform rules, egress allowlists |
@@ -300,7 +300,7 @@ Channel delivery is only one slice of the wrapper. For cron, lifecycle, proxy, f
 | Launch verification | `launch_verify` | `launch-verify-debug` | preflight, queue ping, chat completions, wake-from-sleep, restorePrepared, remote smoke |
 | Admin UI | `admin_ui` | `admin-ui-debug` | command shell, status panels, action helpers, operator copy, visual verification |
 
-For cron incidents, start with `$cron-watchdog-debug` and keep these states separate: Vercel Cron invoked, watchdog authorized, cron wake due, sandbox woke, AI Gateway token refreshed, OpenClaw cron scheduler loaded jobs, and user-visible delivery happened. Save raw runtime evidence under `.agent-runs/cron-debug/<timestamp>/` and do not commit it.
+For cron incidents, start with `$cron-watchdog-debug` and keep these states separate: OpenClaw baseline reconciled, host projection accepted, Workflow armed, dispatch token claimed, sandbox woke, OpenClaw scheduler ran the due job, and user-visible delivery happened. Save raw runtime evidence under `.agent-runs/cron-debug/<timestamp>/` and do not commit it.
 
 ## Documentation
 

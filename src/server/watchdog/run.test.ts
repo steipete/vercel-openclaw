@@ -147,7 +147,11 @@ test("running sandbox with healthy probe refreshes AI Gateway token", async () =
   );
 
   assert.equal(report.status, "ok");
-  assert.deepEqual(calls, [{ force: false, reason: "watchdog:healthy-running" }]);
+  assert.deepEqual(calls, [{
+    force: false,
+    reason: "watchdog:healthy-running",
+    controlPlaneOrigin: "https://app.test",
+  }]);
   assert.equal(findCheck(report, "token.refresh")?.status, "pass");
 });
 

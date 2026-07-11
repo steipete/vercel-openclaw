@@ -193,6 +193,29 @@ test("policy: enforcing mode with token and empty allowlist still includes ai-ga
   });
 });
 
+test("policy: enforcing mode always permits the internal control-plane domain", () => {
+  const userAllowlist = ["registry.npmjs.org"];
+  const policy = toNetworkPolicy(
+    "enforcing",
+    userAllowlist,
+    TEST_TOKEN,
+    ["app.example.com"],
+  );
+
+  assert.deepEqual(policy, {
+    allow: {
+      "app.example.com": [],
+      "registry.npmjs.org": [],
+      "ai-gateway.vercel.sh": expectedTransform,
+    },
+  });
+  assert.deepEqual(
+    userAllowlist,
+    ["registry.npmjs.org"],
+    "internal egress must not become user-approved state",
+  );
+});
+
 test("policy: applyFirewallPolicyToSandbox with token passes transform to handle", async () => {
   const events: SandboxEvent[] = [];
   const handle = new FakeSandboxHandle("sbx-transform", events);

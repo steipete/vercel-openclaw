@@ -1268,7 +1268,7 @@ test("sandbox running + extendTimeout fails → detects dead sandbox before prox
     // Make extendTimeout throw (simulates Vercel auto-suspended sandbox).
     // Set a low timeout so the top-up logic actually attempts the extension.
     const handle = h.controller.getHandle(metaBefore.sandboxId!)!;
-    Object.defineProperty(handle, "timeout", { get: () => 60_000 });
+    handle.setSessionAgeMsForTesting(handle.timeout - 60_000);
     handle.extendTimeout = async () => {
       throw new Error("sandbox not found");
     };

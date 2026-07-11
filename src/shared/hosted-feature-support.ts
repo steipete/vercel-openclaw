@@ -165,10 +165,10 @@ export const HOSTED_FEATURE_SUPPORT_ENTRIES = [
     feature: "Cron and scheduled jobs",
     userExpectation: "Persist scheduled OpenClaw jobs across sandbox sleep and restore.",
     upstreamEvidence: "OpenClaw can schedule jobs inside its runtime.",
-    hostedStatus: "supported",
+    hostedStatus: "experimental",
     owningRepo: "vercel-openclaw",
-    verificationSignal: "Persisted cron wake key and jobs JSON, watchdog wake, restore write-back, and gateway restart evidence.",
-    nextAction: "Keep watchdog verification separate from actual chat completion execution.",
+    verificationSignal: "Sanitized bounded earliest-wake snapshot, Redis CAS dispatch, token-revalidating Workflow, and watchdog anti-entropy tests.",
+    nextAction: "Require an exact verified cron-projection-v1 bundle, then prove schedule, reschedule, delete, sleep, and wake end to end.",
     alternativePath: null,
   },
   {

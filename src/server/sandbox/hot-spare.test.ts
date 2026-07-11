@@ -53,6 +53,9 @@ function buildDeps(overrides: Partial<SnapshotBackedCreateDeps> = {}): SnapshotB
     getSandboxSleepAfterMs: overrides.getSandboxSleepAfterMs ?? (() => 1800000),
     sandboxPorts: overrides.sandboxPorts ?? [3000, 8787],
     restoreEnv: overrides.restoreEnv ?? { OPENCLAW_GATEWAY_TOKEN: "gw-tok" },
+    networkPolicy: overrides.networkPolicy ?? {
+      allow: ["app.example.com"],
+    },
   };
 }
 
@@ -153,6 +156,9 @@ test("hot-spare snapshot: creates candidate from snapshot when enabled and idle"
     assert.deepEqual(call.source, { type: "snapshot", snapshotId: "snap_abc" });
     assert.equal(call.persistent, true);
     assert.deepEqual(call.ports, [3000, 8787]);
+    assert.deepEqual(call.networkPolicy, {
+      allow: ["app.example.com"],
+    });
   } finally {
     delete process.env.OPENCLAW_HOT_SPARE_ENABLED;
   }

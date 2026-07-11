@@ -47,7 +47,8 @@ export type PreflightCheckId =
   | "openclaw-package-spec"
   | "auth-config"
   | "bootstrap-exposure"
-  | "cron-secret";
+  | "cron-secret"
+  | "cron-projection-connectivity";
 
 export type PreflightActionId =
   | "configure-public-origin"
@@ -264,6 +265,7 @@ function buildActions(input: {
   webhookBypassEnabled: boolean;
   webhookBypassRecommended: boolean;
   deploymentProtectionDetected: boolean;
+  cronProjectionBlocked: boolean;
 }): PreflightAction[] {
   const actions: PreflightAction[] = [];
   const byId = indexRequirements(input.contract);
@@ -273,7 +275,10 @@ function buildActions(input: {
   pushRequirementAction(actions, byId.get("ai-gateway"), "configure-ai-gateway-auth");
   pushRequirementAction(actions, byId.get("cron-secret"), "configure-cron-secret");
 
-  if (input.webhookBypassRecommended && !input.webhookBypassEnabled) {
+  if (
+    input.cronProjectionBlocked ||
+    (input.webhookBypassRecommended && !input.webhookBypassEnabled)
+  ) {
     // When the self-probe confirms protection is active, promote to
     // "required" so buildNextSteps() emits "resolve blockers" text and
     // the operator gets clear actionable guidance.
@@ -281,9 +286,11 @@ function buildActions(input: {
     actions.push({
       id: "configure-webhook-bypass",
       status: protectionConfirmed ? "required" : "recommended",
-      message: protectionConfirmed
-        ? `Deployment Protection is active. Channel webhooks (${HOSTED_DELIVERY_CHANNELS_LABEL}) are blocked. Set VERCEL_AUTOMATION_BYPASS_SECRET or disable Deployment Protection.`
-        : `Enable Protection Bypass for Automation and set VERCEL_AUTOMATION_BYPASS_SECRET so channel webhooks (${HOSTED_DELIVERY_CHANNELS_LABEL}) can reach the protected deployment.`,
+      message: input.cronProjectionBlocked && input.webhookBypassEnabled
+        ? "The configured Protection Bypass did not clear Deployment Protection. Rotate or fix VERCEL_AUTOMATION_BYPASS_SECRET, or disable Deployment Protection, before starting cron projection."
+        : protectionConfirmed
+          ? `Deployment Protection is active. Channel webhooks (${HOSTED_DELIVERY_CHANNELS_LABEL})${input.cronProjectionBlocked ? " and cron projection" : ""} are blocked. Set VERCEL_AUTOMATION_BYPASS_SECRET or disable Deployment Protection.`
+          : `Enable Protection Bypass for Automation and set VERCEL_AUTOMATION_BYPASS_SECRET so channel webhooks (${HOSTED_DELIVERY_CHANNELS_LABEL}) can reach the protected deployment.`,
       remediation:
         "In your Vercel project, go to Settings > Deployment Protection > Protection Bypass for Automation. Enable it and copy the secret into VERCEL_AUTOMATION_BYPASS_SECRET, then redeploy.",
       env: ["VERCEL_AUTOMATION_BYPASS_SECRET"],
@@ -531,6 +538,11 @@ export async function buildDeployPreflight(
   const webhookBypassEnabled = webhookBypassRequirement.configured;
   const webhookBypassRecommended =
     webhookBypassRequirement.recommendation === "recommended";
+  const cronProjectionConfigured = Boolean(
+    process.env.OPENCLAW_BUNDLE_URL?.trim(),
+  );
+  const cronProjectionBlocked =
+    cronProjectionConfigured && deploymentProtectionDetected;
   const storeBackend = contract.storeBackend;
 
   const aiGatewayAuth = contract.aiGatewayAuth;
@@ -597,6 +609,21 @@ export async function buildDeployPreflight(
       status: webhookBypassRecommended ? "warn" : "pass",
       message: getWebhookBypassStatusMessage(webhookBypassRequirement),
     },
+    ...(cronProjectionConfigured
+      ? [
+          {
+            id: "cron-projection-connectivity" as const,
+            status: cronProjectionBlocked
+              ? ("fail" as const)
+              : ("pass" as const),
+            message: cronProjectionBlocked
+                ? webhookBypassEnabled
+                  ? "Cron projection cannot reach this protected deployment because the configured Protection Bypass failed its self-probe. Rotate or fix VERCEL_AUTOMATION_BYPASS_SECRET, or disable Deployment Protection."
+                  : "Cron projection cannot reach this protected deployment. Configure VERCEL_AUTOMATION_BYPASS_SECRET or disable Deployment Protection before starting the verified OpenClaw bundle."
+                : "Cron projection can reach the canonical deployment origin.",
+          },
+        ]
+      : []),
     // store — derived from contract (warn locally, fail on Vercel)
     {
       id: "store",
@@ -654,6 +681,7 @@ export async function buildDeployPreflight(
     webhookBypassEnabled,
     webhookBypassRecommended,
     deploymentProtectionDetected,
+    cronProjectionBlocked,
   });
 
   const supportedChannelsReady = HOSTED_DELIVERY_CHANNEL_NAMES.every(

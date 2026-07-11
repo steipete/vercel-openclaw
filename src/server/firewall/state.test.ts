@@ -14,6 +14,7 @@ import {
   approveDomains,
   computeWouldBlock,
   dismissLearnedDomains,
+  getFirewallReport,
   getFirewallState,
   ingestLearningFromSandbox,
   promoteLearnedDomainsToEnforcing,
@@ -36,6 +37,12 @@ async function withFirewallTestStore(fn: () => Promise<void>): Promise<void> {
     KV_URL: undefined,
     AI_GATEWAY_API_KEY: undefined,
     VERCEL_OIDC_TOKEN: undefined,
+    NEXT_PUBLIC_APP_URL: undefined,
+    NEXT_PUBLIC_BASE_DOMAIN: undefined,
+    BASE_DOMAIN: undefined,
+    VERCEL_PROJECT_PRODUCTION_URL: undefined,
+    VERCEL_BRANCH_URL: undefined,
+    VERCEL_URL: undefined,
   };
   const originals: Record<string, string | undefined> = {};
 
@@ -130,7 +137,7 @@ function installFailingSandboxSync(): {
       return {
         sandboxId: "sandbox-123",
         get timeout() { return 1800000; },
-        get timeoutRemainingMs() { return 1800000; },
+        get timeoutRemaining() { return 1800000; },
         get status() { return "running" as const; },
         async runCommand() {
           return { exitCode: 0, output: async () => "" };
@@ -301,7 +308,7 @@ function installSucceedingSandboxController(opts?: {
       return {
         sandboxId: "sandbox-123",
         get timeout() { return 1800000; },
-        get timeoutRemainingMs() { return 1800000; },
+        get timeoutRemaining() { return 1800000; },
         get status() { return "running" as const; },
         async runCommand(_cmd: string, args?: string[]) {
           const cmdStr = [_cmd, ...(args ?? [])].join(" ");
@@ -394,7 +401,11 @@ test("learning → enforcing: learned domains become the allowlist, sandbox poli
       assert.equal(ctrl.appliedPolicies.length, 1);
       const applied = ctrl.appliedPolicies[0] as { allow: string[] };
       assert.ok(typeof applied === "object" && "allow" in applied);
-      assert.deepEqual(applied.allow, ["ai-gateway.vercel.sh", "api.openai.com", "registry.npmjs.org"]);
+      assert.deepEqual(applied.allow, [
+        "ai-gateway.vercel.sh",
+        "api.openai.com",
+        "registry.npmjs.org",
+      ]);
     } finally {
       ctrl.restore();
     }
@@ -481,7 +492,11 @@ test("full transition: disabled → learning → ingest domains → enforcing wi
       // Should have synced twice total (setFirewallMode + promote)
       assert.equal(ctrl.appliedPolicies.length, 2);
       const enforcingPolicy = ctrl.appliedPolicies[1] as { allow: string[] };
-      assert.deepEqual(enforcingPolicy.allow, ["ai-gateway.vercel.sh", "api.openai.com", "registry.npmjs.org"]);
+      assert.deepEqual(enforcingPolicy.allow, [
+        "ai-gateway.vercel.sh",
+        "api.openai.com",
+        "registry.npmjs.org",
+      ]);
     } finally {
       ctrl.restore();
     }
@@ -1437,6 +1452,16 @@ test("computePolicyHash: different allowlist produces different hash", () => {
   assert.notEqual(h1, h2, "Different allowlists must produce different hashes");
 });
 
+test("computePolicyHash: required control-plane domains affect the applied policy hash", () => {
+  const withoutControlPlane = computePolicyHash("enforcing", ["a.com"]);
+  const withControlPlane = computePolicyHash(
+    "enforcing",
+    ["a.com"],
+    ["app.example.com"],
+  );
+  assert.notEqual(withoutControlPlane, withControlPlane);
+});
+
 test("syncFirewallPolicyIfRunning returns FirewallSyncOutcome with policyHash", async () => {
   await withFirewallTestStore(async () => {
     const ctrl = installSucceedingSandboxController();
@@ -1469,6 +1494,79 @@ test("syncFirewallPolicyIfRunning persists lastSyncOutcome in metadata", async (
       assert.equal(state.lastSyncOutcome.policyHash.length, 64);
     } finally {
       ctrl.restore();
+    }
+  });
+});
+
+test("firewall sync and report work without a canonical public origin", async () => {
+  await withFirewallTestStore(async () => {
+    const ctrl = installSucceedingSandboxController();
+    try {
+      await prepareRunningSandbox((meta) => {
+        meta.firewall.mode = "enforcing";
+        meta.firewall.allowlist = ["registry.npmjs.org"];
+      });
+
+      const outcome = await syncFirewallPolicyIfRunning();
+      const expectedHash = computePolicyHash(
+        "enforcing",
+        ["registry.npmjs.org"],
+        [],
+      );
+      assert.deepEqual(ctrl.appliedPolicies.at(-1), {
+        allow: ["registry.npmjs.org"],
+      });
+      assert.equal(outcome.policyHash, expectedHash);
+      assert.equal((await getFirewallReport()).policyHash, expectedHash);
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("syncFirewallPolicyIfRunning preserves cron control-plane egress in enforcing mode", async () => {
+  await withFirewallTestStore(async () => {
+    const originalOrigin = process.env.NEXT_PUBLIC_BASE_DOMAIN;
+    process.env.NEXT_PUBLIC_BASE_DOMAIN = "app.example.com";
+    const ctrl = installSucceedingSandboxController();
+    try {
+      await prepareRunningSandbox((meta) => {
+        meta.firewall.mode = "enforcing";
+        meta.firewall.allowlist = ["registry.npmjs.org"];
+        meta.bundleIdentity = {
+          packageSpec: "openclaw@2026.7.2",
+          version: "2026.7.2",
+          forkSha: "1".repeat(40),
+          upstreamSha: "2".repeat(40),
+          canonicalSha256: "3".repeat(64),
+          capabilities: ["cron-projection-v1"],
+          verified: true,
+        };
+      });
+
+      const outcome = await syncFirewallPolicyIfRunning();
+      assert.deepEqual(ctrl.appliedPolicies.at(-1), {
+        allow: ["app.example.com", "registry.npmjs.org"],
+      });
+      assert.equal(
+        outcome.policyHash,
+        computePolicyHash(
+          "enforcing",
+          ["registry.npmjs.org"],
+          ["app.example.com"],
+        ),
+      );
+      assert.deepEqual(
+        (await getFirewallState()).allowlist,
+        ["registry.npmjs.org"],
+      );
+    } finally {
+      ctrl.restore();
+      if (originalOrigin === undefined) {
+        delete process.env.NEXT_PUBLIC_BASE_DOMAIN;
+      } else {
+        process.env.NEXT_PUBLIC_BASE_DOMAIN = originalOrigin;
+      }
     }
   });
 });

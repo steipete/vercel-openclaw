@@ -480,6 +480,7 @@ export async function POST(request: Request): Promise<Response> {
         requestId: requestId ?? null,
         sandboxId: effectiveMeta.sandboxId,
         op,
+        controlPlaneOrigin: getPublicOrigin(request),
       });
 
       const readiness = await probeGatewayReady({ timeoutMs: 1_000 });

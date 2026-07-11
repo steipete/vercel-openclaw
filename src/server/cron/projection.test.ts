@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   acceptCronProjection,
   clearLegacyCronStateAfterBaseline,
+  clearLegacyCronStateForReset,
   CRON_PROJECTION_MAX_BODY_BYTES,
   CRON_PROJECTION_MAX_WAKES,
   fenceCronProjectionStateForReset,
@@ -12,6 +13,7 @@ import {
   isCronProjectionRecord,
   migrateLegacyCronWake,
   mutateCronProjection,
+  normalizeResetCronProjectionGeneration,
   parseCronProjectionInput,
   readCronProjection,
   readCronProjectionState,
@@ -45,7 +47,7 @@ function input(
   };
 }
 
-test("cron projection validates the bounded full-snapshot shape", () => {
+test("cron projection validates the bounded earliest-wake snapshot shape", () => {
   const options = { now: () => 1_800_000_000_000 };
   assert.equal(parseCronProjectionInput(input(1, []), options).ok, true);
   assert.deepEqual(parseCronProjectionInput({ schemaVersion: 2 }), {
@@ -208,7 +210,7 @@ test("newer identical snapshots advance the source cursor without replacing disp
   assert.equal(stale.record.source?.revision, 2);
 });
 
-test("legacy migration imports only the wake for hook-capable pins then deletes old keys after baseline", async () => {
+test("legacy migration imports only the wake and retains the jobs backup after baseline", async () => {
   const store = new MemoryStore();
   await store.setValue(cronNextWakeKey(), 1234);
   await store.setValue(cronJobsKey(), {
@@ -236,9 +238,9 @@ test("legacy migration imports only the wake for hook-capable pins then deletes 
   });
   await clearLegacyCronStateAfterBaseline({ store, now: () => 1600 });
   assert.equal(await store.getValue(cronNextWakeKey()), null);
-  assert.equal(await store.getValue(cronJobsKey()), null);
+  assert.equal(await store.hasValue(cronJobsKey()), true);
   assert.equal(
-    (await readCronProjection(store))?.migration.legacyKeysClearedAtMs,
+    (await readCronProjection(store))?.migration.legacyWakeClearedAtMs,
     1600,
   );
 });
@@ -261,19 +263,19 @@ test("legacy jobs presence can arm one migration bootstrap wake without reading 
   assert.equal(await store.hasValue(cronJobsKey()), true);
 });
 
-test("authoritative baselines repeatedly scrub legacy keys from old deployments", async () => {
+test("authoritative baselines repeatedly scrub only the legacy wake key", async () => {
   const store = new MemoryStore();
   await acceptCronProjection(input(1, []), { store, now: () => 1_500 });
   await clearLegacyCronStateAfterBaseline({ store, now: () => 1_600 });
 
   await store.setValue(cronNextWakeKey(), 2_000);
-  await store.setValue(cronJobsKey(), { private: "must-be-scrubbed" });
+  await store.setValue(cronJobsKey(), { private: "must-be-preserved" });
   await clearLegacyCronStateAfterBaseline({ store, now: () => 1_700 });
 
   assert.equal(await store.hasValue(cronNextWakeKey()), false);
-  assert.equal(await store.hasValue(cronJobsKey()), false);
+  assert.equal(await store.hasValue(cronJobsKey()), true);
   assert.equal(
-    (await readCronProjection(store))?.migration.legacyKeysClearedAtMs,
+    (await readCronProjection(store))?.migration.legacyWakeClearedAtMs,
     1_600,
   );
 });
@@ -356,6 +358,43 @@ test("reset fence returns the active wake Workflow for cancellation", async () =
   });
   assert.equal(fenced.supersededWorkflowRunId, "wrun-running-reset");
   assert.equal(fenced.record.dispatch.status, "none");
+});
+
+test("reset fence leaves legacy cleanup to the post-destroy commit", async () => {
+  const store = new MemoryStore();
+  await store.setValue(cronNextWakeKey(), 5_000);
+  await store.setValue(cronJobsKey(), { jobs: ["private"] });
+
+  await fenceCronProjectionStateForReset({
+    gatewayGeneration: "2".repeat(32),
+    store,
+    now: () => 2_000,
+  });
+
+  assert.equal(await store.hasValue(cronNextWakeKey()), true);
+  assert.equal(await store.hasValue(cronJobsKey()), true);
+  await clearLegacyCronStateForReset(store);
+  assert.equal(await store.hasValue(cronNextWakeKey()), false);
+  assert.equal(await store.hasValue(cronJobsKey()), false);
+});
+
+test("sandbox startup repairs a reset fence after gateway-token commit failure", async () => {
+  const store = new MemoryStore();
+  await fenceCronProjectionStateForReset({
+    gatewayGeneration: "a".repeat(32),
+    store,
+    now: () => 1_000,
+  });
+
+  await normalizeResetCronProjectionGeneration({
+    gatewayGeneration: "b".repeat(32),
+    store,
+  });
+
+  const record = await readCronProjection(store);
+  assert.equal(record?.gatewayGeneration, "b".repeat(32));
+  assert.equal(record?.source, null);
+  assert.equal(record?.dispatch.status, "none");
 });
 
 test("cron projection diagnostics hash dispatch tokens and omit source identities", async () => {

@@ -3,14 +3,14 @@ import {
   type DeploymentContract,
 } from "@/server/deployment-contract";
 import { getCurrentDeploymentId } from "@/server/launch-verify/state";
-import { logError, logInfo, logWarn } from "@/server/log";
+import { logError, logInfo } from "@/server/log";
 import {
   createOperationContext,
 } from "@/server/observability/operation-context";
 import { getPublicOrigin } from "@/server/public-url";
+import { matchesConfiguredBundleIdentity } from "@/server/openclaw/bundle-identity";
+import { supportsCronProjectionBundleIdentity } from "@/server/cron/compatibility";
 import {
-  CRON_NEXT_WAKE_KEY,
-  ensureSandboxReady,
   ensureUsableAiGatewayCredential,
   isBusyStatus,
   prepareHotSpareFromPreparedRestore,
@@ -24,12 +24,22 @@ import {
   type TokenRefreshResult,
 } from "@/server/sandbox/lifecycle";
 import {
+  reconcileCronProjection,
+  type CronProjectionReconcileResult,
+  type CronWorkflowRunStatus,
+} from "@/server/cron/dispatch";
+import type { CronWakeWorkflowEnvelopeV1 } from "@/server/cron/workflow-contract";
+import {
+  getCronProjectionDiagnostics,
+  type CronProjectionDiagnostics,
+} from "@/server/cron/projection";
+import { cronWakeWorkflow } from "@/server/workflows/cron/cron-wake-workflow";
+import {
   runRestoreOracleCycle,
   type RestoreOracleCycleResult,
 } from "@/server/sandbox/restore-oracle";
-import { getInitializedMeta, getStore, mutateMeta } from "@/server/store/store";
+import { getInitializedMeta, mutateMeta } from "@/server/store/store";
 import type {
-  CronRestoreOutcome,
   OperationContext,
   SingleMeta,
 } from "@/shared/types";
@@ -58,17 +68,18 @@ export type WatchdogDeps = {
     schedule?: (callback: () => Promise<void> | void) => void;
     op?: OperationContext;
   }) => Promise<SandboxHealthResult>;
-  ensureReady: (options: {
-    origin: string;
-    reason: string;
-  }) => Promise<SingleMeta>;
   readPrevious: () => Promise<WatchdogReport>;
   writeReport: (report: WatchdogReport) => Promise<WatchdogReport>;
-  getCronNextWakeMs: () => Promise<number | null>;
-  clearCronNextWake: () => Promise<void>;
+  reconcileCronProjection: (options: {
+    origin: string;
+    enabled: boolean;
+    bootstrapFromLegacyJobs?: boolean;
+  }) => Promise<CronProjectionReconcileResult>;
+  getCronProjectionDiagnostics: () => Promise<CronProjectionDiagnostics | null>;
   refreshGatewayToken: (input: {
     force?: boolean;
     reason: string;
+    controlPlaneOrigin?: string;
   }) => Promise<TokenRefreshResult>;
   runRestoreOracle: (input: {
     origin: string;
@@ -85,11 +96,25 @@ export type WatchdogDeps = {
 };
 
 const WATCHDOG_CRON_WAKE_CHECK_ID = "cron.wake" as const;
-const WATCHDOG_CRON_WAKE_CLEAR_OUTCOMES = new Set<CronRestoreOutcome>([
-  "no-store-jobs",
-  "already-present",
-  "restored-verified",
-]);
+
+async function startCronWakeWorkflow(
+  envelope: CronWakeWorkflowEnvelopeV1,
+): Promise<{ runId: string }> {
+  const { start } = await import("workflow/api");
+  const run = await start(cronWakeWorkflow, [envelope], {
+    deploymentId: "latest",
+  });
+  return { runId: run.runId };
+}
+
+async function getCronWakeWorkflowStatus(
+  runId: string,
+): Promise<CronWorkflowRunStatus> {
+  const { getRun } = await import("workflow/api");
+  const run = getRun(runId);
+  if (!(await run.exists)) return "missing";
+  return run.status;
+}
 
 const defaultDeps: WatchdogDeps = {
   buildContract: buildDeploymentContract,
@@ -97,15 +122,20 @@ const defaultDeps: WatchdogDeps = {
   probe: () => probeGatewayReady({ resume: false, thaw: false }),
   reconcileStale: reconcileStaleRunningStatus,
   reconcile: reconcileSandboxHealth,
-  ensureReady: ensureSandboxReady,
   readPrevious: readWatchdogReport,
   writeReport: writeWatchdogReport,
-  getCronNextWakeMs: () => getStore().getValue<number>(CRON_NEXT_WAKE_KEY()),
-  clearCronNextWake: () => getStore().deleteValue(CRON_NEXT_WAKE_KEY()),
+  reconcileCronProjection: (options) =>
+    reconcileCronProjection({
+      ...options,
+      startWorkflow: startCronWakeWorkflow,
+      getWorkflowRunStatus: getCronWakeWorkflowStatus,
+    }),
+  getCronProjectionDiagnostics,
   refreshGatewayToken: (input) =>
     ensureUsableAiGatewayCredential({
       force: input.force,
       reason: input.reason,
+      controlPlaneOrigin: input.controlPlaneOrigin,
     }),
   runRestoreOracle: (input) =>
     runRestoreOracleCycle(input, {
@@ -166,6 +196,7 @@ export async function runSandboxWatchdog(
     const result = await deps.refreshGatewayToken({
       force: input.force,
       reason: input.reason,
+      controlPlaneOrigin: getPublicOrigin(options.request),
     });
     const failed = result.reason.startsWith("refresh-failed:") ||
       result.reason === "no-credential-available";
@@ -206,10 +237,15 @@ export async function runSandboxWatchdog(
   let triggeredRepair = false;
   let lastError: string | null = null;
   let tokenRefreshFailed = false;
+  let cronProjectionEnabled = false;
 
   try {
     previous = await deps.readPrevious();
     meta = await deps.getMeta();
+    const bundleIdentity = matchesConfiguredBundleIdentity(meta.bundleIdentity)
+      ? meta.bundleIdentity
+      : null;
+    cronProjectionEnabled = supportsCronProjectionBundleIdentity(bundleIdentity);
 
     // Check deployment contract
     const contractStartedAt = deps.now();
@@ -310,14 +346,10 @@ export async function runSandboxWatchdog(
         addCheck("probe", "pass", probeStartedAt, "Gateway probe returned the openclaw-app marker.");
         addCheck("reconcile", "skip", deps.now(), "Probe passed; no repair scheduled.");
 
-        const cronNextWakeMs = await deps.getCronNextWakeMs();
-        const cronDueOrSoon = typeof cronNextWakeMs === "number" && cronNextWakeMs <= deps.now() + 60_000;
         await refreshGatewayTokenForWatchdog({
-          force: cronDueOrSoon,
-          reason: cronDueOrSoon ? "watchdog:cron-due-or-soon" : "watchdog:healthy-running",
-          message: cronDueOrSoon
-            ? "AI Gateway token refreshed for due sandbox cron."
-            : "AI Gateway token is usable for running sandbox.",
+          force: false,
+          reason: "watchdog:healthy-running",
+          message: "AI Gateway token is usable for running sandbox.",
         });
 
         // Restore oracle: attempt to seal a fresh restore target when idle
@@ -425,65 +457,57 @@ export async function runSandboxWatchdog(
       } // close SDK stale-check else
     }
 
-    // Cron wake: if sandbox is stopped or recoverable and has a resumable
-    // target (snapshotId for legacy, sandboxId for v2 persistent), wake it.
-    // OpenClaw's native cron scheduler handles everything once running.
+    // Anti-entropy only. A token-revalidating Workflow owns the actual wake;
+    // watchdog repairs missing/stale dispatch without becoming a second timer.
     const cronCheckStartedAt = deps.now();
-    const hasResumableTarget = !!(meta.snapshotId || meta.sandboxId);
-    if (
-      (meta.status === "stopped" && hasResumableTarget) ||
-      (meta.status === "error" && hasResumableTarget)
-    ) {
-      const cronNextWakeMs = await deps.getCronNextWakeMs();
-      if (cronNextWakeMs && cronNextWakeMs <= deps.now()) {
-        try {
-          const origin = getPublicOrigin(options.request);
-          const wakeMeta = await deps.ensureReady({ origin, reason: "watchdog:cron-wake" });
-          await refreshGatewayTokenForWatchdog({
-            force: true,
-            reason: "watchdog:cron-wake",
-            message: "AI Gateway token refreshed after cron wake.",
-          });
-
-          const cronRestoreOutcome = wakeMeta.lastRestoreMetrics?.cronRestoreOutcome;
-          const shouldClearWakeKey =
-            cronRestoreOutcome !== undefined &&
-            WATCHDOG_CRON_WAKE_CLEAR_OUTCOMES.has(cronRestoreOutcome);
-
-          if (shouldClearWakeKey) {
-            await deps.clearCronNextWake();
-          } else {
-            logWarn("watchdog.cron_wake_key_retained", {
-              reason: cronRestoreOutcome
-                ? "Cron restore outcome requires retry; retaining wake key"
-                : "Cron restore outcome missing after wake; retaining wake key",
-              cronRestoreOutcome: cronRestoreOutcome ?? "unknown",
-            });
-          }
-          triggeredRepair = true;
-          addCheck(WATCHDOG_CRON_WAKE_CHECK_ID, "pass", cronCheckStartedAt,
-            shouldClearWakeKey
-              ? `Cron job due — woke sandbox; cron restore outcome ${cronRestoreOutcome}.`
-              : cronRestoreOutcome
-                ? `Cron job due — woke sandbox but cron restore outcome ${cronRestoreOutcome}; wake key retained.`
-                : "Cron job due — woke sandbox but cron restore outcome missing; wake key retained.");
-          status = "repairing";
-          meta = wakeMeta;
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          lastError = `Cron wake failed: ${errMsg}`;
-          addCheck(WATCHDOG_CRON_WAKE_CHECK_ID, "fail", cronCheckStartedAt, lastError);
-          status = "failed";
-        }
+    try {
+      const cron = await deps.reconcileCronProjection({
+        origin: getPublicOrigin(options.request),
+        enabled: cronProjectionEnabled,
+        bootstrapFromLegacyJobs:
+          (meta.status === "stopped" || meta.status === "error") &&
+          Boolean(meta.sandboxId || meta.snapshotId),
+      });
+      const diagnostics = await deps.getCronProjectionDiagnostics();
+      if (cron.status === "failed") {
+        lastError = "Cron projection workflow could not be started.";
+        addCheck(
+          WATCHDOG_CRON_WAKE_CHECK_ID,
+          "fail",
+          cronCheckStartedAt,
+          lastError,
+          diagnostics ?? undefined,
+        );
+        status = "failed";
       } else {
-        const msg = cronNextWakeMs
-          ? `Next cron wake in ${Math.ceil((cronNextWakeMs - deps.now()) / 60000)} min.`
-          : "No cron wake scheduled.";
-        addCheck(WATCHDOG_CRON_WAKE_CHECK_ID, "skip", cronCheckStartedAt, msg);
+        const repaired = cron.status === "started" && cron.repaired;
+        triggeredRepair ||= repaired;
+        if (repaired && status !== "failed") status = "repairing";
+        addCheck(
+          WATCHDOG_CRON_WAKE_CHECK_ID,
+          cron.status === "unsupported" ||
+            cron.status === "empty" ||
+            cron.status === "idle"
+            ? "skip"
+            : "pass",
+          cronCheckStartedAt,
+          cron.status === "unsupported"
+            ? "Cron projection is disabled because the active bundle capability is not verified."
+            : cron.status === "empty"
+            ? "No cron projection baseline is available."
+            : cron.status === "idle"
+              ? "Cron projection has no pending wake."
+              : cron.status === "started"
+                ? "Cron projection Workflow started."
+                : "Cron projection Workflow is scheduled.",
+          diagnostics ?? undefined,
+        );
       }
-    } else {
-      addCheck(WATCHDOG_CRON_WAKE_CHECK_ID, "skip", cronCheckStartedAt,
-        `Sandbox is ${meta.status}; cron wake not needed.`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      lastError = `Cron projection reconciliation failed: ${errMsg}`;
+      addCheck(WATCHDOG_CRON_WAKE_CHECK_ID, "fail", cronCheckStartedAt, lastError);
+      status = "failed";
     }
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error);

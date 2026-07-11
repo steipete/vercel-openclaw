@@ -44,7 +44,6 @@ import {
 } from "@/server/openclaw/config";
 import {
   CRON_PROJECTION_CAPABILITY,
-  cronProjectionCompatibilityRuntime,
 } from "@/server/cron/compatibility";
 
 function withEnv<T>(
@@ -175,28 +174,22 @@ test("buildGatewayConfig explicitly enables authenticated admin HTTP RPC only fo
   );
 });
 
-test("buildGatewayConfig enables cron projection only for a verified capable bundle", (t) => {
-  t.mock.method(
-    cronProjectionCompatibilityRuntime,
-    "getVerifiedBundleIdentity",
-    () => ({
-      packageSpec: "openclaw@2026.7.2",
-      version: "2026.7.2",
-      forkSha: "a".repeat(40),
-      upstreamSha: "b".repeat(40),
-      canonicalSha256: "c".repeat(64),
-      capabilities: [CRON_PROJECTION_CAPABILITY],
-      verified: true,
-    }),
-  );
+test("buildGatewayConfig enables cron projection only for an admitted capability", () => {
   withEnv(
     {
-      OPENCLAW_PACKAGE_SPEC: "openclaw@2026.7.2",
+      OPENCLAW_PACKAGE_SPEC: undefined,
       VERCEL_AUTOMATION_BYPASS_SECRET: "test-bypass",
     },
     () => {
       const config = JSON.parse(
-        buildGatewayConfig(undefined, "https://app.example.com"),
+        buildGatewayConfig(
+          undefined,
+          "https://app.example.com",
+          undefined,
+          undefined,
+          undefined,
+          [CRON_PROJECTION_CAPABILITY],
+        ),
       ) as {
         plugins?: {
           allow?: string[];
@@ -219,7 +212,7 @@ test("buildGatewayConfig enables cron projection only for a verified capable bun
     },
   );
 
-  withEnv({ OPENCLAW_PACKAGE_SPEC: "openclaw@2026.7.1" }, () => {
+  withEnv({ OPENCLAW_PACKAGE_SPEC: undefined }, () => {
     const config = JSON.parse(
       buildGatewayConfig(undefined, "https://app.example.com"),
     ) as { plugins?: { allow?: string[]; entries?: Record<string, unknown> } };

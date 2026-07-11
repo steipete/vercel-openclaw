@@ -337,7 +337,19 @@ async function syncFirewallPolicyAfterMutation(
   options?: FirewallPolicyContext,
 ): Promise<void> {
   try {
-    await syncFirewallPolicyIfRunning(options);
+    const outcome = await syncFirewallPolicyIfRunning(options);
+    if (outcome.reason === "sandbox-generation-changed") {
+      logInfo("firewall.sync_retrying", {
+        operation: "sync",
+        reason: outcome.reason,
+        mutation,
+        requestId: options?.requestId,
+      });
+      const retried = await syncFirewallPolicyIfRunning(options);
+      if (retried.reason === "sandbox-generation-changed") {
+        throw new Error("Firewall sync target changed repeatedly.");
+      }
+    }
   } catch (error) {
     logWarn("firewall.sync_failed_after_mutation", {
       operation: "sync",

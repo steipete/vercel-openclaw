@@ -1538,6 +1538,45 @@ test("syncFirewallPolicyIfRunning cannot attribute an old apply to a replacement
   });
 });
 
+test("firewall mutations retry policy sync against a replacement generation", async () => {
+  await withFirewallTestStore(async () => {
+    await prepareRunningSandbox((meta) => {
+      meta.lifecycleAttemptId = "attempt-old";
+      meta.firewall.mode = "enforcing";
+      meta.firewall.allowlist = ["api.openai.com"];
+    });
+    let updateCount = 0;
+    const ctrl = installSucceedingSandboxController({
+      onUpdateNetworkPolicy: async () => {
+        updateCount += 1;
+        if (updateCount !== 1) return;
+        await mutateMeta((meta) => {
+          meta.sandboxId = "sandbox-replacement";
+          meta.lifecycleAttemptId = "attempt-new";
+          meta.status = "booting";
+        });
+      },
+    });
+
+    try {
+      await approveDomains(["vercel.com"]);
+      const meta = await getInitializedMeta();
+
+      assert.equal(updateCount, 2);
+      assert.equal(meta.sandboxId, "sandbox-replacement");
+      assert.equal(meta.lifecycleAttemptId, "attempt-new");
+      assert.equal(meta.firewall.lastSyncOutcome?.applied, true);
+      assert.equal(meta.firewall.lastSyncOutcome?.reason, "policy-applied");
+      assert.deepEqual(ctrl.appliedPolicies, [
+        { allow: ["api.openai.com", "vercel.com"] },
+        { allow: ["api.openai.com", "vercel.com"] },
+      ]);
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
 test("firewall sync and report work without a canonical public origin", async () => {
   await withFirewallTestStore(async () => {
     const ctrl = installSucceedingSandboxController();

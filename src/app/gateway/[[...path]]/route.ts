@@ -23,6 +23,10 @@ import {
 } from "@/server/sandbox/lifecycle";
 import { OPENCLAW_OPERATOR_SCOPES } from "@/server/openclaw/config";
 import { getSandboxHeartbeatIntervalMs } from "@/server/sandbox/timeout";
+import {
+  buildHostIngressFencedResponse,
+  getHostIngressFence,
+} from "@/server/sandbox/host-suspension";
 import { GATEWAY_CHAT_PATH } from "@/shared/gateway-paths";
 
 export const maxDuration = 300;
@@ -89,6 +93,19 @@ async function handleProxy(request: Request, path: string): Promise<Response> {
     return auth;
   }
 
+  const ingressFence = await getHostIngressFence();
+  if (ingressFence) {
+    logInfo("gateway.host_ingress_fenced", {
+      ...reqCtx,
+      phase: ingressFence.phase,
+      operationId: ingressFence.operationId,
+    });
+    return withSetCookie(
+      buildHostIngressFencedResponse(ingressFence),
+      auth.setCookieHeader,
+    );
+  }
+
   const ensure = await ensureSandboxRunning({
     origin: getPublicOrigin(request),
     reason: "gateway.request",
@@ -120,7 +137,7 @@ async function handleProxy(request: Request, path: string): Promise<Response> {
   await ensureFreshGatewayToken();
 
   const meta = await touchRunningSandbox();
-  if (!meta.sandboxId || !meta.gatewayToken) {
+  if (meta.status !== "running" || !meta.sandboxId || !meta.gatewayToken) {
     logWarn("gateway.missing_credentials", {
       ...reqCtx,
       sandboxStatus: meta.status,

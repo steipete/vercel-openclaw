@@ -31,6 +31,10 @@ import { createOperationContext, withOperationContext } from "@/server/observabi
 import { getSandboxDomain, markSandboxPortUrlStale, probeGatewayReady, reconcileSandboxHealth, reconcileStaleRunningStatus, syncGatewayConfigToSandbox } from "@/server/sandbox/lifecycle";
 import { getInitializedMeta, getStore } from "@/server/store/store";
 import { hydrateVerifiedBundleIdentity } from "@/server/openclaw/bundle-identity";
+import {
+  buildHostIngressFencedResponse,
+  getHostIngressFence,
+} from "@/server/sandbox/host-suspension";
 const SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage";
 const SLACK_BOOT_MESSAGE_TIMEOUT_MS = 5_000;
 // The fast path intentionally awaits the native handler's full turn
@@ -279,6 +283,18 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const eventInfo = extractSlackEventInfo(payload);
+  const ingressFence = await getHostIngressFence();
+  // Bot replies still need to clear their pending wake placeholder while the
+  // host fence prevents new user work from entering the suspended gateway.
+  if (ingressFence && !eventInfo.botId) {
+    logInfo("channels.slack_host_ingress_fenced", {
+      requestId,
+      phase: ingressFence.phase,
+      operationId: ingressFence.operationId,
+    });
+    return buildHostIngressFencedResponse(ingressFence);
+  }
+
   const dedupId = extractSlackDedupId(payload);
   let dedupLock: SlackWebhookDedupLock | null = null;
   if (dedupId) {

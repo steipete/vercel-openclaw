@@ -367,6 +367,17 @@ Read `attestation.reusable` and `plan.blocking` together: if the attestation say
 | `lifecycle.lastTokenRefreshError` | string \| null | Error from the last failed token refresh, or `null` |
 | `lifecycle.consecutiveTokenRefreshFailures` | number | Count of consecutive token refresh failures. `0` when healthy. |
 | `lifecycle.breakerOpenUntil` | number \| null | If the token refresh circuit breaker is open, the Unix ms timestamp when it will close. `null` when the breaker is closed. |
+| `lifecycle.hostSuspension` | object \| null | Durable cooperative-stop state. `null` when no host suspension operation exists. |
+| `lifecycle.hostSuspension.operationId` | string \| null | Stable operation/request ID used for adoption and Gateway lease renewal. |
+| `lifecycle.hostSuspension.phase` | string | `fencing`, `preparing`, `prepared`, `stop-requesting`, `stopping`, `stopped`, `thawing`, `running`, `failed`, or `state-corrupt`. |
+| `lifecycle.hostSuspension.ingressFenced` | boolean | Whether app-owned ingress and ordinary admin mutations remain closed. |
+| `lifecycle.hostSuspension.leaseExpiresAtMs` | number \| null | Current OpenClaw suspension lease expiry. |
+| `lifecycle.hostSuspension.stopRequestDeadlineAtMs` | number \| null | Absolute deadline for resolving an ambiguous platform stop request. |
+| `lifecycle.hostSuspension.monitorHeartbeatAtMs` | number \| null | Last durable Workflow monitor heartbeat. |
+| `lifecycle.hostSuspension.lastErrorCode` | string \| null | Structured lifecycle/Gateway error code; no secret or raw response body. |
+| `lifecycle.hostSuspension.lastErrorClass` | string \| null | Error class used for operator diagnosis. |
+
+`phase: "state-corrupt"` is fail-closed: ingress remains fenced until destructive reset clears the invalid record with the sandbox.
 
 ##### Setup progress
 

@@ -11,6 +11,11 @@ import test from "node:test";
 
 import { requireRouteAuth, sanitizeNextPath } from "@/server/auth/vercel-auth";
 import { requireJsonRouteAuth, requireMutationAuth } from "@/server/auth/route-auth";
+import {
+  hostSuspensionOperationKey,
+  lifecycleLockKey,
+} from "@/server/store/keyspace";
+import { _resetStoreForTesting, getStore } from "@/server/store/store";
 
 // ---------------------------------------------------------------------------
 // Set env for admin-secret mode (default)
@@ -188,5 +193,157 @@ test("LOCAL_READ_ONLY unset: mutation auth does NOT short-circuit with LOCAL_REA
     }
   } finally {
     if (original !== undefined) process.env.LOCAL_READ_ONLY = original;
+  }
+});
+
+test("host suspension blocks authenticated mutations but preserves explicit lifecycle controls", async () => {
+  setAuthMode(undefined);
+  const previousAdminAuth = process.env.ADMIN_SECRET;
+  process.env.ADMIN_SECRET = "fixture";
+  const now = Date.now();
+  try {
+    await getStore().setValue(hostSuspensionOperationKey(), {
+      version: 1,
+      operationId: "operation-route-auth",
+      requestId: "operation-route-auth",
+      sandboxId: "sbx-route-auth",
+      reason: "test",
+      intent: "stop",
+      phase: "stopping",
+      ingressFenced: true,
+      suspensionId: "suspension-route-auth",
+      leaseExpiresAtMs: now + 60_000,
+      stopRequestDeadlineAtMs: null,
+      monitorHeartbeatAtMs: now,
+      startedAtMs: now - 1_000,
+      updatedAtMs: now,
+      stoppedAtMs: null,
+      resumedAtMs: null,
+      lastError: null,
+      lastErrorCode: null,
+      lastErrorClass: null,
+    });
+
+    const blocked = await requireMutationAuth(new Request(
+      "http://localhost:3000/api/admin/ssh",
+      { method: "POST", headers: { authorization: "Bearer fixture" } },
+    ));
+    assert.ok(blocked instanceof Response);
+    assert.equal(blocked.status, 503);
+    assert.equal(
+      ((await blocked.json()) as { error?: unknown }).error,
+      "HOST_INGRESS_FENCED",
+    );
+
+    const control = await requireMutationAuth(new Request(
+      "http://localhost:3000/api/admin/reset",
+      { method: "POST", headers: { authorization: "Bearer fixture" } },
+    ));
+    assert.equal(control instanceof Response, false);
+
+    const currentState = await getStore().getValue<Record<string, unknown>>(
+      hostSuspensionOperationKey(),
+    );
+    assert.ok(currentState);
+    const stoppedAtMs = Date.now();
+    await getStore().setValue(hostSuspensionOperationKey(), {
+      ...currentState,
+      phase: "stopped",
+      stoppedAtMs,
+      updatedAtMs: stoppedAtMs,
+    });
+    const restore = await requireMutationAuth(new Request(
+      "http://localhost:3000/api/admin/snapshots/restore",
+      { method: "POST", headers: { authorization: "Bearer fixture" } },
+    ));
+    assert.equal(restore instanceof Response, false);
+  } finally {
+    _resetStoreForTesting();
+    if (previousAdminAuth === undefined) delete process.env.ADMIN_SECRET;
+    else process.env.ADMIN_SECRET = previousAdminAuth;
+    setAuthMode(originalAuthMode);
+  }
+});
+
+test("host mutation admission refuses while lifecycle lock is held", async () => {
+  setAuthMode(undefined);
+  const previousAdminAuth = process.env.ADMIN_SECRET;
+  process.env.ADMIN_SECRET = "fixture";
+  const token = await getStore().acquireLock(lifecycleLockKey(), 30);
+  assert.ok(token);
+  try {
+    const result = await requireMutationAuth(new Request(
+      "http://localhost:3000/api/admin/ssh",
+      { method: "POST", headers: { authorization: "Bearer fixture" } },
+    ));
+    assert.ok(result instanceof Response);
+    assert.equal(result.status, 503);
+    assert.equal(
+      ((await result.json()) as { error?: unknown }).error,
+      "HOST_MUTATION_BUSY",
+    );
+  } finally {
+    await getStore().releaseLock(lifecycleLockKey(), token);
+    _resetStoreForTesting();
+    if (previousAdminAuth === undefined) delete process.env.ADMIN_SECRET;
+    else process.env.ADMIN_SECRET = previousAdminAuth;
+    setAuthMode(originalAuthMode);
+  }
+});
+
+test("host mutation admission rechecks a suspension that won before lock acquisition", async () => {
+  setAuthMode(undefined);
+  const previousAdminAuth = process.env.ADMIN_SECRET;
+  process.env.ADMIN_SECRET = "fixture";
+  const store = getStore();
+  const acquireLock = store.acquireLock.bind(store);
+  let injected = false;
+  store.acquireLock = async (key, ttlSeconds) => {
+    const token = await acquireLock(key, ttlSeconds);
+    if (key === lifecycleLockKey() && token && !injected) {
+      injected = true;
+      const now = Date.now();
+      await store.setValue(hostSuspensionOperationKey(), {
+        version: 1,
+        operationId: "operation-route-race",
+        requestId: "operation-route-race",
+        sandboxId: "sbx-route-race",
+        intent: "stop",
+        reason: "test-race",
+        phase: "stopping",
+        ingressFenced: true,
+        suspensionId: "suspension-route-race",
+        leaseExpiresAtMs: now + 60_000,
+        stopRequestDeadlineAtMs: null,
+        monitorHeartbeatAtMs: now,
+        startedAtMs: now - 1_000,
+        updatedAtMs: now,
+        stoppedAtMs: null,
+        resumedAtMs: null,
+        lastError: null,
+        lastErrorCode: null,
+        lastErrorClass: null,
+      });
+    }
+    return token;
+  };
+
+  try {
+    const result = await requireMutationAuth(new Request(
+      "http://localhost:3000/api/admin/ssh",
+      { method: "POST", headers: { authorization: "Bearer fixture" } },
+    ));
+    assert.ok(result instanceof Response);
+    assert.equal(result.status, 503);
+    assert.equal(
+      ((await result.json()) as { error?: unknown }).error,
+      "HOST_INGRESS_FENCED",
+    );
+  } finally {
+    store.acquireLock = acquireLock;
+    _resetStoreForTesting();
+    if (previousAdminAuth === undefined) delete process.env.ADMIN_SECRET;
+    else process.env.ADMIN_SECRET = previousAdminAuth;
+    setAuthMode(originalAuthMode);
   }
 });

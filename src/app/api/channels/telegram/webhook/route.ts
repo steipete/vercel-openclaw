@@ -49,6 +49,10 @@ import { getSandboxDomain, markSandboxPortUrlStale, reconcileStaleRunningStatus 
 const TELEGRAM_FAST_PATH_FORWARD_TIMEOUT_MS = 10 * 60 * 1000;
 import { channelForwardDiagnosticKey } from "@/server/store/keyspace";
 import { getInitializedMeta, getStore } from "@/server/store/store";
+import {
+  buildHostIngressFencedResponse,
+  getHostIngressFence,
+} from "@/server/sandbox/host-suspension";
 
 const TELEGRAM_FAST_PATH_POLICY: FastPathClassifierPolicy = {
   channel: "telegram",
@@ -271,6 +275,16 @@ export async function POST(request: Request): Promise<Response> {
       bundleIdentityVerified: verifiedBundleIdentity !== null,
       requestId,
     });
+  }
+
+  const ingressFence = await getHostIngressFence();
+  if (ingressFence) {
+    logInfo("channels.telegram_host_ingress_fenced", {
+      requestId,
+      phase: ingressFence.phase,
+      operationId: ingressFence.operationId,
+    });
+    return buildHostIngressFencedResponse(ingressFence);
   }
 
   // Return 200 only after the update is handled or successfully handed off.

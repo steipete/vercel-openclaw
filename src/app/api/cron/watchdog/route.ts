@@ -2,6 +2,10 @@ import { after } from "next/server";
 import { ApiError, jsonError, jsonOk } from "@/shared/http";
 import { getCronSecret } from "@/server/env";
 import { runSandboxWatchdog } from "@/server/watchdog/run";
+import {
+  buildHostIngressFencedResponse,
+  getHostMutationFence,
+} from "@/server/sandbox/host-suspension";
 
 function isAuthorized(request: Request): boolean {
   const configured = getCronSecret();
@@ -21,6 +25,11 @@ function isAuthorized(request: Request): boolean {
 async function handle(request: Request): Promise<Response> {
   if (!isAuthorized(request)) {
     return jsonError(new ApiError(401, "UNAUTHORIZED", "Unauthorized"));
+  }
+
+  const fence = await getHostMutationFence();
+  if (fence && fence.phase !== "stopped") {
+    return buildHostIngressFencedResponse(fence);
   }
 
   const report = await runSandboxWatchdog({ request, schedule: after });

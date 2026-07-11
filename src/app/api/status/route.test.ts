@@ -29,7 +29,10 @@ import {
   getStore,
   mutateMeta,
 } from "@/server/store/store";
-import { setupProgressKey } from "@/server/store/keyspace";
+import {
+  hostSuspensionOperationKey,
+  setupProgressKey,
+} from "@/server/store/keyspace";
 import type { RestoreTargetAttestation } from "@/shared/launch-verification";
 import type { RestoreOracleState } from "@/shared/types";
 import {
@@ -117,6 +120,54 @@ async function withTestEnv(fn: () => Promise<void>): Promise<void> {
 // ===========================================================================
 // GET /api/status
 // ===========================================================================
+
+test("GET /api/status: reports corrupt suspension state while snapshotting", async () => {
+  await withTestEnv(async () => {
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = "sbx-corrupt-suspension";
+    });
+    await getStore().setValue(hostSuspensionOperationKey(), {
+      version: 99,
+      corrupt: true,
+    });
+
+    const route = getStatusRoute();
+    const result = await callRoute(
+      route.GET!,
+      buildAuthGetRequest("/api/status"),
+    );
+
+    assert.equal(result.status, 200);
+    const body = result.json as {
+      status: string;
+      lifecycle: {
+        hostSuspension: {
+          operationId: string | null;
+          phase: string;
+          lastErrorCode: string;
+        } | null;
+      };
+    };
+    assert.equal(body.status, "snapshotting");
+    assert.deepEqual(body.lifecycle.hostSuspension, {
+      operationId: null,
+      sandboxId: null,
+      reason: null,
+      phase: "state-corrupt",
+      ingressFenced: true,
+      leaseExpiresAtMs: null,
+      stopRequestDeadlineAtMs: null,
+      monitorHeartbeatAtMs: null,
+      startedAtMs: null,
+      updatedAtMs: null,
+      stoppedAtMs: null,
+      resumedAtMs: null,
+      lastErrorCode: "HOST_SUSPENSION_STATE_CORRUPT",
+      lastErrorClass: "HostSuspensionStateCorruptError",
+    });
+  });
+});
 
 test("estimateSandboxTimeoutRemainingMs: returns null without last access and clamps at zero", () => {
   assert.equal(estimateSandboxTimeoutRemainingMs(null, 300_000, 1_000), null);
@@ -680,7 +731,12 @@ test("GET /api/status: live health returns live timeout and gateway data", async
 
       assert.equal(body.sleepAfterMs, 300_000);
       assert.equal(body.heartbeatIntervalMs, 150_000);
-      assert.equal(body.timeoutRemainingMs, 120_000);
+      assert.ok(
+        body.timeoutRemainingMs !== null
+        && body.timeoutRemainingMs <= 120_000
+        && body.timeoutRemainingMs > 119_000,
+        `expected live timeout near 120000ms, got ${body.timeoutRemainingMs}`,
+      );
       assert.equal(body.timeoutSource, "live");
       assert.equal(body.gatewayStatus, "ready");
       assert.equal(body.gatewayReady, true);

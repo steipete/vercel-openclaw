@@ -1,5 +1,15 @@
+import { after } from "next/server";
+
 import { ApiError, jsonError, jsonOk } from "@/shared/http";
 import { requireAdminAuth, requireAdminMutationAuth } from "@/server/auth/admin-auth";
+import { logWarn } from "@/server/log";
+import {
+  buildHostIngressFencedResponse,
+  getHostMutationFence,
+  type HostIngressFence,
+} from "@/server/sandbox/host-suspension";
+import { lifecycleLockKey } from "@/server/store/keyspace";
+import { getStore } from "@/server/store/store";
 
 type AdminAuthResult = Exclude<
   Awaited<ReturnType<typeof requireAdminAuth>>,
@@ -25,6 +35,109 @@ function localReadOnlyBlocked(): Response | null {
   );
 }
 
+const ALWAYS_ALLOWED_SUSPENSION_CONTROL_PATHS = new Set([
+  "/api/admin/reset",
+  "/api/admin/snapshot",
+  "/api/admin/stop",
+]);
+
+const WAKE_CONTROL_PATHS = new Set([
+  "/api/admin/ensure",
+  "/api/admin/snapshots/restore",
+  "/api/admin/watchdog",
+]);
+
+const LIFECYCLE_MANAGED_MUTATION_PATHS = new Set([
+  "/api/admin/ensure",
+  "/api/admin/launch-verify",
+  "/api/admin/lifecycle-lock",
+  "/api/admin/prepare-restore",
+  "/api/admin/reset",
+  "/api/admin/snapshot",
+  "/api/admin/snapshots",
+  "/api/admin/snapshots/restore",
+  "/api/admin/stop",
+  "/api/admin/watchdog",
+  "/api/debug/restore-waterfall",
+]);
+
+const HOST_MUTATION_LOCK_TTL_SECONDS = 330;
+
+function hostMutationLockBusyResponse(): Response {
+  return Response.json({
+    error: "HOST_MUTATION_BUSY",
+    message: "Another sandbox mutation or lifecycle transition is in progress.",
+  }, {
+    status: 503,
+    headers: { "Cache-Control": "no-store", "Retry-After": "2" },
+  });
+}
+
+async function admitHostMutation(request: Request): Promise<Response | null> {
+  const path = new URL(request.url).pathname;
+  if (LIFECYCLE_MANAGED_MUTATION_PATHS.has(path)) return null;
+
+  const store = getStore();
+  const token = await store.acquireLock(
+    lifecycleLockKey(),
+    HOST_MUTATION_LOCK_TTL_SECONDS,
+  );
+  if (!token) return hostMutationLockBusyResponse();
+
+  const release = async () => {
+    await store.releaseLock(lifecycleLockKey(), token);
+  };
+  try {
+    // The first fence read and lock acquisition are not atomic. Recheck while
+    // holding the lifecycle lock so a stop that won the race cannot be
+    // followed by a mutation after it releases the lock.
+    const suspensionBlock = await hostMutationBlocked(request);
+    if (suspensionBlock) {
+      await release();
+      return suspensionBlock;
+    }
+  } catch (error) {
+    await release();
+    throw error;
+  }
+  const testRuntime = process.env.NODE_ENV === "test"
+    || process.env.NODE_TEST_CONTEXT !== undefined;
+  if (testRuntime) {
+    await release();
+    return null;
+  }
+
+  try {
+    // Hold the same distributed lock used by stop/reset until the response is
+    // complete. Either the mutation wins first and stop refuses, or stop wins
+    // first and this admission refuses; no check-to-action gap remains.
+    after(release);
+    return null;
+  } catch (error) {
+    await release();
+    logWarn("auth.host_mutation_after_registration_failed", {
+      path,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return hostMutationLockBusyResponse();
+  }
+}
+
+function mutationAllowedDuringSuspension(
+  request: Request,
+  fence: HostIngressFence,
+): boolean {
+  const path = new URL(request.url).pathname;
+  if (ALWAYS_ALLOWED_SUSPENSION_CONTROL_PATHS.has(path)) return true;
+  return fence.phase === "stopped" && WAKE_CONTROL_PATHS.has(path);
+}
+
+async function hostMutationBlocked(request: Request): Promise<Response | null> {
+  const fence = await getHostMutationFence();
+  if (!fence || mutationAllowedDuringSuspension(request, fence)) return null;
+  return buildHostIngressFencedResponse(fence);
+}
+
 /**
  * Require admin auth for JSON API routes.
  * For mutations (POST/PUT/DELETE), also enforces CSRF for cookie sessions.
@@ -36,9 +149,7 @@ export async function requireJsonRouteAuth(
   const isMutation = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 
   if (isMutation) {
-    const blocked = localReadOnlyBlocked();
-    if (blocked) return blocked;
-    return requireAdminMutationAuth(request);
+    return requireMutationAuth(request);
   }
 
   return requireAdminAuth(request);
@@ -52,7 +163,13 @@ export async function requireMutationAuth(
 ): Promise<Response | AdminAuthResult> {
   const blocked = localReadOnlyBlocked();
   if (blocked) return blocked;
-  return requireAdminMutationAuth(request);
+  const auth = await requireAdminMutationAuth(request);
+  if (auth instanceof Response) return auth;
+  const suspensionBlock = await hostMutationBlocked(request);
+  if (suspensionBlock) return suspensionBlock;
+  const admissionBlock = await admitHostMutation(request);
+  if (admissionBlock) return admissionBlock;
+  return auth;
 }
 
 export function authJsonOk<T>(

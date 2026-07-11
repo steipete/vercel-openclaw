@@ -25,6 +25,7 @@ import { jsonError } from "@/shared/http";
 import type { SingleMeta } from "@/shared/types";
 import { GATEWAY_CHAT_PATH } from "@/shared/gateway-paths";
 import { getHostedFeatureSupportMatrix } from "@/shared/hosted-feature-support";
+import { readHostSuspensionState } from "@/server/sandbox/host-suspension";
 
 type GatewayStatus = "ready" | "not-ready" | "unknown";
 
@@ -138,6 +139,18 @@ export async function GET(request: Request): Promise<Response> {
     const setupProgress = includeSetupProgress
       ? await readSetupProgress(responseMeta.id, responseMeta.lifecycleAttemptId)
       : null;
+    let hostSuspension: Awaited<ReturnType<typeof readHostSuspensionState>> = null;
+    let hostSuspensionStateError: { code: string; class: string } | null = null;
+    try {
+      hostSuspension = await readHostSuspensionState();
+    } catch (error) {
+      hostSuspensionStateError = {
+        code: error instanceof Error && "code" in error
+          ? String((error as { code: unknown }).code)
+          : "HOST_SUSPENSION_STATE_ERROR",
+        class: error instanceof Error ? error.name : "UnknownError",
+      };
+    }
 
     const sandboxSdkVersion = await import("@vercel/sandbox/package.json", { with: { type: "json" } })
       .then((m) => (m.default as { version?: string }).version ?? null)
@@ -205,6 +218,41 @@ export async function GET(request: Request): Promise<Response> {
         consecutiveTokenRefreshFailures:
           responseMeta.consecutiveTokenRefreshFailures ?? 0,
         breakerOpenUntil: responseMeta.breakerOpenUntil ?? null,
+        hostSuspension: hostSuspension
+          ? {
+              operationId: hostSuspension.operationId,
+              sandboxId: hostSuspension.sandboxId,
+              reason: hostSuspension.reason,
+              phase: hostSuspension.phase,
+              ingressFenced: hostSuspension.ingressFenced,
+              leaseExpiresAtMs: hostSuspension.leaseExpiresAtMs,
+              stopRequestDeadlineAtMs: hostSuspension.stopRequestDeadlineAtMs,
+              monitorHeartbeatAtMs: hostSuspension.monitorHeartbeatAtMs,
+              startedAtMs: hostSuspension.startedAtMs,
+              updatedAtMs: hostSuspension.updatedAtMs,
+              stoppedAtMs: hostSuspension.stoppedAtMs,
+              resumedAtMs: hostSuspension.resumedAtMs,
+              lastErrorCode: hostSuspension.lastErrorCode ?? null,
+              lastErrorClass: hostSuspension.lastErrorClass ?? null,
+            }
+          : hostSuspensionStateError
+            ? {
+                operationId: null,
+                sandboxId: null,
+                reason: null,
+                phase: "state-corrupt",
+                ingressFenced: true,
+                leaseExpiresAtMs: null,
+                stopRequestDeadlineAtMs: null,
+                monitorHeartbeatAtMs: null,
+                startedAtMs: null,
+                updatedAtMs: null,
+                stoppedAtMs: null,
+                resumedAtMs: null,
+                lastErrorCode: hostSuspensionStateError.code,
+                lastErrorClass: hostSuspensionStateError.class,
+              }
+            : null,
       },
       setupProgress,
       user: { sub: "admin", name: "Admin" },

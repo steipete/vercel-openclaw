@@ -13,6 +13,10 @@ import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-
 import { extractRequestId, logInfo, logWarn } from "@/server/log";
 import { createOperationContext, withOperationContext } from "@/server/observability/operation-context";
 import { getInitializedMeta, getStore } from "@/server/store/store";
+import {
+  buildHostIngressFencedResponse,
+  getHostIngressFence,
+} from "@/server/sandbox/host-suspension";
 
 type DiscordWebhookDedupLock = ChannelDedupLock;
 
@@ -180,6 +184,16 @@ export async function POST(request: Request): Promise<Response> {
       ...extractDiscordInteractionInfo(payload),
     });
     return Response.json({ type: 1 });
+  }
+
+  const ingressFence = await getHostIngressFence();
+  if (ingressFence) {
+    logInfo("channels.discord_host_ingress_fenced", {
+      requestId,
+      phase: ingressFence.phase,
+      operationId: ingressFence.operationId,
+    });
+    return buildHostIngressFencedResponse(ingressFence);
   }
 
   const interactionId = extractInteractionId(payload);

@@ -35,6 +35,22 @@ export function lifecycleLockKey(): string {
   return buildKey("lock:lifecycle");
 }
 
+export function hostSuspensionOperationKey(): string {
+  return buildKey("lifecycle:host-suspension");
+}
+
+export function hostSuspensionOperationLockKey(): string {
+  return buildKey("lock:host-suspension");
+}
+
+export function sandboxDeadlineKey(): string {
+  return buildKey("lifecycle:sandbox-deadline");
+}
+
+export function sandboxDeadlineLockKey(): string {
+  return buildKey("lock:sandbox-deadline");
+}
+
 export function startLockKey(): string {
   return buildKey("lock:start");
 }

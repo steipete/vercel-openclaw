@@ -780,8 +780,9 @@ export async function thawHostSuspensionIfNeeded(input: {
   sandbox: SandboxHandle;
   lifecycleAttemptId?: string | null;
 }, deps: HostSuspensionDeps = defaultDeps): Promise<boolean> {
-  const state = await readHostSuspensionState(deps);
+  let state = await readHostSuspensionState(deps);
   if (!state?.ingressFenced) return true;
+  const initialOperationId = state.operationId;
   if (
     state.phase !== "stopped"
     && state.phase !== "thawing"
@@ -798,7 +799,7 @@ export async function thawHostSuspensionIfNeeded(input: {
       ]);
       if (
         !latest
-        || latest.operationId !== state.operationId
+        || latest.operationId !== initialOperationId
         || (
           latest.phase !== "stopped"
           && latest.phase !== "thawing"
@@ -826,7 +827,77 @@ export async function thawHostSuspensionIfNeeded(input: {
   if (
     input.lifecycleAttemptId !== undefined
     && state.lifecycleAttemptId !== input.lifecycleAttemptId
-  ) return false;
+  ) {
+    if (state.phase !== "stopped") return false;
+    const observedOperationId = state.operationId;
+    const suspensionId = state.suspensionId;
+    if (!suspensionId) return false;
+    const status = await deps.callRpc<SuspendStatusResult>({
+      sandbox: input.sandbox,
+      method: "gateway.suspend.status",
+      params: { suspensionId },
+      requestId: observedOperationId,
+    });
+    assertStatusResult(status);
+    if (status.status === "running") {
+      const cleared = await withHostSuspensionStateLock(deps, async () => {
+        const [latest, currentGeneration] = await Promise.all([
+          readHostSuspensionState(deps),
+          deps.getCurrentGeneration(),
+        ]);
+        if (
+          !latest
+          || latest.operationId !== observedOperationId
+          || latest.phase !== "stopped"
+          || latest.sandboxId !== input.sandbox.sandboxId
+          || currentGeneration.sandboxId !== input.sandbox.sandboxId
+          || currentGeneration.lifecycleAttemptId !== input.lifecycleAttemptId
+        ) return false;
+        await deps.clear();
+        return true;
+      });
+      if (cleared) {
+        logInfo("sandbox.host_suspension.same_name_replacement_thawed", {
+          operationId: observedOperationId,
+          sandboxId: input.sandbox.sandboxId,
+        });
+      }
+      return cleared;
+    }
+    const adopted = await withHostSuspensionStateLock(deps, async () => {
+      const [latest, currentGeneration] = await Promise.all([
+        readHostSuspensionState(deps),
+        deps.getCurrentGeneration(),
+      ]);
+      if (
+        !latest
+        || latest.operationId !== observedOperationId
+        || latest.phase !== "stopped"
+        || latest.sandboxId !== input.sandbox.sandboxId
+        || currentGeneration.sandboxId !== input.sandbox.sandboxId
+        || currentGeneration.lifecycleAttemptId !== input.lifecycleAttemptId
+      ) {
+        return null;
+      }
+      // A stable-name persistent resume rotates the host lifecycle attempt,
+      // while the stopped Gateway still owns the prior suspension lease.
+      // Adopt only that exact stopped sandbox into the current generation.
+      const next = {
+        ...latest,
+        lifecycleAttemptId: input.lifecycleAttemptId ?? null,
+        updatedAtMs: deps.now(),
+      };
+      await deps.write(next);
+      return next;
+    });
+    if (!adopted) return false;
+    state = adopted;
+    logInfo("sandbox.host_suspension.generation_adopted", {
+      operationId: state.operationId,
+      sandboxId: state.sandboxId,
+      lifecycleAttemptId: state.lifecycleAttemptId,
+    });
+  }
 
   const thawing = await writePhase(state, {
     phase: "thawing",

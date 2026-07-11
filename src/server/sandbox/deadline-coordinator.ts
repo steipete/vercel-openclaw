@@ -42,7 +42,7 @@ export type SandboxDeadlineState = {
   workflowScheduledDeadlineAtMs: number | null;
   updatedAtMs: number;
   lastAttemptAtMs: number | null;
-  lastOutcome: "armed" | "busy" | "error" | null;
+  lastOutcome: "armed" | "stopping" | "busy" | "error" | null;
   lastErrorCode: string | null;
   lastErrorClass: string | null;
 };
@@ -256,6 +256,10 @@ export async function armSandboxDeadline(
     const desiredDeadlineAtMs = committedActivityAtMs + desiredIdleMs;
     const existing = await deps.read();
     const current = sameGeneration(existing, latestMeta) ? existing : null;
+    // The lifecycle owner claimed this exact expired generation while holding
+    // the lifecycle lock. Activity may not reopen it behind the admission
+    // fence; the stop outcome will clear or re-arm the deadline.
+    if (current?.lastOutcome === "stopping") return null;
     const existingNativeStopDeadlineAtMs = current?.nativeStopDeadlineAtMs ?? null;
     const nativeStopDeadlineAtMs = options.nativeTimeoutRemainingMs === undefined
       ? existingNativeStopDeadlineAtMs
@@ -470,6 +474,43 @@ export type DeadlineStepResult =
   | { status: "done"; reason: string }
   | { status: "sleep"; deadlineAtMs: number };
 
+/**
+ * Seal an expired deadline after the caller owns the lifecycle lock. This
+ * establishes the only cross-lock order: lifecycle, then deadline.
+ */
+export async function claimSandboxDeadlineStop(
+  claim: { generationId: string; claimedAtMs: number },
+  deps: DeadlineCoordinatorDeps = defaultDeps,
+): Promise<boolean> {
+  const token = await acquireDeadlineLockWithRetry(deps);
+  if (!token) return false;
+  try {
+    const [state, meta] = await Promise.all([deps.read(), deps.getMeta()]);
+    if (
+      !state
+      || state.generationId !== claim.generationId
+      || state.lastAttemptAtMs !== claim.claimedAtMs
+      || !sameGeneration(state, meta)
+      || meta.status !== "running"
+    ) return false;
+    if (state.lastOutcome === "stopping") return true;
+    const activityDeadlineAtMs = typeof meta.lastAccessedAt === "number"
+      ? meta.lastAccessedAt + state.desiredIdleMs
+      : state.deadlineAtMs;
+    if (state.deadlineAtMs > deps.now() || activityDeadlineAtMs > deps.now()) {
+      return false;
+    }
+    await deps.write({
+      ...state,
+      lastOutcome: "stopping",
+      updatedAtMs: deps.now(),
+    });
+    return true;
+  } finally {
+    await deps.releaseLock(token);
+  }
+}
+
 export type DeadlineStepDeps = {
   read: () => Promise<SandboxDeadlineState | null>;
   write: (state: SandboxDeadlineState) => Promise<void>;
@@ -484,7 +525,10 @@ export type DeadlineStepDeps = {
     metaStatus: "uninitialized" | "stopped" | "error";
     lastError: string | null;
   }) => Promise<SingleMeta>;
-  stop: () => Promise<SingleMeta>;
+  stop: (claim: {
+    generationId: string;
+    claimedAtMs: number;
+  }) => Promise<SingleMeta>;
   now: () => number;
 };
 
@@ -515,9 +559,9 @@ const defaultStepDeps: DeadlineStepDeps = {
     meta.lastError = input.lastError;
     meta.lastGatewayProbeReady = false;
   }),
-  stop: async () => {
-    const { stopSandbox } = await import("@/server/sandbox/lifecycle");
-    return stopSandbox();
+  stop: async (claim) => {
+    const { stopSandboxForDeadline } = await import("@/server/sandbox/lifecycle");
+    return stopSandboxForDeadline(claim);
   },
   now: () => Date.now(),
 };
@@ -554,6 +598,12 @@ function deadlineSandboxIsGone(error: unknown): boolean {
   }
   return error instanceof Error
     && /^(?:HTTP\s+)?(?:404|410)(?:\b|:)/i.test(error.message.trim());
+}
+
+function deadlineStopClaimWasRevoked(error: unknown): boolean {
+  return error instanceof Error
+    && "code" in error
+    && error.code === "SANDBOX_LIFECYCLE_GUARD_REJECTED";
 }
 
 async function reconcileDeadlinePlatformDeparture(
@@ -609,6 +659,7 @@ export async function processSandboxDeadlineStep(
     };
   }
 
+  let lockReleased = false;
   try {
     const state = await deps.read();
     if (!state || state.generationId !== generationId) {
@@ -750,41 +801,75 @@ export async function processSandboxDeadlineStep(
       return { status: "sleep", deadlineAtMs: latest.deadlineAtMs };
     }
 
-    const stopped = await deps.stop();
+    // Never wait for the lifecycle lock while holding the deadline lock.
+    // The lifecycle owner seals this claim under the deadline lock before it
+    // begins suspension, preserving the canonical lifecycle -> deadline order.
+    await deps.releaseLock(token);
+    lockReleased = true;
+    const stopped = await deps.stop({ generationId, claimedAtMs });
     if (stopped.status === "snapshotting" || stopped.status === "stopped") {
-      await deps.clear();
+      const settleToken = await deps.acquireLock();
+      if (settleToken) {
+        try {
+          const current = await deps.read();
+          if (current?.generationId === generationId) await deps.clear();
+        } finally {
+          await deps.releaseLock(settleToken);
+        }
+      }
       return { status: "done", reason: `stop-${stopped.status}` };
     }
     throw new Error(`Unexpected stop status: ${stopped.status}`);
   } catch (error) {
-    const retryAfterMs = deadlineRetryAfterMs(error);
-    const identity = errorIdentity(error);
-    const retryCurrent = await deps.read();
-    if (!retryCurrent || retryCurrent.generationId !== generationId) {
-      return { status: "done", reason: "generation-replaced-or-cleared" };
+    let retryToken: string | null = null;
+    if (lockReleased) {
+      retryToken = await deps.acquireLock();
+      if (!retryToken) {
+        return { status: "sleep", deadlineAtMs: deps.now() + 1_000 };
+      }
     }
-    const retryAtMs = deps.now();
-    const retryDeadlineAtMs = retryAtMs + retryAfterMs;
-    const retryState: SandboxDeadlineState = {
-      ...retryCurrent,
-      deadlineAtMs: retryDeadlineAtMs,
-      workflowScheduledDeadlineAtMs: retryDeadlineAtMs,
-      updatedAtMs: retryAtMs,
-      lastAttemptAtMs: retryAtMs,
-      lastOutcome: error instanceof HostSuspensionBusyError ? "busy" : "error",
-      lastErrorCode: identity.code,
-      lastErrorClass: identity.className,
-    };
-    await deps.write(retryState);
-    logWarn("sandbox.deadline.stop_deferred", {
-      generationId,
-      sandboxId: retryCurrent.sandboxId,
-      retryAfterMs,
-      errorCode: identity.code,
-      errorClass: identity.className,
-    });
-    return { status: "sleep", deadlineAtMs: retryState.deadlineAtMs };
+    try {
+      if (deadlineStopClaimWasRevoked(error)) {
+        const current = await deps.read();
+        if (!current || current.generationId !== generationId) {
+          return { status: "done", reason: "generation-replaced-or-cleared" };
+        }
+        return {
+          status: "sleep",
+          deadlineAtMs: Math.max(current.deadlineAtMs, deps.now() + 1_000),
+        };
+      }
+      const retryAfterMs = deadlineRetryAfterMs(error);
+      const identity = errorIdentity(error);
+      const retryCurrent = await deps.read();
+      if (!retryCurrent || retryCurrent.generationId !== generationId) {
+        return { status: "done", reason: "generation-replaced-or-cleared" };
+      }
+      const retryAtMs = deps.now();
+      const retryDeadlineAtMs = retryAtMs + retryAfterMs;
+      const retryState: SandboxDeadlineState = {
+        ...retryCurrent,
+        deadlineAtMs: retryDeadlineAtMs,
+        workflowScheduledDeadlineAtMs: retryDeadlineAtMs,
+        updatedAtMs: retryAtMs,
+        lastAttemptAtMs: retryAtMs,
+        lastOutcome: error instanceof HostSuspensionBusyError ? "busy" : "error",
+        lastErrorCode: identity.code,
+        lastErrorClass: identity.className,
+      };
+      await deps.write(retryState);
+      logWarn("sandbox.deadline.stop_deferred", {
+        generationId,
+        sandboxId: retryCurrent.sandboxId,
+        retryAfterMs,
+        errorCode: identity.code,
+        errorClass: identity.className,
+      });
+      return { status: "sleep", deadlineAtMs: retryState.deadlineAtMs };
+    } finally {
+      if (retryToken) await deps.releaseLock(retryToken);
+    }
   } finally {
-    await deps.releaseLock(token);
+    if (!lockReleased) await deps.releaseLock(token);
   }
 }

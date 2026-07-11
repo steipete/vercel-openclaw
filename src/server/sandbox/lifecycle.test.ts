@@ -2511,8 +2511,9 @@ test("post-receipt takeover cannot be overwritten or delete the verified sandbox
   await withTestEnv(fake, async () => {
     configureBundleLifecycleTest();
     fake.onNetworkPolicy = async (policy) => {
-      const currentMeta = await getInitializedMeta();
-      if (!takeoverApplied && currentMeta.bundleIdentity !== null) {
+      // Fresh bootstrap applies the final firewall only after the bundle
+      // receipt is installed, but before publishing that receipt to host meta.
+      if (!takeoverApplied) {
         takeoverApplied = true;
         await mutateMeta((meta) => {
           meta.status = "running";
@@ -2892,6 +2893,45 @@ test("createAndBootstrapSandbox records successful firewall sync before running"
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+test("fresh Gateway startup reapplies a firewall policy changed during bootstrap", async () => {
+  const fake = new FakeSandboxController();
+  let updates = 0;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "uninitialized";
+      meta.snapshotId = null;
+      meta.gatewayToken = "test-gw-token";
+      meta.firewall.mode = "disabled";
+      meta.firewall.allowlist = [];
+    });
+    fake.onNetworkPolicy = async (policy) => {
+      updates += 1;
+      if (updates === 1) {
+        await mutateMeta((meta) => {
+          meta.firewall.mode = "enforcing";
+          meta.firewall.allowlist = ["api.openai.com"];
+        });
+      }
+      return policy;
+    };
+
+    const meta = await runCreatePath();
+
+    assert.equal(meta.status, "running");
+    const handle = fake.created.at(-1);
+    assert.ok(handle);
+    assert.equal(handle.networkPolicies.length, 2);
+    const finalPolicy = handle.networkPolicies.at(-1) as {
+      allow: string[] | Record<string, unknown[]>;
+    };
+    const finalDomains = Array.isArray(finalPolicy.allow)
+      ? finalPolicy.allow
+      : Object.keys(finalPolicy.allow);
+    assert.ok(finalDomains.includes("api.openai.com"));
   });
 });
 
@@ -6630,6 +6670,24 @@ test("resetSandbox deletes first and clears corrupt durable suspension state", a
     );
     assert.equal(reset.status, "uninitialized");
     assert.equal(reset.sandboxId, null);
+  });
+});
+
+test("resetSandbox rotates cron generation when metadata has no sandbox", async () => {
+  await withHarness(async () => {
+    const before = await getInitializedMeta();
+    assert.equal(before.status, "uninitialized");
+    assert.equal(before.sandboxId, null);
+
+    const reset = await resetSandbox({
+      origin: "https://app.example.com",
+      reason: "uninitialized-reset-test",
+    });
+
+    assert.equal(reset.status, "uninitialized");
+    assert.equal(reset.sandboxId, null);
+    assert.notEqual(reset.gatewayToken, before.gatewayToken);
+    assert.equal(reset.resetCronTransition, null);
   });
 });
 

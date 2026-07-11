@@ -439,6 +439,14 @@ export type SingleMeta = {
   pendingPersistentAutoSave: PendingPersistentAutoSave | null;
   /** Exact durable stop attempt allowed to reconcile snapshotting metadata. */
   activePersistentStop: ActivePersistentStop | null;
+  /** Crash-recoverable gateway/projection generation rotation for reset. */
+  resetCronTransition: {
+    sandboxId: string | null;
+    lifecycleAttemptId: string | null;
+    previousGatewayGeneration: string;
+    nextGatewayGeneration: string;
+    startedAt: number;
+  } | null;
   /** SDK-reported current snapshot ID when available; informational only. */
   currentSnapshotId?: string | null;
 
@@ -528,6 +536,7 @@ export function createDefaultMeta(
     persistedStateSource: null,
     pendingPersistentAutoSave: null,
     activePersistentStop: null,
+    resetCronTransition: null,
     currentSnapshotId: null,
     restorePreparedStatus: "unknown",
     restorePreparedReason: null,
@@ -700,7 +709,7 @@ export function ensureMetaShape(
         && Number.isSafeInteger(value.createdAt)
         && value.createdAt > 0
         ? {
-            sandboxId: value.sandboxId,
+            sandboxId: value.sandboxId as string,
             lifecycleAttemptId: value.lifecycleAttemptId as string | null,
             operationId: value.operationId as string | null,
             dynamicConfigHash: value.dynamicConfigHash,
@@ -727,6 +736,31 @@ export function ensureMetaShape(
             lifecycleAttemptId: value.lifecycleAttemptId as string | null,
             operationId: value.operationId as string | null,
             reason: value.reason,
+            startedAt: value.startedAt,
+          }
+        : null;
+    })(),
+    resetCronTransition: (() => {
+      const transition = (raw as Record<string, unknown>).resetCronTransition;
+      if (!transition || typeof transition !== "object" || Array.isArray(transition)) {
+        return null;
+      }
+      const value = transition as Record<string, unknown>;
+      return (typeof value.sandboxId === "string" || value.sandboxId === null)
+        && (typeof value.lifecycleAttemptId === "string"
+          || value.lifecycleAttemptId === null)
+        && typeof value.previousGatewayGeneration === "string"
+        && /^[a-f0-9]{32}$/.test(value.previousGatewayGeneration)
+        && typeof value.nextGatewayGeneration === "string"
+        && /^[a-f0-9]{32}$/.test(value.nextGatewayGeneration)
+        && typeof value.startedAt === "number"
+        && Number.isSafeInteger(value.startedAt)
+        && value.startedAt > 0
+        ? {
+            sandboxId: value.sandboxId as string | null,
+            lifecycleAttemptId: value.lifecycleAttemptId as string | null,
+            previousGatewayGeneration: value.previousGatewayGeneration,
+            nextGatewayGeneration: value.nextGatewayGeneration,
             startedAt: value.startedAt,
           }
         : null;

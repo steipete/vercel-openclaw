@@ -612,6 +612,7 @@ export async function clearLegacyCronStateAfterBaseline(
 export async function fenceCronProjectionStateForReset(
   options: {
     gatewayGeneration: string;
+    expectedGatewayGeneration: string | null;
     store?: Store;
     now?: () => number;
   },
@@ -619,11 +620,31 @@ export async function fenceCronProjectionStateForReset(
   if (!isHex(options.gatewayGeneration, 32)) {
     throw new Error("cron_projection_gateway_generation_invalid");
   }
+  if (
+    options.expectedGatewayGeneration !== null
+    && !isHex(options.expectedGatewayGeneration, 32)
+  ) {
+    throw new Error("cron_projection_expected_gateway_generation_invalid");
+  }
   const store = options.store ?? getStore();
   const now = options.now ?? Date.now;
   for (let attempt = 0; attempt < PROJECTION_CAS_ATTEMPTS; attempt += 1) {
     const state = await readCronProjectionState(store);
     const current = state.status === "valid" ? state.record : null;
+    if (
+      current?.gatewayGeneration === options.gatewayGeneration
+      && current.source === null
+      && current.dispatch.status === "none"
+    ) {
+      return { record: current, supersededWorkflowRunId: null };
+    }
+    if (
+      current
+      && current.gatewayGeneration !== null
+      && current.gatewayGeneration !== options.expectedGatewayGeneration
+    ) {
+      throw new Error("cron_projection_reset_generation_superseded");
+    }
     const resetAtMs = now();
     const next: CronProjectionRecordV1 = {
       schemaVersion: 1,

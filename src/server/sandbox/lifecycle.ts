@@ -83,6 +83,7 @@ import {
   clearInactiveHostSuspension,
   clearHostSuspensionAfterDelete,
   ensureHostStopMonitor,
+  getHostMutationFence,
   HostSuspensionBusyError,
   HostSuspensionStateCorruptError,
   HOST_STOP_REQUEST_MAX_MS,
@@ -117,7 +118,6 @@ import {
   tokenRefreshLockKey,
 } from "@/server/store/keyspace";
 import {
-  clearLegacyCronStateForReset,
   fenceCronProjectionStateForReset,
   normalizeResetCronProjectionGeneration,
 } from "@/server/cron/projection";
@@ -133,6 +133,7 @@ import {
 } from "@/server/sandbox/hot-spare";
 import {
   armSandboxDeadline,
+  claimSandboxDeadlineStop,
   clearSandboxDeadline,
   readSandboxDeadlineRemainingMs,
 } from "@/server/sandbox/deadline-coordinator";
@@ -319,6 +320,32 @@ async function validateSlackCredentialsForRestore(
 // Gateway restart helper
 // ---------------------------------------------------------------------------
 
+async function assertRunningGatewayMutationAllowed(input: {
+  sandboxId: string;
+  lifecycleAttemptId: string | null;
+  lease: AutoRenewedLockLease;
+}): Promise<void> {
+  await input.lease.assertOwned();
+  const [fence, meta] = await Promise.all([
+    getHostMutationFence(),
+    getInitializedMeta(),
+  ]);
+  if (fence) {
+    throw new ApiError(
+      409,
+      "HOST_SUSPENSION_CONFLICT",
+      "Gateway configuration cannot restart while lifecycle suspension is fenced.",
+    );
+  }
+  if (
+    meta.status !== "running"
+    || meta.sandboxId !== input.sandboxId
+    || (meta.lifecycleAttemptId ?? null) !== input.lifecycleAttemptId
+  ) {
+    throw new LifecycleLockOwnershipLostError();
+  }
+}
+
 /**
  * Kill the running gateway and launch a new one via the on-disk restart script.
  * The script reads tokens from disk and uses setsid to background the gateway.
@@ -326,24 +353,47 @@ async function validateSlackCredentialsForRestore(
 async function restartGateway(
   sandbox: SandboxHandle,
   reason: string = "unspecified",
+  assertCurrent?: () => Promise<void>,
 ): Promise<void> {
   const startedAt = Date.now();
   logInfo("gateway.restart_started", {
     sandboxId: sandbox.sandboxId,
     reason,
   });
-  const result = await sandbox.runCommand("bash", [OPENCLAW_GATEWAY_RESTART_SCRIPT_PATH]);
-  if (result.exitCode !== 0) {
+  // Split shutdown from launch. The second ownership assertion renews the
+  // lifecycle lease immediately before the short launch-only command, so a
+  // successor cannot prepare suspension between a long shutdown and launch.
+  await assertCurrent?.();
+  const stopped = await sandbox.runCommand({
+    cmd: "bash",
+    args: [OPENCLAW_GATEWAY_RESTART_SCRIPT_PATH],
+    env: { OPENCLAW_RESTART_PHASE: "kill" },
+  });
+  if (stopped.exitCode !== 0) {
     throw new CommandFailedError({
-      command: "bash restart-gateway",
-      exitCode: result.exitCode,
-      output: await result.output("both"),
+      command: "bash restart-gateway kill",
+      exitCode: stopped.exitCode,
+      output: await stopped.output("both"),
     });
   }
+  await assertCurrent?.();
+  const started = await sandbox.runCommand({
+    cmd: "bash",
+    args: [OPENCLAW_GATEWAY_RESTART_SCRIPT_PATH],
+    env: { OPENCLAW_RESTART_PHASE: "start" },
+  });
+  if (started.exitCode !== 0) {
+    throw new CommandFailedError({
+      command: "bash restart-gateway start",
+      exitCode: started.exitCode,
+      output: await started.output("both"),
+    });
+  }
+  await assertCurrent?.();
   logInfo("gateway.restart_completed", {
     sandboxId: sandbox.sandboxId,
     durationMs: Date.now() - startedAt,
-    exitCode: result.exitCode,
+    exitCode: started.exitCode,
     reason,
   });
 }
@@ -1363,7 +1413,10 @@ export async function resetSandbox(
   deps: ResetSandboxDeps = {},
 ): Promise<SingleMeta> {
   const deleteSnapshot = deps.deleteSnapshot ?? deleteVercelSnapshot;
-  let resetTarget: Pick<SingleMeta, "sandboxId" | "lifecycleAttemptId"> | null = null;
+  let resetTarget: Pick<
+    SingleMeta,
+    "sandboxId" | "lifecycleAttemptId" | "gatewayToken"
+  > | null = null;
   let sandboxDestroyed = false;
   let destroyedSandboxId: string | null = null;
   let destroyedOperationId: string | null = null;
@@ -1408,6 +1461,20 @@ export async function resetSandbox(
       resetTarget = {
         sandboxId: current.sandboxId,
         lifecycleAttemptId: current.lifecycleAttemptId,
+        gatewayToken: current.gatewayToken,
+      };
+      const assertResetGeneration = async (): Promise<void> => {
+        await lease.assertOwned();
+        const latest = await getInitializedMeta();
+        if (
+          !resetTarget
+          || latest.sandboxId !== resetTarget.sandboxId
+          || (latest.lifecycleAttemptId ?? null)
+            !== (resetTarget.lifecycleAttemptId ?? null)
+          || latest.gatewayToken !== resetTarget.gatewayToken
+        ) {
+          throw new LifecycleLockOwnershipLostError();
+        }
       };
       const snapshotIds = collectTrackedSnapshotIds(current);
 
@@ -1424,6 +1491,7 @@ export async function resetSandbox(
             resetTarget = {
               sandboxId,
               lifecycleAttemptId: current.lifecycleAttemptId,
+              gatewayToken: current.gatewayToken,
             };
           }
         },
@@ -1438,10 +1506,13 @@ export async function resetSandbox(
         snapshotIds,
         deleteSnapshot,
         ctx,
-        lease,
+        assertResetGeneration,
       );
       await lease.assertOwned();
-      await clearResetCronState(ctx);
+      await clearResetCronState(ctx, {
+        lease,
+        expected: resetTarget,
+      });
       await lease.assertOwned();
 
       if (failedSnapshotIds.length > 0) {
@@ -1598,6 +1669,7 @@ async function cleanupBeforeSnapshot(
 type StopSandboxInternalOptions = {
   deadlineAtMs?: number;
   pendingAutoSave?: PersistentAutoSaveInput;
+  lifecycleGuard?: SandboxLifecycleGuard;
 };
 
 async function stopSandboxWithOptions(
@@ -1606,6 +1678,7 @@ async function stopSandboxWithOptions(
   logInfo("sandbox.stop_requested");
   try {
     return await withLifecycleLock(async (lease) => {
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
       const meta = await getInitializedMeta();
       if (meta.status === "stopped") {
         await markHostSuspensionStopped();
@@ -1639,6 +1712,7 @@ async function stopSandboxWithOptions(
       logInfo("sandbox.stopping", { sandboxId: meta.sandboxId });
       try {
         const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
+        await assertLifecycleGuardCurrent(options.lifecycleGuard);
         const stoppedMeta = await requestCooperativePersistentStop({
           meta,
           sandbox,
@@ -1748,6 +1822,15 @@ async function stopSandboxWithOptions(
 
 export async function stopSandbox(): Promise<SingleMeta> {
   return stopSandboxWithOptions();
+}
+
+export async function stopSandboxForDeadline(claim: {
+  generationId: string;
+  claimedAtMs: number;
+}): Promise<SingleMeta> {
+  return stopSandboxWithOptions({
+    lifecycleGuard: () => claimSandboxDeadlineStop(claim),
+  });
 }
 
 export async function snapshotSandbox(): Promise<SingleMeta> {
@@ -1926,6 +2009,27 @@ export async function markSandboxPortUrlStale(
  * No-op when the sandbox is not running.
  */
 export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult> {
+  try {
+    return await withLifecycleLock(syncGatewayConfigToSandboxWithinLifecycleLock);
+  } catch (error) {
+    const reason = error instanceof LifecycleLockUnavailableError
+      ? "lifecycle_lock_contended"
+      : error instanceof Error
+        ? error.message
+        : String(error);
+    logWarn("sandbox.config_sync_failed", { reason });
+    return {
+      outcome: "failed",
+      reason,
+      liveConfigFresh: false,
+      operatorMessage: "Config sync could not acquire the current sandbox lifecycle generation.",
+    };
+  }
+}
+
+async function syncGatewayConfigToSandboxWithinLifecycleLock(
+  lease: AutoRenewedLockLease,
+): Promise<LiveConfigSyncResult> {
   const meta = await getInitializedMeta();
   if (meta.status !== "running" || !meta.sandboxId) {
     logInfo("sandbox.config_sync_skipped", {
@@ -1957,7 +2061,12 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
 
   const sandboxId = meta.sandboxId;
   try {
-    const sandbox = await getSandboxController().get({ sandboxId });
+    const sandbox = await getSandboxController().get({ sandboxId, resume: false });
+    await assertRunningGatewayMutationAllowed({
+      sandboxId,
+      lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+      lease,
+    });
     await sandbox.writeFiles(files);
     logInfo("sandbox.config_sync_written", {
       sandboxId,
@@ -1970,7 +2079,12 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
     // wire up new routes like /slack/events.
     const restartStartedAt = Date.now();
     try {
-      await restartGateway(sandbox, "config-sync");
+      await restartGateway(sandbox, "config-sync", () =>
+        assertRunningGatewayMutationAllowed({
+          sandboxId,
+          lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+          lease,
+        }));
     } catch (restartErr) {
       logWarn("sandbox.config_sync_restart_failed", {
         sandboxId,
@@ -1992,7 +2106,10 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
     // the restart.
     let invalidatedPortUrls: Record<string, string> | null = null;
     await mutateMeta((next) => {
-      if (next.sandboxId !== sandboxId) return;
+      if (
+        next.sandboxId !== sandboxId
+        || (next.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+      ) return;
       if (!next.portUrls) return;
       invalidatedPortUrls = { ...next.portUrls };
       next.portUrls = null;
@@ -2015,8 +2132,16 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
       telegramConfigured: Boolean(meta.channels.telegram),
     });
 
-    await mutateMeta((next) => {
-      if (next.sandboxId !== sandboxId) return;
+    await assertRunningGatewayMutationAllowed({
+      sandboxId,
+      lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+      lease,
+    });
+    const synchronized = await mutateMeta((next) => {
+      if (
+        next.sandboxId !== sandboxId
+        || (next.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+      ) return;
       if (next.channels.telegram) {
         next.lastRestoreMetrics = {
           ...(next.lastRestoreMetrics ?? buildConfigSyncRestoreMetricsPatch()),
@@ -2029,6 +2154,18 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
         };
       }
     });
+    await assertRunningGatewayMutationAllowed({
+      sandboxId,
+      lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+      lease,
+    });
+    if (
+      synchronized.sandboxId !== sandboxId
+      || (synchronized.lifecycleAttemptId ?? null)
+        !== (meta.lifecycleAttemptId ?? null)
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
 
     logInfo("sandbox.config_sync_restarted", { sandboxId });
     return { outcome: "applied", reason: "config_written_and_restarted", liveConfigFresh: true, operatorMessage: null };
@@ -2071,8 +2208,38 @@ export type DynamicConfigReconcileResult = {
 export async function ensureRunningSandboxDynamicConfigFresh(input: {
   origin: string;
   op?: OperationContext;
+  expectedSandboxId?: string;
+  expectedLifecycleAttemptId?: string | null;
 }): Promise<DynamicConfigReconcileResult> {
+  try {
+    return await withLifecycleLock((lease) =>
+      ensureRunningSandboxDynamicConfigFreshWithinLifecycleLock(input, lease));
+  } catch (error) {
+    logWarn("sandbox.config_reconcile.lifecycle_unavailable", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { verified: false, changed: false, reason: "sandbox-unavailable" };
+  }
+}
+
+async function ensureRunningSandboxDynamicConfigFreshWithinLifecycleLock(
+  input: {
+    origin: string;
+    op?: OperationContext;
+    expectedSandboxId?: string;
+    expectedLifecycleAttemptId?: string | null;
+  },
+  lease: AutoRenewedLockLease,
+): Promise<DynamicConfigReconcileResult> {
   const meta = await getInitializedMeta();
+  if (
+    (input.expectedSandboxId !== undefined
+      && meta.sandboxId !== input.expectedSandboxId)
+    || (input.expectedLifecycleAttemptId !== undefined
+      && (meta.lifecycleAttemptId ?? null) !== input.expectedLifecycleAttemptId)
+  ) {
+    return { verified: false, changed: false, reason: "sandbox-unavailable" };
+  }
   if (meta.status !== "running" || !meta.sandboxId) {
     logInfo("sandbox.config_reconcile.skipped", {
       reason: "sandbox_unavailable",
@@ -2139,7 +2306,12 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
 
   let sandbox: SandboxHandle;
   try {
-    sandbox = await getSandboxController().get({ sandboxId });
+    sandbox = await getSandboxController().get({ sandboxId, resume: false });
+    await assertRunningGatewayMutationAllowed({
+      sandboxId,
+      lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+      lease,
+    });
   } catch (error) {
     logWarn("sandbox.config_reconcile.sandbox_lookup_failed", {
       sandboxId,
@@ -2164,7 +2336,12 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
 
   // Restart the gateway so it picks up the new config.
   try {
-    await restartGateway(sandbox);
+    await restartGateway(sandbox, "dynamic-config-reconcile", () =>
+      assertRunningGatewayMutationAllowed({
+        sandboxId,
+        lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+        lease,
+      }));
     logInfo("sandbox.config_reconcile.checkpoint_after_restart", { sandboxId });
   } catch (error) {
     logWarn("sandbox.config_reconcile.restart_failed", {
@@ -2177,7 +2354,11 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
   // Update runtime truth only. Prepared persisted-state truth is stamped only
   // by prepare/manual snapshot paths, so mark restore target dirty when
   // the running sandbox diverges.
-  await mutateMeta((next) => {
+  const updated = await mutateMeta((next) => {
+    if (
+      next.sandboxId !== sandboxId
+      || (next.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+    ) return;
     next.runtimeDynamicConfigHash = expectedHash;
     if (
       next.restorePreparedStatus === "ready" ||
@@ -2194,6 +2375,13 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
     next.restoreOracle.pendingReason = "dynamic-config-changed";
     next.restoreOracle.lastBlockedReason = null;
   });
+  if (
+    updated.sandboxId !== sandboxId
+    || (updated.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+    || updated.runtimeDynamicConfigHash !== expectedHash
+  ) {
+    throw new LifecycleLockOwnershipLostError();
+  }
 
   logInfo("sandbox.config_reconcile.checkpoint_verified", {
     sandboxId,
@@ -2504,6 +2692,8 @@ export async function prepareRestoreTarget(input: {
   const reconcileResult = await ensureRunningSandboxDynamicConfigFresh({
     origin: input.origin,
     op: input.op,
+    expectedSandboxId: meta.sandboxId,
+    expectedLifecycleAttemptId: meta.lifecycleAttemptId ?? null,
   });
   actions.push({
     id: "reconcile-dynamic-config",
@@ -5345,11 +5535,14 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       }
 
       if (persistedSandbox.status === "stopped") {
-        await options?.lease?.assertOwned();
+        await assertAcquiredSandboxOwnership(persistedSandbox);
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
         const resumed = await getSandboxController().get({
           sandboxId: persistedSandbox.sandboxId,
           resume: true,
         });
+        await assertAcquiredSandboxOwnership(resumed);
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
         if (resumed.status !== "running") {
           throw new ApiError(
             503,
@@ -5522,6 +5715,10 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       // starts. Install the fresh credential transform before that boundary.
       const firewallStart = Date.now();
       try {
+        await assertSandboxGenerationOwnership(
+          initialSandbox,
+          bundleMode && sandboxIsBundleCandidate,
+        );
         progress.setPhase(
           "applying-firewall",
           `Applying ${latest.firewall.mode} firewall policy`,
@@ -5531,6 +5728,10 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           latest,
           freshApiKey,
           requiredControlPlaneDomains(latest, origin),
+        );
+        await assertSandboxGenerationOwnership(
+          initialSandbox,
+          bundleMode && sandboxIsBundleCandidate,
         );
       } catch (err) {
         const firewallError = err instanceof Error ? err.message : String(err);
@@ -5586,6 +5787,10 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
 
       const fastRestoreStart = Date.now();
       await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+      await assertSandboxGenerationOwnership(
+        initialSandbox,
+        bundleMode && sandboxIsBundleCandidate,
+      );
       const restoreResult = await sandbox.runCommand({
         cmd: "bash",
         args: [
@@ -5773,6 +5978,14 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     // Reuse the already-resolved credential for firewall policy transforms.
     const apiKey = credential?.token;
     const slackCfg = await validateSlackCredentialsForRestore(latest.channels.slack);
+    let startupFirewallMode = latest.firewall.mode;
+    let startupFirewallAllowlist = [...latest.firewall.allowlist];
+    let startupFirewallControlPlaneDomains = requiredControlPlaneDomains(latest, origin);
+    let startupFirewallAppliedAtBoundary = false;
+    let firewallApplied = false;
+    let firewallError: string | null = null;
+    let firewallStartedAt = 0;
+    let firewallCompletedAt = 0;
     await assertLifecycleGuardCurrent(options?.lifecycleGuard);
     const setupResult = await setupOpenClaw(initialSandbox, {
       gatewayToken: latest.gatewayToken,
@@ -5782,8 +5995,119 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       telegramWebhookSecret: latest.channels.telegram?.webhookSecret,
       slackCredentials: slackCfg ?? undefined,
       progress,
-      beforeGatewayStart: () =>
-        assertLifecycleGuardCurrent(options?.lifecycleGuard),
+      beforeGatewayStart: async () => {
+        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+        await assertSandboxGenerationOwnership(
+          initialSandbox,
+          bundleMode && sandboxIsBundleCandidate,
+        );
+        firewallStartedAt = Date.now();
+        let policyMeta = await getInitializedMeta();
+        for (let policyAttempt = 0; policyAttempt < 4; policyAttempt += 1) {
+          startupFirewallMode = policyMeta.firewall.mode;
+          startupFirewallAllowlist = [...policyMeta.firewall.allowlist];
+          startupFirewallControlPlaneDomains = requiredControlPlaneDomains(
+            policyMeta,
+            origin,
+          );
+          firewallApplied = false;
+          firewallError = null;
+          try {
+            progress.setPhase(
+              "applying-firewall",
+              `Applying ${policyMeta.firewall.mode} firewall policy`,
+            );
+            await applyFirewallPolicyToSandbox(
+              initialSandbox,
+              policyMeta,
+              apiKey,
+              startupFirewallControlPlaneDomains,
+            );
+            firewallApplied = true;
+          } catch (error) {
+            firewallError = error instanceof Error ? error.message : String(error);
+            logWarn("sandbox.create.firewall_sync_failed", ctx({
+              sandboxId: initialSandbox.sandboxId,
+              mode: policyMeta.firewall.mode,
+              error: firewallError,
+            }));
+            if (policyMeta.firewall.mode === "enforcing") {
+              await assertSandboxGenerationOwnership(
+              initialSandbox,
+              bundleMode && sandboxIsBundleCandidate,
+            );
+            await initialSandbox.stop({ blocking: true });
+            await assertSandboxGenerationOwnership(
+              initialSandbox,
+              bundleMode && sandboxIsBundleCandidate,
+            );
+            const failedAt = Date.now();
+            const policyHash = computePolicyHash(
+              policyMeta.firewall.mode,
+              policyMeta.firewall.allowlist,
+              requiredControlPlaneDomains(policyMeta, origin),
+            );
+            await mutateMeta((meta) => {
+              if (
+                meta.lifecycleAttemptId !== attemptId
+                || meta.sandboxId !== initialSandbox.sandboxId
+              ) return;
+              meta.firewall.lastSyncReason = "create-policy-failed";
+              meta.firewall.lastSyncOutcome = {
+                timestamp: failedAt,
+                durationMs: failedAt - firewallStartedAt,
+                allowlistCount: policyMeta.firewall.allowlist.length,
+                policyHash,
+                applied: false,
+                reason: "create-policy-failed",
+              };
+              meta.firewall.lastSyncFailedAt = failedAt;
+              meta.status = "error";
+              meta.lastError = `Firewall sync failed during create: ${firewallError}`;
+              meta.sandboxId = null;
+              meta.portUrls = null;
+            });
+            throw new Error(
+              `Firewall sync failed during create: ${firewallError}`,
+              { cause: error },
+            );
+            }
+          }
+          await assertSandboxGenerationOwnership(
+            initialSandbox,
+            bundleMode && sandboxIsBundleCandidate,
+          );
+          const latestPolicyMeta = await getInitializedMeta();
+          const latestControlPlaneDomains = requiredControlPlaneDomains(
+            latestPolicyMeta,
+            origin,
+          );
+          const appliedHash = computePolicyHash(
+            startupFirewallMode,
+            startupFirewallAllowlist,
+            startupFirewallControlPlaneDomains,
+          );
+          const latestHash = computePolicyHash(
+            latestPolicyMeta.firewall.mode,
+            latestPolicyMeta.firewall.allowlist,
+            latestControlPlaneDomains,
+          );
+          if (appliedHash === latestHash) {
+            startupFirewallAppliedAtBoundary = true;
+            break;
+          }
+          if (policyAttempt === 3) {
+            throw new Error("Firewall policy changed repeatedly during Gateway startup.");
+          }
+          policyMeta = latestPolicyMeta;
+        }
+        firewallCompletedAt = Date.now();
+        // No Gateway process may be launched after lifecycle ownership moves.
+        await assertSandboxGenerationOwnership(
+          initialSandbox,
+          bundleMode && sandboxIsBundleCandidate,
+        );
+      },
     });
     await assertLifecycleGuardCurrent(options?.lifecycleGuard);
 
@@ -5856,36 +6180,15 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       }
     };
 
-    // Apply firewall policy and record structured outcome before marking running.
-    const firewallPolicyHash = computePolicyHash(
-      pending.firewall.mode,
-      pending.firewall.allowlist,
-      requiredControlPlaneDomains(pending, origin),
-    );
-
-    let firewallApplied = false;
-    let firewallError: string | null = null;
-    const firewallStartedAt = Date.now();
-    try {
-      await assertCommittedSandboxOwnership();
-      progress.setPhase("applying-firewall", `Applying ${pending.firewall.mode} firewall policy`);
-      await applyFirewallPolicyToSandbox(
-        sandbox,
-        pending,
-        apiKey,
-        requiredControlPlaneDomains(pending, origin),
-      );
-      await assertCommittedSandboxOwnership();
-      firewallApplied = true;
-    } catch (err) {
-      firewallError = err instanceof Error ? err.message : String(err);
-      logWarn("sandbox.create.firewall_sync_failed", ctx({
-        sandboxId: sandbox.sandboxId,
-        mode: pending.firewall.mode,
-        error: firewallError,
-      }));
+    if (!startupFirewallAppliedAtBoundary) {
+      throw new Error("Gateway startup did not apply its firewall policy.");
     }
-    const firewallCompletedAt = Date.now();
+    // The exact policy above was installed at the Gateway launch boundary.
+    const firewallPolicyHash = computePolicyHash(
+      startupFirewallMode,
+      startupFirewallAllowlist,
+      startupFirewallControlPlaneDomains,
+    );
     const firewallDurationMs = firewallCompletedAt - firewallStartedAt;
 
     // Record firewall sync outcome in metadata.
@@ -5895,7 +6198,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       const outcome: import("@/shared/types").FirewallSyncOutcome = {
         timestamp: firewallCompletedAt,
         durationMs: firewallDurationMs,
-        allowlistCount: pending.firewall.allowlist.length,
+        allowlistCount: startupFirewallAllowlist.length,
         policyHash: firewallPolicyHash,
         applied: firewallApplied,
         reason: firewallApplied ? "create-policy-applied" : "create-policy-failed",
@@ -5914,7 +6217,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
 
     // In enforcing mode, firewall sync failure is a hard blocker — the
     // sandbox must not become available without its network policy applied.
-    if (!firewallApplied && pending.firewall.mode === "enforcing") {
+    if (!firewallApplied && startupFirewallMode === "enforcing") {
       logError("sandbox.create.firewall_sync_blocked_create", ctx({
         sandboxId: sandbox.sandboxId,
         error: firewallError,
@@ -6280,6 +6583,7 @@ async function destroyCurrentSandboxWithoutSnapshot(
             // no potentially suspended Gateway can survive a fail-open repair.
             await options.lease.assertOwned();
             await sandbox.delete();
+            await options.lease.assertOwned();
             sandboxDestroyed = true;
             options.onSandboxDestroyed(sandbox.sandboxId, cleanupOperationId);
             await clearHostSuspensionAfterDelete({
@@ -6315,6 +6619,7 @@ async function destroyCurrentSandboxWithoutSnapshot(
       // race even though reset intentionally discards the restore target.
       await options.lease.assertOwned();
       await sandbox.delete();
+      await options.lease.assertOwned();
       sandboxDestroyed = true;
       options.onSandboxDestroyed(sandbox.sandboxId, cleanupOperationId);
       await clearSandboxDeadline(sandbox.sandboxId, {
@@ -6393,15 +6698,15 @@ async function deleteTrackedSnapshotsForReset(
   snapshotIds: string[],
   deleteSnapshot: (snapshotId: string) => Promise<void>,
   ctx: (extra?: Record<string, unknown>) => Record<string, unknown>,
-  lease: AutoRenewedLockLease,
+  assertResetGeneration: () => Promise<void>,
 ): Promise<string[]> {
   const failedSnapshotIds: string[] = [];
 
   for (const snapshotId of snapshotIds) {
     try {
-      await lease.assertOwned();
+      await assertResetGeneration();
       await deleteSnapshot(snapshotId);
-      await lease.assertOwned();
+      await assertResetGeneration();
       logInfo("sandbox.reset.snapshot_deleted", ctx({ snapshotId }));
     } catch (error) {
       if (error instanceof LifecycleLockOwnershipLostError) throw error;
@@ -6423,40 +6728,99 @@ async function deleteTrackedSnapshotsForReset(
 
 async function clearResetCronState(
   ctx: (extra?: Record<string, unknown>) => Record<string, unknown>,
+  options: {
+    lease: AutoRenewedLockLease;
+    expected: Pick<
+      SingleMeta,
+      "sandboxId" | "lifecycleAttemptId" | "gatewayToken"
+    >;
+  },
 ): Promise<void> {
-  const current = await getInitializedMeta();
-  const previousGatewayGeneration = createHash("sha256")
-    .update(current.gatewayToken)
-    .digest("hex")
-    .slice(0, 32);
-  const nextGatewayValue = randomUUID();
-  const gatewayGeneration = createHash("sha256")
-    .update(nextGatewayValue)
-    .digest("hex")
-    .slice(0, 32);
-  const fenced = await fenceCronProjectionStateForReset({ gatewayGeneration });
-  try {
-    await mutateMeta((meta) => {
-      if (meta.gatewayToken !== current.gatewayToken) {
+  const assertCurrent = async (gatewayToken: string): Promise<SingleMeta> => {
+    await options.lease.assertOwned();
+    const current = await getInitializedMeta();
+    if (
+      current.sandboxId !== options.expected.sandboxId
+      || (current.lifecycleAttemptId ?? null)
+        !== (options.expected.lifecycleAttemptId ?? null)
+      || current.gatewayToken !== gatewayToken
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+    return current;
+  };
+  const current = await assertCurrent(options.expected.gatewayToken);
+  let transition = current.resetCronTransition;
+  let nextGatewayValue = current.gatewayToken;
+  if (transition) {
+    const currentGeneration = createHash("sha256")
+      .update(current.gatewayToken)
+      .digest("hex")
+      .slice(0, 32);
+    if (
+      transition.sandboxId !== options.expected.sandboxId
+      || transition.lifecycleAttemptId
+        !== (options.expected.lifecycleAttemptId ?? null)
+      || transition.nextGatewayGeneration !== currentGeneration
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+  } else {
+    nextGatewayValue = randomUUID();
+    transition = {
+      sandboxId: options.expected.sandboxId,
+      lifecycleAttemptId: options.expected.lifecycleAttemptId ?? null,
+      previousGatewayGeneration: createHash("sha256")
+        .update(current.gatewayToken)
+        .digest("hex")
+        .slice(0, 32),
+      nextGatewayGeneration: createHash("sha256")
+        .update(nextGatewayValue)
+        .digest("hex")
+        .slice(0, 32),
+      startedAt: Date.now(),
+    };
+    const committed = await mutateMeta((meta) => {
+      if (
+        meta.sandboxId !== options.expected.sandboxId
+        || (meta.lifecycleAttemptId ?? null)
+          !== (options.expected.lifecycleAttemptId ?? null)
+        || meta.gatewayToken !== current.gatewayToken
+        || meta.resetCronTransition !== null
+      ) {
         throw new Error("sandbox_reset_gateway_token_changed");
       }
       meta.gatewayToken = nextGatewayValue;
+      meta.resetCronTransition = transition;
     });
-  } catch (error) {
-    try {
-      await normalizeResetCronProjectionGeneration({
-        gatewayGeneration: previousGatewayGeneration,
-      });
-    } catch (rollbackError) {
-      throw new AggregateError(
-        [error, rollbackError],
-        "Sandbox reset gateway-token commit and projection rollback failed.",
-      );
-    }
-    throw error;
+    if (
+      committed.gatewayToken !== nextGatewayValue
+      || committed.resetCronTransition?.nextGatewayGeneration
+        !== transition.nextGatewayGeneration
+    ) throw new LifecycleLockOwnershipLostError();
   }
-  await clearLegacyCronStateForReset();
+  await assertCurrent(nextGatewayValue);
+  const fenced = await fenceCronProjectionStateForReset({
+    gatewayGeneration: transition.nextGatewayGeneration,
+    expectedGatewayGeneration: transition.previousGatewayGeneration,
+  });
+  await assertCurrent(nextGatewayValue);
   await cancelSupersededCronWake(fenced.supersededWorkflowRunId);
+  await assertCurrent(nextGatewayValue);
+  const completed = await mutateMeta((meta) => {
+    if (
+      meta.sandboxId !== options.expected.sandboxId
+      || (meta.lifecycleAttemptId ?? null)
+        !== (options.expected.lifecycleAttemptId ?? null)
+      || meta.gatewayToken !== nextGatewayValue
+      || meta.resetCronTransition?.nextGatewayGeneration
+        !== transition.nextGatewayGeneration
+    ) return;
+    meta.resetCronTransition = null;
+  });
+  if (completed.resetCronTransition !== null) {
+    throw new LifecycleLockOwnershipLostError();
+  }
   logInfo("sandbox.reset.cron_state_fenced", ctx());
 }
 
@@ -6475,6 +6839,7 @@ function clearSandboxRuntimeStateForReset(meta: SingleMeta): void {
   meta.persistedStateSource = null;
   meta.pendingPersistentAutoSave = null;
   meta.activePersistentStop = null;
+  meta.resetCronTransition = null;
   meta.currentSnapshotId = null;
   meta.restorePreparedStatus = "unknown";
   meta.restorePreparedReason = null;
@@ -6533,6 +6898,25 @@ async function withLifecycleLock<T>(
     },
     fn,
   );
+}
+
+/** Serialize external runtime mutations with Gateway start/stop boundaries. */
+export async function withSandboxLifecycleMutationLock<T>(
+  action: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await withLifecycleLock(async (lease) => {
+      await lease.assertOwned();
+      const result = await action();
+      await lease.assertOwned();
+      return result;
+    });
+  } catch (error) {
+    if (error instanceof LifecycleLockUnavailableError) {
+      throw new SandboxLifecycleLockContendedError();
+    }
+    throw error;
+  }
 }
 
 async function withAutoRenewedLock<T>(

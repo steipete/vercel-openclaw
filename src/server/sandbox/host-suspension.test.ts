@@ -352,6 +352,77 @@ test("replacement sandbox retires a stopped fence from the prior process", async
   assert.equal(h.readState(), null);
 });
 
+test("same-name persistent resume adopts a stopped fence into the new lifecycle attempt", async () => {
+  const calls: string[] = [];
+  const h = harness(async <T>(input: { method: string }) => {
+    calls.push(input.method);
+    if (input.method === "gateway.suspend.prepare") {
+      return {
+        status: "ready",
+        suspensionId: "suspension-stable-name",
+        expiresAtMs: 10_000,
+      } as T;
+    }
+    if (input.method === "gateway.suspend.status") {
+      return { status: "ready", expiresAtMs: 10_000 } as T;
+    }
+    return { ok: true, status: "running", resumed: true } as T;
+  });
+  const prepared = await prepareHostSuspension({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    reason: "stable-name-resume-test",
+  }, h.deps);
+  await markHostSuspensionStopped(prepared.operationId, h.deps);
+  h.setCurrentGeneration({
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: "lifecycle-attempt-2",
+  });
+
+  assert.equal(await thawHostSuspensionIfNeeded({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: "lifecycle-attempt-2",
+  }, h.deps), true);
+  assert.equal(h.readState()?.lifecycleAttemptId, "lifecycle-attempt-2");
+  assert.equal(h.readState()?.phase, "running");
+  assert.equal(h.readState()?.ingressFenced, false);
+  assert.deepEqual(calls, [
+    "gateway.suspend.prepare",
+    "gateway.suspend.status",
+    "gateway.suspend.status",
+    "gateway.suspend.resume",
+  ]);
+});
+
+test("same-name replacement clears an old stopped fence when the lease is absent", async () => {
+  const h = harness(async <T>(input: { method: string }) => {
+    if (input.method === "gateway.suspend.prepare") {
+      return {
+        status: "ready",
+        suspensionId: "suspension-old-process",
+        expiresAtMs: 10_000,
+      } as T;
+    }
+    return { status: "running" } as T;
+  });
+  const prepared = await prepareHostSuspension({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    reason: "same-name-replacement-test",
+  }, h.deps);
+  await markHostSuspensionStopped(prepared.operationId, h.deps);
+  h.setCurrentGeneration({
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: "replacement-attempt",
+  });
+
+  assert.equal(await thawHostSuspensionIfNeeded({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: "replacement-attempt",
+  }, h.deps), true);
+  assert.equal(h.readState(), null);
+});
+
 test("stale replacement caller cannot clear the current generation fence", async () => {
   const h = harness(async <T>() => ({
     status: "ready",

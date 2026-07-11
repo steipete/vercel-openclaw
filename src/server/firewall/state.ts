@@ -20,6 +20,7 @@ import { logDebug, logInfo, logWarn } from "@/server/log";
 import { getSandboxController } from "@/server/sandbox/controller";
 import { resolveAiGatewayCredentialOptional } from "@/server/env";
 import { getPublicOrigin } from "@/server/public-url";
+import { withSandboxLifecycleMutationLock } from "@/server/sandbox/lifecycle";
 
 const EVENT_RETENTION = 1000;
 const LEARNED_RETENTION = 500;
@@ -106,6 +107,14 @@ export async function setFirewallMode(
   mode: FirewallState["mode"],
   options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
+  return withSandboxLifecycleMutationLock(() =>
+    setFirewallModeWithinLifecycleLock(mode, options));
+}
+
+async function setFirewallModeWithinLifecycleLock(
+  mode: FirewallState["mode"],
+  options?: FirewallPolicyContext,
+): Promise<FirewallState> {
   const current = (await getInitializedMeta()).firewall.mode;
   if (current === mode) {
     logInfo("firewall.mode_change_noop", { operation: "mode_change", mode, requestId: options?.requestId });
@@ -150,6 +159,14 @@ export async function setFirewallMode(
 }
 
 export async function approveDomains(
+  domains: string[],
+  options?: FirewallPolicyContext,
+): Promise<FirewallState> {
+  return withSandboxLifecycleMutationLock(() =>
+    approveDomainsWithinLifecycleLock(domains, options));
+}
+
+async function approveDomainsWithinLifecycleLock(
   domains: string[],
   options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
@@ -198,6 +215,14 @@ export async function approveDomains(
 }
 
 export async function removeDomains(
+  domains: string[],
+  options?: FirewallPolicyContext,
+): Promise<FirewallState> {
+  return withSandboxLifecycleMutationLock(() =>
+    removeDomainsWithinLifecycleLock(domains, options));
+}
+
+async function removeDomainsWithinLifecycleLock(
   domains: string[],
   options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
@@ -251,6 +276,13 @@ export async function removeDomains(
 }
 
 export async function promoteLearnedDomainsToEnforcing(
+  options?: FirewallPolicyContext,
+): Promise<FirewallState> {
+  return withSandboxLifecycleMutationLock(() =>
+    promoteLearnedDomainsToEnforcingWithinLifecycleLock(options));
+}
+
+async function promoteLearnedDomainsToEnforcingWithinLifecycleLock(
   options?: FirewallPolicyContext,
 ): Promise<FirewallState> {
   logInfo("firewall.promote_started", { operation: "promote", requestId: options?.requestId });
@@ -337,7 +369,7 @@ async function syncFirewallPolicyAfterMutation(
   options?: FirewallPolicyContext,
 ): Promise<void> {
   try {
-    const outcome = await syncFirewallPolicyIfRunning(options);
+    const outcome = await syncFirewallPolicyIfRunningWithinLifecycleLock(options);
     if (outcome.reason === "sandbox-generation-changed") {
       logInfo("firewall.sync_retrying", {
         operation: "sync",
@@ -345,7 +377,7 @@ async function syncFirewallPolicyAfterMutation(
         mutation,
         requestId: options?.requestId,
       });
-      const retried = await syncFirewallPolicyIfRunning(options);
+      const retried = await syncFirewallPolicyIfRunningWithinLifecycleLock(options);
       if (retried.reason === "sandbox-generation-changed") {
         throw new Error("Firewall sync target changed repeatedly.");
       }
@@ -367,6 +399,13 @@ async function syncFirewallPolicyAfterMutation(
 }
 
 export async function syncFirewallPolicyIfRunning(
+  options?: FirewallPolicyContext,
+): Promise<FirewallSyncOutcome> {
+  return withSandboxLifecycleMutationLock(() =>
+    syncFirewallPolicyIfRunningWithinLifecycleLock(options));
+}
+
+async function syncFirewallPolicyIfRunningWithinLifecycleLock(
   options?: FirewallPolicyContext,
 ): Promise<FirewallSyncOutcome> {
   const meta = await getInitializedMeta();

@@ -4,6 +4,7 @@ import test from "node:test";
 import type { SandboxHandle } from "@/server/sandbox/controller";
 import {
   armSandboxDeadline,
+  claimSandboxDeadlineStop,
   clearSandboxDeadline,
   processSandboxDeadlineStep,
   readSandboxDeadlineRemainingMs,
@@ -145,6 +146,27 @@ test("moving a deadline earlier starts a same-generation replacement workflow", 
   assert.equal(shortened?.workflowScheduledDeadlineAtMs, 7_000);
   assert.equal(shortened?.workflowRunId, "run-2");
   assert.deepEqual(h.starts, ["generation-1", "generation-1"]);
+});
+
+test("lifecycle stop claim seals the deadline against concurrent activity", async () => {
+  const h = coordinatorHarness();
+  const armed = await armSandboxDeadline(runningMeta(), h.deps);
+  assert.ok(armed);
+  h.setNow(2_000_000);
+  await h.deps.write({
+    ...armed,
+    deadlineAtMs: 1_900_000,
+    lastAttemptAtMs: 2_000_000,
+  });
+
+  assert.equal(await claimSandboxDeadlineStop({
+    generationId: armed.generationId,
+    claimedAtMs: 2_000_000,
+  }, h.deps), true);
+  assert.equal(h.read()?.lastOutcome, "stopping");
+  assert.equal(await armSandboxDeadline(runningMeta(), h.deps, {
+    activityAtMs: 2_000_001,
+  }), null);
 });
 
 test("armSandboxDeadline retries ordinary coordinator lock contention", async () => {
@@ -496,6 +518,61 @@ test("deadline step extends native runway before explicit cooperative stop", asy
   assert.equal(h.extensions.length, 1);
   assert.ok(h.extensions[0] > 0);
   assert.equal(h.read(), null);
+});
+
+test("deadline step releases its lock before entering lifecycle stop", async () => {
+  let deadlineLockHeld = false;
+  const h = stepHarness({
+    stop: async () => {
+      assert.equal(deadlineLockHeld, false);
+      return { status: "snapshotting" } as SingleMeta;
+    },
+  });
+  h.deps.acquireLock = async () => {
+    if (deadlineLockHeld) return null;
+    deadlineLockHeld = true;
+    return "deadline-lock";
+  };
+  h.deps.releaseLock = async () => {
+    deadlineLockHeld = false;
+  };
+
+  const result = await processSandboxDeadlineStep("generation-1", h.deps);
+
+  assert.deepEqual(result, { status: "done", reason: "stop-snapshotting" });
+  assert.equal(deadlineLockHeld, false);
+});
+
+test("revoked lifecycle claim preserves a concurrently refreshed deadline", async () => {
+  const revoked = Object.assign(new Error("deadline claim revoked"), {
+    code: "SANDBOX_LIFECYCLE_GUARD_REJECTED",
+  });
+  const stateAccess: {
+    read: ReturnType<typeof stepHarness>["read"] | null;
+    write: ReturnType<typeof stepHarness>["deps"]["write"] | null;
+  } = { read: null, write: null };
+  const h = stepHarness({
+    stop: async () => {
+      assert.ok(stateAccess.read);
+      assert.ok(stateAccess.write);
+      const current = stateAccess.read();
+      assert.ok(current);
+      await stateAccess.write({
+        ...current,
+        deadlineAtMs: 20_000,
+        lastAttemptAtMs: null,
+        lastOutcome: "armed",
+      });
+      throw revoked;
+    },
+  });
+  stateAccess.read = h.read;
+  stateAccess.write = h.deps.write;
+
+  const result = await processSandboxDeadlineStep("generation-1", h.deps);
+
+  assert.deepEqual(result, { status: "sleep", deadlineAtMs: 20_000 });
+  assert.equal(h.read()?.lastOutcome, "armed");
 });
 
 test("deadline step never extends past the portable total timeout", async () => {

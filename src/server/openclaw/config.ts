@@ -462,7 +462,13 @@ set -euo pipefail
 ${buildNetLearnWriteShell()}
 ${buildGatewayEnvShell()}
 ${buildClearStaleGatewayLockShell()}
+restart_phase="\${OPENCLAW_RESTART_PHASE:-all}"
+if [ "$restart_phase" != "start" ]; then
 ${buildGatewayKillShell()}
+fi
+if [ "$restart_phase" = "kill" ]; then
+  exit 0
+fi
 ${buildGatewayLaunchShell()}
 `;
   logInfo("gateway.restart_script_built", {

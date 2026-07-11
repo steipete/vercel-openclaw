@@ -539,6 +539,8 @@ test("buildGatewayRestartScript kills existing gateway and relaunches it", () =>
   assert.ok(script.includes("openclaw") && script.includes("kill"), "restart script should kill existing gateway");
   assert.ok(script.includes("setsid"), "restart script should relaunch via setsid");
   assert.ok(script.includes("gateway --port 3000 --bind loopback"), "restart script should launch the gateway");
+  assert.match(script, /OPENCLAW_RESTART_PHASE:-all/);
+  assert.match(script, /restart_phase" = "kill"/);
 });
 
 test("buildGatewayRestartScript kill matches both pre- and post-title-overwrite forms", () => {

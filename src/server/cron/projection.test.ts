@@ -328,6 +328,7 @@ test("reset generation rejects old sources across clock skew", async () => {
   await acceptCronProjection(old, { store, now: () => 1_500 });
   const fenced = await fenceCronProjectionStateForReset({
     gatewayGeneration: "2".repeat(32),
+    expectedGatewayGeneration: "1".repeat(32),
     store,
     now: () => 2_000,
   });
@@ -344,6 +345,30 @@ test("reset generation rejects old sources across clock skew", async () => {
     (await acceptCronProjection(replacement, { store, now: () => 3_000 })).status,
     "accepted",
   );
+});
+
+test("reset fence resumes idempotently after token-transition worker loss", async () => {
+  const store = new MemoryStore();
+  await acceptCronProjection(
+    input(1, [{ jobId: "old", runAtMs: 5_000 }]),
+    { store, now: () => 1_500 },
+  );
+  const first = await fenceCronProjectionStateForReset({
+    gatewayGeneration: "2".repeat(32),
+    expectedGatewayGeneration: "1".repeat(32),
+    store,
+    now: () => 2_000,
+  });
+
+  const resumed = await fenceCronProjectionStateForReset({
+    gatewayGeneration: "2".repeat(32),
+    expectedGatewayGeneration: "1".repeat(32),
+    store,
+    now: () => 3_000,
+  });
+
+  assert.deepEqual(resumed.record, first.record);
+  assert.equal(resumed.supersededWorkflowRunId, null);
 });
 
 test("reset fence returns the obsolete sleeping Workflow for cancellation", async () => {
@@ -366,6 +391,7 @@ test("reset fence returns the obsolete sleeping Workflow for cancellation", asyn
 
   const fenced = await fenceCronProjectionStateForReset({
     gatewayGeneration: "2".repeat(32),
+    expectedGatewayGeneration: "1".repeat(32),
     store,
     now: () => 2_000,
   });
@@ -393,6 +419,7 @@ test("reset fence returns the active wake Workflow for cancellation", async () =
 
   const fenced = await fenceCronProjectionStateForReset({
     gatewayGeneration: "2".repeat(32),
+    expectedGatewayGeneration: "1".repeat(32),
     store,
     now: () => 2_000,
   });
@@ -407,6 +434,7 @@ test("reset fence leaves legacy cleanup to the post-destroy commit", async () =>
 
   await fenceCronProjectionStateForReset({
     gatewayGeneration: "2".repeat(32),
+    expectedGatewayGeneration: null,
     store,
     now: () => 2_000,
   });
@@ -418,7 +446,7 @@ test("reset fence leaves legacy cleanup to the post-destroy commit", async () =>
   assert.equal(await store.hasValue(cronJobsKey()), false);
 });
 
-test("reset atomically replaces the exact corrupt value without deleting a concurrent projection", async () => {
+test("reset refuses a concurrent replacement after corrupt-state CAS loss", async () => {
   const store = new MemoryStore();
   await store.setValue(cronProjectionKey(), { schemaVersion: 1, revision: 1 });
   const replacementStore = new MemoryStore();
@@ -436,19 +464,23 @@ test("reset atomically replaces the exact corrupt value without deleting a concu
     return compareToken(key, token, next);
   };
 
-  const fenced = await fenceCronProjectionStateForReset({
-    gatewayGeneration: "2".repeat(32),
-    store,
-    now: () => 2_000,
-  });
-  assert.equal(fenced.record.projectionRevision, 2);
-  assert.equal(fenced.record.revision, replacement.record.revision + 1);
+  await assert.rejects(
+    fenceCronProjectionStateForReset({
+      gatewayGeneration: "2".repeat(32),
+      expectedGatewayGeneration: null,
+      store,
+      now: () => 2_000,
+    }),
+    /cron_projection_reset_generation_superseded/,
+  );
+  assert.deepEqual(await readCronProjection(store), replacement.record);
 });
 
 test("sandbox startup repairs a reset fence after gateway-token commit failure", async () => {
   const store = new MemoryStore();
   await fenceCronProjectionStateForReset({
     gatewayGeneration: "a".repeat(32),
+    expectedGatewayGeneration: null,
     store,
     now: () => 1_000,
   });

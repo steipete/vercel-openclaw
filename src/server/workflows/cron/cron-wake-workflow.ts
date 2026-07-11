@@ -35,6 +35,7 @@ export const CRON_WAKE_POST_DUE_SAFETY_MS = 15 * 60_000;
 
 export type CronWakeHandoffOutcome =
   | { status: "settled" }
+  | { status: "monitor" }
   | { status: "retry"; retryAfterMs: number };
 
 export type CronWakeProcessOutcome =
@@ -93,6 +94,15 @@ export async function cronWakeWorkflow(
   while (true) {
     const outcome = await handoffCronWakeStep(envelope);
     if (outcome.status === "settled") return;
+    if (outcome.status === "monitor") {
+      let monitorAfterMs = CRON_WAKE_MONITOR_INTERVAL_MS;
+      while (true) {
+        await sleep(monitorAfterMs);
+        const monitor = await settleCronWakeStep(envelope);
+        if (monitor.status === "settled") return;
+        monitorAfterMs = monitor.retryAfterMs;
+      }
+    }
     await sleep(
       getCronWakeDurableRetryMs(recoveryCycle, outcome.retryAfterMs),
     );
@@ -115,16 +125,9 @@ export async function cronWakeExecutionWorkflow(
   while (true) {
     const outcome = await processCronWakeStep(envelope, parentWorkflowRunId);
     if (outcome.status === "settled") return;
-    if (outcome.status === "completed") {
-      await sleep(
-        new Date(envelope.runAtMs + CRON_DISPATCH_SETTLEMENT_GRACE_MS),
-      );
-      while (true) {
-        const settlement = await settleCronWakeStep(envelope);
-        if (settlement.status === "settled") return;
-        await sleep(settlement.retryAfterMs);
-      }
-    }
+    // The durable timer parent is the sole settlement/recovery monitor. The
+    // execution child owns only sandbox wake and completion state.
+    if (outcome.status === "completed") return;
     await sleep(
       getCronWakeDurableRetryMs(recoveryCycle, outcome.retryAfterMs),
     );
@@ -147,7 +150,7 @@ export async function handoffCronWakeStep(
       parentWorkflowRunId,
     );
     if (handoffState === "stale") return { status: "settled" };
-    if (handoffState === "already") return { status: "settled" };
+    if (handoffState === "already") return { status: "monitor" };
     const run = await start(
       cronWakeExecutionWorkflow,
       [envelope, parentWorkflowRunId],
@@ -161,7 +164,7 @@ export async function handoffCronWakeStep(
     if (shouldCancelCronWakeHandoff(recorded)) {
       await cancelSupersededCronWake(run.runId);
     }
-    return { status: "settled" };
+    return { status: recorded === "stale" ? "settled" : "monitor" };
   } catch {
     const attempt = getStepMetadata().attempt;
     if (attempt < CRON_WAKE_MAX_STEP_ATTEMPTS) {

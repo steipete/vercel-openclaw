@@ -125,7 +125,8 @@ export async function cronWakeExecutionWorkflow(
   while (true) {
     const outcome = await processCronWakeStep(envelope, parentWorkflowRunId);
     if (outcome.status === "settled") return;
-    // The durable timer parent is the sole settlement/recovery monitor. The
+    // Timer parents in every shipped deployment monitor after handoff. Keep
+    // recovery parent-owned across mixed-deployment handoffs; the current
     // execution child owns only sandbox wake and completion state.
     if (outcome.status === "completed") return;
     await sleep(

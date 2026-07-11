@@ -142,6 +142,36 @@ test("buildGatewayConfig allowlists bundled channel plugins without rejected leg
   );
 });
 
+test("buildGatewayConfig explicitly enables authenticated admin HTTP RPC only for its admitted capability", () => {
+  const withoutCapability = JSON.parse(buildGatewayConfig()) as {
+    plugins: { allow: string[]; entries?: Record<string, { enabled: boolean }> };
+  };
+  const withCapability = JSON.parse(
+    buildGatewayConfig(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      ["admin-http-rpc-v1"],
+    ),
+  ) as {
+    plugins: { allow: string[]; entries?: Record<string, { enabled: boolean }> };
+  };
+
+  assert.equal(withoutCapability.plugins.allow.includes("admin-http-rpc"), false);
+  assert.equal(withoutCapability.plugins.entries?.["admin-http-rpc"], undefined);
+  assert.equal(withCapability.plugins.allow.includes("admin-http-rpc"), true);
+  assert.deepEqual(withCapability.plugins.entries?.["admin-http-rpc"], {
+    enabled: true,
+  });
+  assert.notEqual(
+    computeGatewayConfigHash({}),
+    computeGatewayConfigHash({ bundleCapabilities: ["admin-http-rpc-v1"] }),
+  );
+});
+
 test("buildGatewayConfig throws for invalid boolean env values", () => {
   withEnv(
     {

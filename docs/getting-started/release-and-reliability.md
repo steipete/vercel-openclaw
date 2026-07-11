@@ -8,20 +8,35 @@ The OpenClaw fork publishes sandbox bundle assets through its Sandbox Bundle Ass
 
 Required bundle assets currently include:
 
+- `asset-manifest.json` (schema v2)
 - `openclaw.bundle.mjs`
 - `channel-catalog.json`
 - `workspace-templates.tar.gz`
 - `channels.tar.gz`
+- `runtime-plugins.tar.gz`
+- `external-plugins.json`
+- `external-plugin-slack.tgz`
 - `bundle-deps.tar.gz`
 - `bundle-openclaw-pkg.tar.gz`
-- `channel-shared-chunks.tar.gz`
 - `control-ui.tar.gz`
+- `bundle-capabilities.json`
+- `bundle-contract.json`
+- `release.json`
+- the canonical release tarball named by `asset-manifest.json`
+
+`channel-shared-chunks.tar.gz` remains an optional manifest-declared asset.
 
 The important compatibility risk is asset shape drift. A release with only `openclaw.bundle.mjs` is not enough, and a bundle can build successfully while still failing dashboard restore or channel route readiness.
 
 The hosted plugin and skill contract is currently bundled-only: the dashboard verifies the plugins, skills, sidecars, and runtime assets shipped in the pinned OpenClaw bundle. Arbitrary plugin, skill, ClawHub, MCP, or tool installation needs a persistence, restore, compatibility, rollback, firewall, and launch-verification contract before the hosted UI offers install/update actions.
 
-During migration, dashboard bootstrap treats a missing `asset-manifest.json` as a legacy-bundle warning, but a present malformed or incompatible manifest is fatal. That failure uses `OPENCLAW_BUNDLE_COMPATIBILITY_MISMATCH` and happens before sandbox downloads begin.
+Dashboard bootstrap admits only exact schema-v2 assets from one official `vercel-labs/openclaw` GitHub Release. Package version, release ref, fork and upstream SHAs, canonical digest, capabilities, asset roles and digests, and Slack package metadata must agree across the asset, capability, contract, release, and external-plugin manifests. Missing, legacy, malformed, oversized, or mismatched assets fail with `OPENCLAW_BUNDLE_COMPATIBILITY_MISMATCH` before sandbox installation.
+
+Required capabilities are `admin-http-rpc-v1`, `cron-projection-v1`, `gateway-suspend-v1`, and `telegram-durable-ack-v1`; required plugin IDs include `admin-http-rpc`, `slack`, and `telegram`. Hosted code gates these paths on admitted capability identity, never release-version guesses.
+
+The sandbox downloads only the manifest-named canonical tarball, verifies its exact bytes and SHA-256, verifies every contained asset before extraction, and installs the verified Slack tarball offline through the OpenClaw plugin installer. It writes the bundle identity receipt only after config and external-plugin installation succeed. Persistent resume requires that receipt, stored metadata, and the currently configured release identity to match exactly; otherwise the sandbox is deleted and rebuilt.
+
+Release order matters: publish the exact `@openclaw/slack@<bundle-version>` package before assembling the bundle, then publish and verify the marker-producing bundle, then deploy `vclaw` and dashboard consumers. No older plugin or unverified bundle fallback is supported.
 
 ## Dashboard Release
 
@@ -53,7 +68,7 @@ The workflow should check tag/version agreement, run tests, and publish with npm
 
 - `vclaw` bundle resolver finds a GitHub Release with the complete asset set.
 - Dashboard bootstrap understands the bundle asset layout.
-- `OPENCLAW_BUNDLE_URL` points at the intended release asset when pinning.
+- The complete verified-bundle environment points at one official release and matches its manifest identity.
 - Channel route readiness is tested after OpenClaw plugin/channel runtime changes.
 - Documentation does not treat passing CI as proof of live webhook delivery.
 - Hosted feature claims stay aligned with `src/shared/hosted-feature-support.ts` and [Hosted Feature Support](hosted-feature-support.md).

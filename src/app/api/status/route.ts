@@ -2,7 +2,8 @@ import { requireJsonRouteAuth } from "@/server/auth/route-auth";
 import { getPublicChannelState } from "@/server/channels/state";
 import { getAuthMode } from "@/server/env";
 import { computeWouldBlock } from "@/server/firewall/state";
-import { extractRequestId, logError } from "@/server/log";
+import { extractRequestId, logError, logWarn } from "@/server/log";
+import { hydrateVerifiedBundleIdentity } from "@/server/openclaw/bundle-identity";
 import {
   buildRestoreTargetAttestation,
   buildRestoreTargetPlan,
@@ -141,6 +142,20 @@ export async function GET(request: Request): Promise<Response> {
     const sandboxSdkVersion = await import("@vercel/sandbox/package.json", { with: { type: "json" } })
       .then((m) => (m.default as { version?: string }).version ?? null)
       .catch(() => null);
+    let bundleIdentity: Awaited<
+      ReturnType<typeof hydrateVerifiedBundleIdentity>
+    > = null;
+    try {
+      bundleIdentity = await hydrateVerifiedBundleIdentity(
+        responseMeta.bundleIdentity,
+      );
+    } catch (error) {
+      const ctx: Record<string, unknown> = {
+        error: error instanceof Error ? error.message : String(error),
+      };
+      if (requestId) ctx.requestId = requestId;
+      logWarn("status.bundle_identity_hydration_failed", ctx);
+    }
 
     const response = Response.json({
       authMode: getAuthMode(),
@@ -148,6 +163,7 @@ export async function GET(request: Request): Promise<Response> {
       persistentStore: getStore().name !== "memory",
       sandboxSdkVersion,
       openclawVersion: responseMeta.openclawVersion,
+      bundleIdentity,
       status: responseMeta.status,
       sandboxId: responseMeta.sandboxId,
       snapshotId: responseMeta.snapshotId,

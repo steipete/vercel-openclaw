@@ -167,6 +167,7 @@ export async function POST(request: Request): Promise<Response> {
         slackCredentials: slackConfig
           ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
           : undefined,
+        bundleCapabilities: latest.bundleIdentity?.capabilities,
       });
     });
     const skippedConfigWrite = latest.snapshotConfigHash === currentConfigHash;
@@ -181,6 +182,7 @@ export async function POST(request: Request): Promise<Response> {
             slackCredentials: slackConfig
               ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
               : undefined,
+            bundleCapabilities: latest.bundleIdentity?.capabilities,
           }),
         );
       });

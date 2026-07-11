@@ -2,6 +2,7 @@ import type { ChannelName } from "@/shared/channels";
 import type { HostedFeatureSupportMatrix } from "@/shared/hosted-feature-support";
 import type { RestoreDecision } from "@/shared/restore-decision";
 import type { RestorePreparedStatus, RestorePreparedReason } from "@/shared/types";
+import type { VerifiedBundleIdentity } from "@/shared/bundle-identity";
 
 // ---------------------------------------------------------------------------
 // Restore target attestation — canonical machine-readable restore contract
@@ -196,6 +197,7 @@ export type LaunchVerificationPayload = {
   completedAt: string;
   phases: LaunchVerificationPhase[];
   featureSupport: HostedFeatureSupportMatrix;
+  bundleIdentity: VerifiedBundleIdentity | null;
   diagnostics?: LaunchVerificationDiagnostics;
   runtime?: LaunchVerificationRuntime;
   sandboxHealth?: LaunchVerificationSandboxHealth;
@@ -382,6 +384,7 @@ const REQUIRED_PHASE_IDS: LaunchVerificationPhaseId[] = [
 export const LAUNCH_PHASE_COUNT = REQUIRED_PHASE_IDS.length;
 
 export function isChannelReady(payload: LaunchVerificationPayload): boolean {
+  if (!payload.ok) return false;
   if (payload.mode !== "destructive") return false;
   const phaseMap = new Map(payload.phases.map((p) => [p.id, p.status]));
   return REQUIRED_PHASE_IDS.every((id) => phaseMap.get(id) === "pass");

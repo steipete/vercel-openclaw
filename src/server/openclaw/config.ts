@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+
 import { getProtectionBypassSecret } from "@/server/public-url";
 import { logInfo } from "@/server/log";
 
@@ -512,6 +513,7 @@ export function buildGatewayConfig(
   slackCredentials?: { botToken: string; signingSecret: string },
   telegramWebhookSecret?: string,
   whatsappConfig?: WhatsAppGatewayConfig,
+  bundleCapabilities: readonly string[] = [],
 ): string {
   const controlUi: Record<string, unknown> = {
     // The proxy enforces auth before any request reaches the sandbox gateway,
@@ -544,6 +546,12 @@ export function buildGatewayConfig(
     controlUi.allowedOrigins = Array.from(allowedOriginsSet);
   }
 
+  const adminHttpRpcEnabled = bundleCapabilities.includes("admin-http-rpc-v1");
+  const allowedPlugins = ["slack", "telegram", "whatsapp", "discord"];
+  if (adminHttpRpcEnabled) {
+    allowedPlugins.push("admin-http-rpc");
+  }
+
   const config: Record<string, unknown> = {
     gateway: {
       mode: "local",
@@ -567,7 +575,10 @@ export function buildGatewayConfig(
     // per-channel config. Older OpenClaw builds also accepted
     // `plugins.bundledDiscovery`, but current bundles reject that legacy key.
     plugins: {
-      allow: ["slack", "telegram", "whatsapp", "discord"],
+      allow: allowedPlugins,
+      ...(adminHttpRpcEnabled
+        ? { entries: { "admin-http-rpc": { enabled: true } } }
+        : {}),
     },
   };
 
@@ -763,6 +774,7 @@ export type GatewayConfigHashInput = {
   telegramWebhookSecret?: string;
   slackCredentials?: { botToken: string; signingSecret: string };
   whatsappConfig?: WhatsAppGatewayConfig;
+  bundleCapabilities?: readonly string[];
 };
 
 export function computeGatewayConfigHash(input: GatewayConfigHashInput): string {
@@ -773,6 +785,7 @@ export function computeGatewayConfigHash(input: GatewayConfigHashInput): string 
     input.slackCredentials,
     input.telegramWebhookSecret,
     input.whatsappConfig,
+    input.bundleCapabilities,
   );
   return createHash("sha256")
     .update(`gateway-config-hash:v${GATEWAY_CONFIG_HASH_VERSION}\0`)

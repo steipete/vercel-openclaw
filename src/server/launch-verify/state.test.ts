@@ -63,6 +63,7 @@ function makeDestructivePayload(
     phases: makeAllPassPhases(),
     featureSupport: getHostedFeatureSupportMatrix(),
     ...overrides,
+    bundleIdentity: overrides.bundleIdentity ?? null,
   };
 }
 
@@ -83,6 +84,7 @@ function makeSafePayload(
       { id: "wakeFromSleep", status: "skip", durationMs: 0, message: "Not run in safe mode." },
     ],
     ...overrides,
+    bundleIdentity: overrides.bundleIdentity ?? null,
   };
 }
 
@@ -149,6 +151,11 @@ test("isChannelReady returns false for safe mode even if all phases pass", () =>
   const payload = makeSafePayload({
     phases: makeAllPassPhases(),
   });
+  assert.equal(isChannelReady(payload), false);
+});
+
+test("isChannelReady returns false when a non-phase completion gate fails", () => {
+  const payload = makeDestructivePayload({ ok: false });
   assert.equal(isChannelReady(payload), false);
 });
 

@@ -24,6 +24,10 @@ import {
   toWhatsAppGatewayConfig,
 } from "@/server/openclaw/config";
 import { buildRestoreAssetManifest } from "@/server/openclaw/restore-assets";
+import {
+  _resetBundleIdentityForTesting,
+  _setBundleAdmissionForTesting,
+} from "@/server/openclaw/bundle-identity";
 import type {
   LaunchVerifyQueueProbe,
   LaunchVerifyQueueResult,
@@ -585,6 +589,113 @@ test("launch-verify POST (JSON): missing webhook bypass does not block runtime p
       assertBypassNonBlocking(body.phases);
       assertBypassDiagnostics(body.diagnostics);
     } finally {
+      restoreEnv();
+    }
+  });
+});
+
+test("launch-verify POST: configured bundle requires and reports verified identity", async () => {
+  await withHarness(async (h) => {
+    const restoreEnv = await setupWebhookBypassScenario(h);
+    const bundleEnvKeys = [
+      "OPENCLAW_PACKAGE_SPEC",
+      "OPENCLAW_BUNDLE_URL",
+      "OPENCLAW_BUNDLE_UI_URL",
+      "OPENCLAW_BUNDLE_MANIFEST_URL",
+      "OPENCLAW_BUNDLE_SOURCE_SHA",
+      "OPENCLAW_BUNDLE_SHA256",
+    ] as const;
+    const originalBundleEnv = Object.fromEntries(
+      bundleEnvKeys.map((key) => [key, process.env[key]]),
+    );
+    let resetQueueAdapter: (() => void) | null = null;
+    try {
+      const releaseUrl =
+        "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2";
+      process.env.OPENCLAW_PACKAGE_SPEC = "openclaw@2026.7.2";
+      process.env.OPENCLAW_BUNDLE_URL = `${releaseUrl}/openclaw.bundle.mjs`;
+      process.env.OPENCLAW_BUNDLE_UI_URL = `${releaseUrl}/control-ui.tar.gz`;
+      process.env.OPENCLAW_BUNDLE_MANIFEST_URL = `${releaseUrl}/asset-manifest.json`;
+      process.env.OPENCLAW_BUNDLE_SOURCE_SHA = "1".repeat(40);
+      process.env.OPENCLAW_BUNDLE_SHA256 = "3".repeat(64);
+      _setBundleAdmissionForTesting(null);
+
+      const route = getAdminLaunchVerifyRoute();
+      route.__setLaunchVerifyQueueProbeAdapterForTests?.({
+        async publishLaunchVerifyQueueProbe() {
+          return { probeId: "bundle-gate-probe", messageId: "bundle-gate-message" };
+        },
+        async waitForLaunchVerifyQueueResult(probeId) {
+          return {
+            probeId,
+            ok: true,
+            completedAt: Date.now(),
+            messageId: "bundle-gate-message",
+            stage: "queue-delivery",
+            timings: { queueDelayMs: 1, totalMs: 1 },
+            message: "Queue callback executed successfully.",
+          };
+        },
+      });
+      resetQueueAdapter = () =>
+        route.__setLaunchVerifyQueueProbeAdapterForTests?.(null);
+      const result = await callRoute(
+        route.POST,
+        buildAuthPostRequest("/api/admin/launch-verify", "{}"),
+      );
+      await drainAfterCallbacks();
+
+      const body = result.json as LaunchVerificationPayload;
+      assert.equal(body.bundleIdentity, null);
+      assert.equal(
+        body.phases.every((phase) => phase.status === "pass" || phase.status === "skip"),
+        true,
+        "bundle identity gate should be the only failed completion condition",
+      );
+      assert.equal(body.ok, false);
+
+      const identity = {
+        packageSpec: "openclaw@2026.7.2",
+        version: "2026.7.2",
+        forkSha: "1".repeat(40),
+        upstreamSha: "2".repeat(40),
+        canonicalSha256: "3".repeat(64),
+        capabilities: [
+          "admin-http-rpc-v1",
+          "cron-projection-v1",
+          "gateway-suspend-v1",
+          "telegram-durable-ack-v1",
+        ],
+        verified: true as const,
+      };
+      await h.mutateMeta((meta) => {
+        meta.bundleIdentity = identity;
+      });
+      _setBundleAdmissionForTesting({
+        identity,
+        canonicalTarball: "openclaw-sandbox-bundle-v2026.7.2-1111111.tar.gz",
+        canonicalTarballUrl: `${releaseUrl}/openclaw-sandbox-bundle-v2026.7.2-1111111.tar.gz`,
+        assets: {},
+        externalPlugins: [],
+      });
+      delete process.env.OPENCLAW_PACKAGE_SPEC;
+
+      const verifiedResult = await callRoute(
+        route.POST,
+        buildAuthPostRequest("/api/admin/launch-verify", "{}"),
+      );
+      await drainAfterCallbacks();
+      const verifiedBody = verifiedResult.json as LaunchVerificationPayload;
+      assert.deepEqual(verifiedBody.bundleIdentity, identity);
+      assert.equal(verifiedBody.runtime?.packageSpec, identity.packageSpec);
+    } finally {
+      resetQueueAdapter?.();
+      _resetBundleIdentityForTesting();
+      for (const key of bundleEnvKeys) {
+        const value = originalBundleEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
       restoreEnv();
     }
   });

@@ -363,7 +363,7 @@ Full list is in `.env.example`. Non-obvious policies:
 - **Store requirement**: missing Redis is a hard fail on Vercel but a warning in local/non-Vercel. Applies to both preflight and channel connectability.
 - **`CRON_SECRET`**: when unset on Vercel, the runtime falls back to `ADMIN_SECRET` — that's a warning, not a failure. Missing both is a hard fail.
 - **`OPENCLAW_PACKAGE_SPEC`**: when unset on Vercel, the runtime falls back to a pinned known-good version (currently `openclaw@2026.4.12`). The deployment contract **warns** — it does not fail.
-- **`OPENCLAW_BUNDLE_URL` / `OPENCLAW_BUNDLE_UI_URL`**: set by `vclaw` when it pins a published OpenClaw bundle. Keep these aligned with `OPENCLAW_PACKAGE_SPEC`; a package spec alone does not prove the sidecar asset set is present.
+- **Verified bundle variables**: `vclaw` sets `OPENCLAW_BUNDLE_URL`, `OPENCLAW_BUNDLE_UI_URL`, `OPENCLAW_BUNDLE_MANIFEST_URL`, `OPENCLAW_BUNDLE_SOURCE_SHA`, and `OPENCLAW_BUNDLE_SHA256` as one all-or-none pin. They must name one official release and align with exact `OPENCLAW_PACKAGE_SPEC`. Partial or mismatched bundle pins are rejected.
 - **`NEXT_PUBLIC_APP_URL`, `NEXT_PUBLIC_BASE_DOMAIN`, `BASE_DOMAIN`**: inputs to `getPublicOrigin()` alongside forwarded headers and Vercel system env vars. Admin-visible URLs must use `buildPublicDisplayUrl()`.
 - **`NEXT_PUBLIC_VERCEL_APP_CLIENT_ID` + `VERCEL_APP_CLIENT_SECRET`**: required for `sign-in-with-vercel` OAuth. Missing these is a `auth-config` fail in preflight when that mode is selected.
 - **`OPENCLAW_INSTANCE_ID`**: namespaces Redis keys. On Vercel it auto-uses `VERCEL_PROJECT_ID` when unset; locally falls back to `openclaw-single`. Changing it points at a new namespace — it does not migrate existing state.

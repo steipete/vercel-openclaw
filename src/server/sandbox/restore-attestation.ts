@@ -16,6 +16,7 @@ import type {
 export type RestoreAttestationMeta = Pick<
   SingleMeta,
   | "channels"
+  | "bundleIdentity"
   | "snapshotId"
   | "snapshotConfigHash"
   | "snapshotDynamicConfigHash"
@@ -53,6 +54,7 @@ export function buildRestoreTargetAttestation(
         }
       : undefined,
     whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
+    bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
 
   const desiredAssetSha256 = buildRestoreAssetManifest().sha256;

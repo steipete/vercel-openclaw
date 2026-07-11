@@ -3,22 +3,23 @@ import { getOpenclawPackageSpec, isVercelDeployment } from "@/server/env";
 import { isPinnedPackageSpec } from "@/server/deployment-contract";
 import type { WhatsAppGatewayConfig } from "@/server/openclaw/config";
 import {
-  formatBundleCompatibilityIssue,
-  INVALID_BUNDLE_ASSET_MANIFEST_JSON,
-  validateBundleAssetManifestForDashboard,
-} from "@/server/openclaw/bundle-compatibility";
+  admitConfiguredOpenClawBundle,
+  markVerifiedBundleIdentity,
+  type VerifiedBundleAdmission,
+  type VerifiedBundleIdentity,
+} from "@/server/openclaw/bundle-identity";
 import {
   buildStartupScript,
   BUN_BIN,
   BUN_DOWNLOAD_SHA256,
   BUN_DOWNLOAD_URL,
   BUN_INSTALL_DIR,
-  getOpenclawBundleUiUrl,
   getOpenclawBundleUrl,
   getOpenclawGatewayCmd,
   OPENCLAW_BIN,
   OPENCLAW_BUNDLE_PATH,
   OPENCLAW_BUNDLED_PLUGINS_DIR_PATH,
+  OPENCLAW_CONFIG_PATH,
   OPENCLAW_FORCE_PAIR_SCRIPT_PATH,
   OPENCLAW_INSTALL_PATCH_SCRIPT_PATH,
   OPENCLAW_LOG_FILE,
@@ -80,66 +81,6 @@ async function assertCommandSuccess(
       output,
     });
   }
-}
-
-async function fetchBundleAssetManifest(bundleUrl: string): Promise<unknown | null> {
-  const manifestUrl = new URL("asset-manifest.json", bundleUrl).href;
-  const response = await fetch(manifestUrl, { signal: AbortSignal.timeout(5_000) });
-  if (response.status === 404) return null;
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} fetching ${manifestUrl}`);
-  }
-  try {
-    return await response.json();
-  } catch {
-    return INVALID_BUNDLE_ASSET_MANIFEST_JSON;
-  }
-}
-
-async function validateBundleCompatibilityBeforeDownload(opts: {
-  sandboxId: string;
-  bundleUrl: string;
-}): Promise<void> {
-  let manifest: unknown | null;
-  try {
-    manifest = await fetchBundleAssetManifest(opts.bundleUrl);
-  } catch (err) {
-    logWarn("openclaw.setup.bundle_manifest_unavailable", {
-      sandboxId: opts.sandboxId,
-      bundleUrl: opts.bundleUrl,
-      reason: err instanceof Error ? err.message : String(err),
-    });
-    return;
-  }
-  if (!manifest) {
-    logWarn("openclaw.setup.bundle_manifest_missing", {
-      sandboxId: opts.sandboxId,
-      bundleUrl: opts.bundleUrl,
-      reason: "legacy-bundle-compatibility-boundary",
-    });
-    return;
-  }
-
-  const result = validateBundleAssetManifestForDashboard(manifest);
-  if (!result.ok) {
-    logError("openclaw.setup.bundle_compatibility_mismatch", {
-      sandboxId: opts.sandboxId,
-      bundleUrl: opts.bundleUrl,
-      ...result.issue,
-    });
-    throw new Error(formatBundleCompatibilityIssue(result.issue));
-  }
-  for (const warning of result.warnings) {
-    logWarn("openclaw.setup.bundle_compatibility_warning", {
-      sandboxId: opts.sandboxId,
-      bundleUrl: opts.bundleUrl,
-      ...warning,
-    });
-  }
-  logInfo("openclaw.setup.bundle_compatibility_ok", {
-    sandboxId: opts.sandboxId,
-    bundleUrl: opts.bundleUrl,
-  });
 }
 
 function buildBundleCompatibilityShimScript(): string {
@@ -273,6 +214,156 @@ function buildBundleCompatibilityShimScript(): string {
   ].join("\n");
 }
 
+const OPENCLAW_BUNDLE_METADATA_DIR = "/home/vercel-sandbox/.openclaw-bundle";
+export const OPENCLAW_BUNDLE_IDENTITY_PATH =
+  `${OPENCLAW_BUNDLE_METADATA_DIR}/identity.json`;
+const OPENCLAW_BUNDLE_STAGE_DIR = "/tmp/openclaw-bundle-assets";
+const OPENCLAW_BUNDLE_ARCHIVE_PATH = "/tmp/openclaw-release.tar.gz";
+
+function shellArg(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function buildVerifiedBundleInstallScript(
+  admission: VerifiedBundleAdmission,
+): string {
+  const archiveAssets = Object.keys(admission.assets)
+    .filter((assetName) => assetName !== admission.canonicalTarball)
+    .sort((left, right) => left.localeCompare(right));
+  const expectedEntries = archiveAssets.map(shellArg).join(" ");
+  const canonicalAsset = admission.assets[admission.canonicalTarball];
+  const nestedTarAssets = [
+    "workspace-templates.tar.gz",
+    "channels.tar.gz",
+    "runtime-plugins.tar.gz",
+    "bundle-deps.tar.gz",
+    "bundle-openclaw-pkg.tar.gz",
+    "control-ui.tar.gz",
+    ...admission.externalPlugins.map((plugin) => plugin.artifact),
+    ...(admission.assets["channel-shared-chunks.tar.gz"]
+      ? ["channel-shared-chunks.tar.gz"]
+      : []),
+  ];
+  const lines = [
+    "set -euo pipefail",
+    "export LC_ALL=C",
+    `rm -rf ${shellArg(OPENCLAW_BUNDLE_STAGE_DIR)} ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)}`,
+    `mkdir -p ${shellArg(OPENCLAW_BUNDLE_STAGE_DIR)}`,
+    `curl -fsSL --proto '=https' --proto-redir '=https' --max-time 180 --connect-timeout 10 --max-filesize ${canonicalAsset.bytes} -o ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} ${shellArg(admission.canonicalTarballUrl)}`,
+    `test "$(wc -c < ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} | tr -d '[:space:]')" = ${shellArg(String(canonicalAsset.bytes))}`,
+    `printf '%s  %s\\n' ${shellArg(admission.identity.canonicalSha256)} ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} | sha256sum -c -`,
+    `printf '%s\\n' ${expectedEntries} | sort > /tmp/openclaw-bundle-expected.txt`,
+    `tar -tzf ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} | sed 's#^\\./##' | sort > /tmp/openclaw-bundle-actual.txt`,
+    "cmp -s /tmp/openclaw-bundle-expected.txt /tmp/openclaw-bundle-actual.txt || { echo 'canonical bundle entries do not match asset-manifest.json' >&2; exit 1; }",
+    `tar -tvzf ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} | awk 'substr($1,1,1) != "-" { exit 1 }'`,
+    `tar xzf ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} -C ${shellArg(OPENCLAW_BUNDLE_STAGE_DIR)}`,
+  ];
+
+  for (const assetName of archiveAssets) {
+    const asset = admission.assets[assetName];
+    const assetPath = `${OPENCLAW_BUNDLE_STAGE_DIR}/${assetName}`;
+    lines.push(
+      `test -f ${shellArg(assetPath)} && test ! -L ${shellArg(assetPath)}`,
+      `test "$(wc -c < ${shellArg(assetPath)} | tr -d '[:space:]')" = ${shellArg(String(asset.bytes))}`,
+      `printf '%s  %s\\n' ${shellArg(asset.sha256)} ${shellArg(assetPath)} | sha256sum -c -`,
+    );
+  }
+
+  const verifyNpmIntegrity = [
+    'const fs = require("node:fs");',
+    'const crypto = require("node:crypto");',
+    "const [file, expectedSha1, expectedIntegrity] = process.argv.slice(1);",
+    "const bytes = fs.readFileSync(file);",
+    'const sha1 = crypto.createHash("sha1").update(bytes).digest("hex");',
+    'const integrity = `sha512-${crypto.createHash("sha512").update(bytes).digest("base64")}`;',
+    'if (sha1 !== expectedSha1 || integrity !== expectedIntegrity) throw new Error("external plugin npm integrity mismatch");',
+  ].join("");
+  for (const plugin of admission.externalPlugins) {
+    lines.push(
+      `node -e ${shellArg(verifyNpmIntegrity)} ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/${plugin.artifact}`)} ${shellArg(plugin.shasum)} ${shellArg(plugin.integrity)}`,
+    );
+  }
+
+  const verifyTar = [
+    "set -e;",
+    'archive="$1";',
+    "tar -tzf \"$archive\" | awk '",
+    '  /^\\// { exit 1 }',
+    '  /(^|\\/)\\.\\.(\\/|$)/ { exit 1 }',
+    '  seen[$0]++ { exit 1 }',
+    "';",
+    "tar -tvzf \"$archive\" | awk '",
+    '  { type = substr($1, 1, 1) }',
+    '  type != "-" && type != "d" { exit 1 }',
+    "'",
+  ].join("\n");
+  for (const assetName of nestedTarAssets) {
+    lines.push(
+      `bash -c ${shellArg(verifyTar)} verify-tar ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/${assetName}`)}`,
+    );
+  }
+
+  const verifyPackageJson = [
+    'const fs = require("node:fs");',
+    "const [expectedName, expectedVersion] = process.argv.slice(1);",
+    'const value = JSON.parse(fs.readFileSync(0, "utf8"));',
+    'if (value.name !== expectedName || value.version !== expectedVersion) throw new Error("external plugin package identity mismatch");',
+  ].join("");
+  const verifyPluginManifest = [
+    'const fs = require("node:fs");',
+    "const [expectedId] = process.argv.slice(1);",
+    'const value = JSON.parse(fs.readFileSync(0, "utf8"));',
+    'if (value.id !== expectedId) throw new Error("external plugin manifest identity mismatch");',
+  ].join("");
+  for (const plugin of admission.externalPlugins) {
+    const pluginArchive = `${OPENCLAW_BUNDLE_STAGE_DIR}/${plugin.artifact}`;
+    lines.push(
+      `tar -tzf ${shellArg(pluginArchive)} | grep -qx 'package/package.json'`,
+      `tar -tzf ${shellArg(pluginArchive)} | grep -qx 'package/openclaw.plugin.json'`,
+      `tar -tzf ${shellArg(pluginArchive)} | grep -Eq '^package/dist/.+\\.js$'`,
+      `tar -xOzf ${shellArg(pluginArchive)} package/package.json | node -e ${shellArg(verifyPackageJson)} ${shellArg(plugin.packageName)} ${shellArg(plugin.version)}`,
+      `tar -xOzf ${shellArg(pluginArchive)} package/openclaw.plugin.json | node -e ${shellArg(verifyPluginManifest)} ${shellArg(plugin.id)}`,
+    );
+  }
+
+  lines.push(
+    `mkdir -p /home/vercel-sandbox/dist ${shellArg(OPENCLAW_WORKSPACE_TEMPLATES_DIR)} ${shellArg(OPENCLAW_BUNDLED_PLUGINS_DIR_PATH)} ${shellArg(OPENCLAW_BUNDLE_METADATA_DIR)}`,
+    `install -m 0644 ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/openclaw.bundle.mjs`)} ${shellArg(OPENCLAW_BUNDLE_PATH)}`,
+    `install -m 0644 ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/channel-catalog.json`)} /home/vercel-sandbox/dist/channel-catalog.json`,
+    `tar xzf ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/workspace-templates.tar.gz`)} -C ${shellArg(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`,
+    `tar xzf ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/channels.tar.gz`)} -C ${shellArg(OPENCLAW_BUNDLED_PLUGINS_DIR_PATH)}`,
+    `tar xzf ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/runtime-plugins.tar.gz`)} -C ${shellArg(OPENCLAW_BUNDLED_PLUGINS_DIR_PATH)}`,
+    `test -s ${shellArg(`${OPENCLAW_BUNDLED_PLUGINS_DIR_PATH}/admin-http-rpc/package.json`)}`,
+    `test -s ${shellArg(`${OPENCLAW_BUNDLED_PLUGINS_DIR_PATH}/admin-http-rpc/index.js`)}`,
+    `tar xzf ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/bundle-deps.tar.gz`)} -C /home/vercel-sandbox`,
+    `tar xzf ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/bundle-openclaw-pkg.tar.gz`)} -C /home/vercel-sandbox`,
+  );
+
+  if (admission.assets["channel-shared-chunks.tar.gz"]) {
+    lines.push(
+      `tar xzf ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/channel-shared-chunks.tar.gz`)} -C /home/vercel-sandbox`,
+    );
+  }
+
+  lines.push(
+    buildBundleCompatibilityShimScript(),
+    `tar xzf ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/control-ui.tar.gz`)} -C /home/vercel-sandbox/dist`,
+    `install -m 0644 ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/bundle-capabilities.json`)} ${shellArg(`${OPENCLAW_BUNDLE_METADATA_DIR}/bundle-capabilities.json`)}`,
+    `install -m 0644 ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/bundle-contract.json`)} ${shellArg(`${OPENCLAW_BUNDLE_METADATA_DIR}/bundle-contract.json`)}`,
+    `install -m 0644 ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/release.json`)} ${shellArg(`${OPENCLAW_BUNDLE_METADATA_DIR}/release.json`)}`,
+    `printf '%s\\n' ${shellArg(JSON.stringify({ name: "openclaw", private: true, version: admission.identity.version, type: "module" }))} > /home/vercel-sandbox/package.json`,
+  );
+  for (const plugin of admission.externalPlugins) {
+    lines.push(
+      `install -m 0600 ${shellArg(`${OPENCLAW_BUNDLE_STAGE_DIR}/${plugin.artifact}`)} ${shellArg(`${OPENCLAW_BUNDLE_METADATA_DIR}/${plugin.artifact}`)}`,
+    );
+  }
+  lines.push(
+    `rm -rf ${shellArg(OPENCLAW_BUNDLE_STAGE_DIR)} ${shellArg(OPENCLAW_BUNDLE_ARCHIVE_PATH)} /tmp/openclaw-bundle-expected.txt /tmp/openclaw-bundle-actual.txt`,
+  );
+  return lines.join("\n");
+}
+
 export type BootstrapRuntime = {
   packageSpec: string;
   installedVersion: string | null;
@@ -291,248 +382,80 @@ export async function setupOpenClaw(
     whatsappConfig?: WhatsAppGatewayConfig;
     progress?: SetupProgressWriter;
   },
-): Promise<{ startupScript: string; openclawVersion: string | null; runtime: BootstrapRuntime }> {
+): Promise<{
+  startupScript: string;
+  openclawVersion: string | null;
+  runtime: BootstrapRuntime;
+  bundleIdentity: VerifiedBundleIdentity | null;
+}> {
   const startupScript = buildStartupScript();
   const progress = options.progress;
 
-  const packageSpec = getOpenclawPackageSpec();
+  let packageSpec: string;
   const onVercel = isVercelDeployment();
-
-  if (onVercel && !isPinnedPackageSpec(packageSpec)) {
-    logWarn("openclaw.setup.unpinned_package_spec", {
-      sandboxId: sandbox.sandboxId,
-      packageSpec,
-      reason: "Vercel deployments should use a pinned OPENCLAW_PACKAGE_SPEC for deterministic restores — falling back to current spec",
-    });
-  }
-
   const bundleUrl = getOpenclawBundleUrl();
+  let bundleAdmission: VerifiedBundleAdmission | null = null;
+  let bundleIdentity: VerifiedBundleIdentity | null = null;
+
+  if (bundleUrl) {
+    bundleAdmission = await admitConfiguredOpenClawBundle();
+    if (!bundleAdmission) {
+      throw new Error("Verified bundle admission is required when OPENCLAW_BUNDLE_URL is set");
+    }
+    // Bundle mode takes its package identity from the digest-pinned manifest.
+    // Never let the npm fallback select a different runtime for this archive.
+    packageSpec = bundleAdmission.identity.packageSpec;
+  } else {
+    packageSpec = getOpenclawPackageSpec();
+    if (onVercel && !isPinnedPackageSpec(packageSpec)) {
+      logWarn("openclaw.setup.unpinned_package_spec", {
+        sandboxId: sandbox.sandboxId,
+        packageSpec,
+        reason: "Vercel deployments should use a pinned OPENCLAW_PACKAGE_SPEC for deterministic restores — falling back to current spec",
+      });
+    }
+  }
 
   logInfo("openclaw.setup.start", { sandboxId: sandbox.sandboxId, packageSpec, onVercel, bundleUrl: bundleUrl ?? null });
 
-  if (bundleUrl) {
-    await validateBundleCompatibilityBeforeDownload({
-      sandboxId: sandbox.sandboxId,
-      bundleUrl,
-    });
-
-    // ---------- Bundle path: download pre-built bundle from blob storage ----------
-    progress?.setPhase("downloading-bundle", `Downloading bundle`);
+  if (bundleAdmission) {
+    const admission = bundleAdmission;
+    progress?.setPhase("downloading-bundle", "Downloading verified bundle");
     const downloadResult = await sandbox.runCommand({
       cmd: "bash",
-      args: [
-        "-c",
-        [
-          "set -e",
-          `curl -fsSL --max-time 120 --connect-timeout 10 -o ${JSON.stringify(OPENCLAW_BUNDLE_PATH)} ${JSON.stringify(bundleUrl)}`,
-          // package.json must use name "openclaw" so the package-root resolver
-          // recognizes this directory, enabling channel-catalog.json discovery.
-          `echo '{"name":"openclaw","private":true,"version":"0.0.0","type":"module"}' > /home/vercel-sandbox/package.json`,
-          // Channel catalog — lets the config validator recognize channel IDs
-          // (slack, telegram, discord, etc.) without needing installed extensions.
-          `mkdir -p /home/vercel-sandbox/dist`,
-          `curl -fsSL --max-time 10 --connect-timeout 5 -o /home/vercel-sandbox/dist/channel-catalog.json ${JSON.stringify(new URL("channel-catalog.json", bundleUrl).href)}`,
-          // Workspace templates — agent runtime reads these at chat time
-          // (AGENTS.md, IDENTITY.md, BOOT.md, etc.). Without them, every
-          // chat request fails with "Missing workspace template".
-          `mkdir -p ${JSON.stringify(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`,
-          `curl -fsSL --max-time 15 --connect-timeout 5 ${JSON.stringify(new URL("workspace-templates.tar.gz", bundleUrl).href)} | tar xz -C ${JSON.stringify(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`,
-          // auth-profiles.json — pre-seed the vercel-ai-gateway provider so
-          // chat doesn't fail with "No API key found for provider". The
-          // bundle doesn't include the vercel-ai-gateway extension at runtime,
-          // so the env-var-to-auth-profile bootstrap doesn't run. The key is a
-          // placeholder; the real OIDC token is injected by the firewall's
-          // network policy header transform on the way to ai-gateway.vercel.sh.
-          `mkdir -p /home/vercel-sandbox/.openclaw/agents/main/agent`,
-          `printf '%s' '{"version":1,"profiles":{"vercel-ai-gateway:default":{"type":"api_key","provider":"vercel-ai-gateway","key":"sk-placeholder-injected-via-network-policy"}}}' > /home/vercel-sandbox/.openclaw/agents/main/agent/auth-profiles.json`,
-        ].join(" && "),
-      ],
+      args: ["-c", buildVerifiedBundleInstallScript(admission)],
       stdout: progress?.makeWritable("stdout"),
       stderr: progress?.makeWritable("stderr"),
     });
-    await assertCommandSuccess("bundle download", downloadResult);
-    logInfo("openclaw.setup.bundle_downloaded", { sandboxId: sandbox.sandboxId, bundleUrl });
+    await assertCommandSuccess("verified bundle install", downloadResult);
 
-    // Channel-plugins archive: the single-file ESM bundle ships the gateway
-    // core but no extensions tree, so channel handlers (slack/telegram/…)
-    // never register and webhooks 404 inside the sandbox. Download the
-    // sibling channels.tar.gz and extract it; the gateway env shell points
-    // OPENCLAW_BUNDLED_PLUGINS_DIR at this directory so the bundle's plugin
-    // discovery code finds each plugin on disk.
-    const channelsUrl = new URL("channels.tar.gz", bundleUrl).href;
-    progress?.setPhase("downloading-bundle", "Downloading channel plugins");
-    const channelsResult = await sandbox.runCommand({
-      cmd: "bash",
-      args: [
-        "-c",
-        [
-          "set -e",
-          `mkdir -p ${JSON.stringify(OPENCLAW_BUNDLED_PLUGINS_DIR_PATH)}`,
-          `curl -fsSL --max-time 60 --connect-timeout 10 ${JSON.stringify(channelsUrl)} | tar xz -C ${JSON.stringify(OPENCLAW_BUNDLED_PLUGINS_DIR_PATH)}`,
-        ].join(" && "),
-      ],
-      stdout: progress?.makeWritable("stdout"),
-      stderr: progress?.makeWritable("stderr"),
+    // The bundle has no provider bootstrap for this synthetic runtime, so
+    // seed the placeholder profile used by the network-policy auth transform.
+    await sandbox.writeFiles([
+      {
+        path: "/home/vercel-sandbox/.openclaw/agents/main/agent/auth-profiles.json",
+        content: Buffer.from(
+          JSON.stringify({
+            version: 1,
+            profiles: {
+              "vercel-ai-gateway:default": {
+                type: "api_key",
+                provider: "vercel-ai-gateway",
+                key: "sk-placeholder-injected-via-network-policy",
+              },
+            },
+          }),
+        ),
+      },
+    ]);
+    logInfo("openclaw.setup.bundle_verified", {
+      sandboxId: sandbox.sandboxId,
+      packageSpec: admission.identity.packageSpec,
+      forkSha: admission.identity.forkSha,
+      upstreamSha: admission.identity.upstreamSha,
+      canonicalSha256: admission.identity.canonicalSha256,
+      capabilities: admission.identity.capabilities,
     });
-    if (channelsResult.exitCode === 0) {
-      logInfo("openclaw.setup.channels_downloaded", {
-        sandboxId: sandbox.sandboxId,
-        channelsUrl,
-        extractedTo: OPENCLAW_BUNDLED_PLUGINS_DIR_PATH,
-      });
-    } else {
-      const stderr = (await channelsResult.output("stderr")).trim();
-      logWarn("openclaw.setup.channels_download_failed", {
-        sandboxId: sandbox.sandboxId,
-        channelsUrl,
-        exitCode: channelsResult.exitCode,
-        stderr: stderr.slice(-500),
-      });
-      // Don't fail bootstrap — gateway can still serve non-channel routes
-      // and the failure is loud (channel webhooks will 404). This makes
-      // the failure mode the same as missing channels.tar.gz at the URL,
-      // which we want to surface in launch-verify rather than block boot.
-    }
-
-    // Bundle runtime deps: runtime packages kept external to the ESM bundle
-    // and packages imported by shared channel chunks are shipped as a sidecar.
-    // Extract `bundle-deps.tar.gz` next to openclaw.bundle.mjs so
-    // createRequire(import.meta.url) and root-level shared chunks find them in
-    // node_modules/.
-    const depsUrl = new URL("bundle-deps.tar.gz", bundleUrl).href;
-    progress?.setPhase("downloading-bundle", "Downloading runtime deps");
-    const depsResult = await sandbox.runCommand({
-      cmd: "bash",
-      args: [
-        "-c",
-        [
-          "set -e",
-          `curl -fsSL --max-time 120 --connect-timeout 10 ${JSON.stringify(depsUrl)} | tar xz -C /home/vercel-sandbox`,
-        ].join(" && "),
-      ],
-      stdout: progress?.makeWritable("stdout"),
-      stderr: progress?.makeWritable("stderr"),
-    });
-    if (depsResult.exitCode === 0) {
-      logInfo("openclaw.setup.bundle_deps_downloaded", {
-        sandboxId: sandbox.sandboxId,
-        depsUrl,
-      });
-    } else {
-      const stderr = (await depsResult.output("stderr")).trim();
-      logWarn("openclaw.setup.bundle_deps_download_failed", {
-        sandboxId: sandbox.sandboxId,
-        depsUrl,
-        exitCode: depsResult.exitCode,
-        stderr: stderr.slice(-500),
-      });
-      // Don't hard-fail: older bundles (pre bundle-deps.tar.gz) won't
-      // publish this artifact. The failure mode is loud (Slack plugin
-      // load fails with `Cannot find module '../dist/babel.cjs'`), which
-      // is what the operator will see in /tmp/openclaw.log.
-    }
-
-    // Synthetic openclaw npm package: ships node_modules/openclaw/ with
-    // package.json + plugin-sdk/<subpath>.cjs shims. The shims redirect
-    // bare-specifier imports like `openclaw/plugin-sdk/channel-entry-contract`
-    // to a globalThis.__OPENCLAW_BUNDLE_PLUGIN_SDK_REGISTRY__ map populated
-    // by the bundle at startup. Without this, channel extensions fail to
-    // load with `Cannot find module 'openclaw/plugin-sdk/...'`.
-    const openclawPkgUrl = new URL("bundle-openclaw-pkg.tar.gz", bundleUrl).href;
-    progress?.setPhase("downloading-bundle", "Downloading openclaw shim package");
-    const openclawPkgResult = await sandbox.runCommand({
-      cmd: "bash",
-      args: [
-        "-c",
-        [
-          "set -e",
-          `curl -fsSL --max-time 30 --connect-timeout 10 ${JSON.stringify(openclawPkgUrl)} | tar xz -C /home/vercel-sandbox`,
-          `if [ -f /home/vercel-sandbox/node_modules/openclaw/dist/plugins/runtime/index.js ]; then mkdir -p /home/vercel-sandbox/dist/plugins/runtime && cp /home/vercel-sandbox/node_modules/openclaw/dist/plugins/runtime/index.js /home/vercel-sandbox/dist/plugins/runtime/index.js && echo '{"event":"bundle.plugin_runtime_root_staged","source":"node_modules/openclaw/dist/plugins/runtime/index.js","target":"dist/plugins/runtime/index.js"}'; else echo '{"event":"bundle.plugin_runtime_root_missing","source":"node_modules/openclaw/dist/plugins/runtime/index.js"}'; fi`,
-          `echo '{"name":"openclaw","private":true,"version":"0.0.0","type":"module"}' > /home/vercel-sandbox/package.json`,
-        ].join(" && "),
-      ],
-      stdout: progress?.makeWritable("stdout"),
-      stderr: progress?.makeWritable("stderr"),
-    });
-    if (openclawPkgResult.exitCode === 0) {
-      const stdout = (await openclawPkgResult.output("stdout")).trim();
-      logInfo("openclaw.setup.bundle_openclaw_pkg_downloaded", {
-        sandboxId: sandbox.sandboxId,
-        openclawPkgUrl,
-        stdoutHead: stdout.slice(0, 500),
-      });
-    } else {
-      const stderr = (await openclawPkgResult.output("stderr")).trim();
-      logWarn("openclaw.setup.bundle_openclaw_pkg_download_failed", {
-        sandboxId: sandbox.sandboxId,
-        openclawPkgUrl,
-        exitCode: openclawPkgResult.exitCode,
-        stderr: stderr.slice(-500),
-      });
-      // Don't hard-fail: older bundles won't publish this artifact.
-    }
-
-    // Shared dist chunks: channel extensions and bundle SDK shims may
-    // reference dist/<chunk>.js files that live alongside the bundle.
-    // Extract at sandbox root so they sit next to openclaw.bundle.mjs.
-    const sharedChunksUrl = new URL("channel-shared-chunks.tar.gz", bundleUrl).href;
-    progress?.setPhase("downloading-bundle", "Downloading shared chunks");
-    const sharedChunksResult = await sandbox.runCommand({
-      cmd: "bash",
-      args: [
-        "-c",
-        [
-          "set -e",
-          `curl -fsSL --max-time 60 --connect-timeout 10 ${JSON.stringify(sharedChunksUrl)} | tar xz -C /home/vercel-sandbox`,
-          buildBundleCompatibilityShimScript(),
-        ].join("\n"),
-      ],
-      stdout: progress?.makeWritable("stdout"),
-      stderr: progress?.makeWritable("stderr"),
-    });
-    if (sharedChunksResult.exitCode === 0) {
-      logInfo("openclaw.setup.bundle_shared_chunks_downloaded", {
-        sandboxId: sandbox.sandboxId,
-        sharedChunksUrl,
-      });
-    } else {
-      const stderr = (await sharedChunksResult.output("stderr")).trim();
-      logWarn("openclaw.setup.bundle_shared_chunks_download_failed", {
-        sandboxId: sandbox.sandboxId,
-        sharedChunksUrl,
-        exitCode: sharedChunksResult.exitCode,
-        stderr: stderr.slice(-500),
-      });
-    }
-
-    // Download and extract Control UI assets (required for the gateway readiness probe)
-    const bundleUiUrl = getOpenclawBundleUiUrl();
-    if (bundleUiUrl) {
-      progress?.setPhase("downloading-bundle", "Downloading Control UI assets");
-      const uiDir = "/home/vercel-sandbox/dist/control-ui";
-      const uiResult = await sandbox.runCommand({
-        cmd: "bash",
-        args: [
-          "-c",
-          [
-            "set -e",
-            `mkdir -p /home/vercel-sandbox/dist`,
-            `curl -fsSL --max-time 30 --connect-timeout 10 ${JSON.stringify(bundleUiUrl)} | tar xz -C /home/vercel-sandbox/dist`,
-          ].join(" && "),
-        ],
-        stdout: progress?.makeWritable("stdout"),
-        stderr: progress?.makeWritable("stderr"),
-      });
-      if (uiResult.exitCode === 0) {
-        logInfo("openclaw.setup.bundle_ui_downloaded", { sandboxId: sandbox.sandboxId, bundleUiUrl });
-      } else {
-        logWarn("openclaw.setup.bundle_ui_download_failed", {
-          sandboxId: sandbox.sandboxId,
-          bundleUiUrl,
-          exitCode: uiResult.exitCode,
-        });
-      }
-    }
   } else {
     // ---------- npm install path (existing) ----------
     progress?.setPhase("installing-openclaw", `Installing ${packageSpec}`);
@@ -697,6 +620,7 @@ export async function setupOpenClaw(
       telegramWebhookSecret: options.telegramWebhookSecret,
       slackCredentials: options.slackCredentials,
       whatsappConfig: options.whatsappConfig,
+      bundleCapabilities: bundleAdmission?.identity.capabilities,
     }),
     {
       path: OPENCLAW_INSTALL_PATCH_SCRIPT_PATH,
@@ -711,6 +635,53 @@ export async function setupOpenClaw(
   });
 
   await sandbox.writeFiles(bootstrapFiles);
+
+  if (bundleAdmission) {
+    progress?.setPhase("installing-plugin", "Installing verified external plugins");
+    for (const plugin of bundleAdmission.externalPlugins) {
+      const archivePath = `${OPENCLAW_BUNDLE_METADATA_DIR}/${plugin.artifact}`;
+      const pluginResult = await sandbox.runCommand({
+        cmd: "node",
+        args: [
+          OPENCLAW_BUNDLE_PATH,
+          "plugins",
+          "install",
+          `npm-pack:${archivePath}`,
+        ],
+        env: {
+          PATH: "/home/vercel-sandbox/.global/npm/bin:/usr/local/bin:/usr/bin:/bin",
+          HOME: "/home/vercel-sandbox",
+          OPENCLAW_HOME: "/home/vercel-sandbox",
+          OPENCLAW_CONFIG_PATH,
+          OPENCLAW_BUNDLE_PROFILE: "sandbox",
+          OPENCLAW_BUNDLED_PLUGINS_DIR: OPENCLAW_BUNDLED_PLUGINS_DIR_PATH,
+          npm_config_audit: "false",
+          npm_config_fund: "false",
+          npm_config_offline: "true",
+        },
+        stdout: progress?.makeWritable("stdout"),
+        stderr: progress?.makeWritable("stderr"),
+      });
+      await assertCommandSuccess(`install external plugin ${plugin.id}`, pluginResult);
+    }
+    const receiptPath = OPENCLAW_BUNDLE_IDENTITY_PATH;
+    const receiptResult = await sandbox.runCommand({
+      cmd: "bash",
+      args: [
+        "-c",
+        [
+          "set -e",
+          `umask 077`,
+          `printf '%s\\n' ${shellArg(JSON.stringify(bundleAdmission.identity))} > ${shellArg(`${receiptPath}.tmp`)}`,
+          `mv -f ${shellArg(`${receiptPath}.tmp`)} ${shellArg(receiptPath)}`,
+        ].join("\n"),
+      ],
+      stdout: progress?.makeWritable("stdout"),
+      stderr: progress?.makeWritable("stderr"),
+    });
+    await assertCommandSuccess("persist verified bundle identity", receiptResult);
+    bundleIdentity = markVerifiedBundleIdentity(bundleAdmission);
+  }
 
   // Install patches only apply to the npm-installed package tree.
   if (!bundleUrl) {
@@ -839,7 +810,7 @@ export async function setupOpenClaw(
   }
 
   logInfo("openclaw.setup.ready", { sandboxId: sandbox.sandboxId, runtime });
-  return { startupScript, openclawVersion, runtime };
+  return { startupScript, openclawVersion, runtime, bundleIdentity };
 }
 
 const GATEWAY_DIAG_MAX_CHARS = 7000;

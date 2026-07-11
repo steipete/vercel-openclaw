@@ -190,6 +190,7 @@ When you add or change Redis keys, route every key through `src/server/store/key
 ## Machine-readable operations surfaces
 
 - `GET /api/admin/preflight` returns a `PreflightPayload` with `checks`, `actions`, `nextSteps`, and per-channel readiness.
+- `GET /api/status` returns the currently admitted `bundleIdentity`, or `null` when no verified bundle is active.
 - `GET /api/admin/launch-verify` returns persisted `ChannelReadiness` for the current deployment.
 - `POST /api/admin/launch-verify` returns `LaunchVerificationPayload & { channelReadiness: ChannelReadiness }`. Send `Accept: application/x-ndjson` to stream phase events (`LaunchVerificationStreamEvent`) for automation.
 - When streaming with `Accept: application/x-ndjson`, the terminal `result` event carries the same extended payload including `channelReadiness`.
@@ -205,6 +206,15 @@ Example `POST /api/admin/launch-verify` response (destructive mode, all phases p
   "mode": "destructive",
   "startedAt": "2026-03-24T08:00:00.000Z",
   "completedAt": "2026-03-24T08:01:10.000Z",
+  "bundleIdentity": {
+    "packageSpec": "openclaw@2026.7.2",
+    "version": "2026.7.2",
+    "forkSha": "1111111111111111111111111111111111111111",
+    "upstreamSha": "2222222222222222222222222222222222222222",
+    "canonicalSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "capabilities": ["admin-http-rpc-v1", "cron-projection-v1", "gateway-suspend-v1", "telegram-durable-ack-v1"],
+    "verified": true
+  },
   "phases": [
     { "id": "preflight", "status": "pass", "durationMs": 120, "message": "All 8 config checks passed." },
     { "id": "queuePing", "status": "pass", "durationMs": 840, "message": "Vercel Queue delivered callback msg_123." },
@@ -213,8 +223,8 @@ Example `POST /api/admin/launch-verify` response (destructive mode, all phases p
     { "id": "wakeFromSleep", "status": "pass", "durationMs": 22000, "message": "Wake-from-sleep probe passed." }
   ],
   "runtime": {
-    "packageSpec": "openclaw@1.2.3",
-    "installedVersion": "1.2.3",
+    "packageSpec": "openclaw@2026.7.2",
+    "installedVersion": "2026.7.2",
     "drift": false,
     "expectedConfigHash": "abc123",
     "lastRestoreConfigHash": "abc123",

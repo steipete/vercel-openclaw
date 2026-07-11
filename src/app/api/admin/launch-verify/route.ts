@@ -25,6 +25,7 @@ import {
 } from "@/server/sandbox/lifecycle";
 import { getOpenclawPackageSpec } from "@/server/env";
 import { detectDrift } from "@/server/openclaw/bootstrap";
+import { hydrateVerifiedBundleIdentity } from "@/server/openclaw/bundle-identity";
 import {
   buildRestoreTargetAttestation,
   buildRestoreTargetPlan,
@@ -380,8 +381,9 @@ function buildPreflightPassMessage(preflight: PreflightPayload): string {
 
 function buildLaunchVerificationRuntime(
   runtimeMeta: LaunchVerificationRuntimeMeta,
+  bundleIdentity: Awaited<ReturnType<typeof hydrateVerifiedBundleIdentity>>,
 ): LaunchVerificationRuntime | undefined {
-  const packageSpec = getOpenclawPackageSpec();
+  const packageSpec = bundleIdentity?.packageSpec ?? getOpenclawPackageSpec();
   if (!packageSpec) return undefined;
 
   const attestation = buildRestoreTargetAttestation(runtimeMeta);
@@ -608,6 +610,7 @@ function buildStreamingResponse(
           ok: false, mode, startedAt,
           completedAt: new Date().toISOString(), phases,
           featureSupport: getHostedFeatureSupportMatrix(),
+          bundleIdentity: null,
           diagnostics,
         };
         const readiness = await writeChannelReadiness(payload);
@@ -760,9 +763,15 @@ function buildStreamingResponse(
 
       let runtime: LaunchVerificationRuntime | undefined;
       let sandboxHealth: LaunchVerificationSandboxHealth | undefined;
+      let bundleIdentity: Awaited<
+        ReturnType<typeof hydrateVerifiedBundleIdentity>
+      > = null;
       try {
         const runtimeMeta = await getInitializedMeta();
-        runtime = buildLaunchVerificationRuntime(runtimeMeta);
+        bundleIdentity = await hydrateVerifiedBundleIdentity(
+          runtimeMeta.bundleIdentity,
+        );
+        runtime = buildLaunchVerificationRuntime(runtimeMeta, bundleIdentity);
         sandboxHealth = buildSandboxHealth({
           ensureReadyAction,
           configReconcile,
@@ -778,11 +787,14 @@ function buildStreamingResponse(
       // Stale config that could not be reconciled is a hard fail.
       const configFresh = ensurePhase.status !== "pass" ||
         (!configReconcileError && configReconcile !== null && configReconcile.verified);
-      const ok = phasesOk && configFresh;
+      const bundleVerified =
+        !process.env.OPENCLAW_BUNDLE_URL?.trim() || bundleIdentity !== null;
+      const ok = phasesOk && configFresh && bundleVerified;
       const payload: LaunchVerificationPayload = {
         ok, mode, startedAt,
         completedAt: new Date().toISOString(),
-        phases, featureSupport: getHostedFeatureSupportMatrix(), diagnostics, runtime, sandboxHealth,
+        phases, featureSupport: getHostedFeatureSupportMatrix(), bundleIdentity,
+        diagnostics, runtime, sandboxHealth,
       };
       const readiness = await writeChannelReadiness(payload);
 
@@ -827,6 +839,7 @@ async function buildJsonResponse(
       ok: false, mode, startedAt,
       completedAt: new Date().toISOString(), phases,
       featureSupport: getHostedFeatureSupportMatrix(),
+      bundleIdentity: null,
       diagnostics,
     };
     const readiness = await writeChannelReadiness(payload);
@@ -953,9 +966,15 @@ async function buildJsonResponse(
 
   let runtime: LaunchVerificationRuntime | undefined;
   let sandboxHealth: LaunchVerificationSandboxHealth | undefined;
+  let bundleIdentity: Awaited<
+    ReturnType<typeof hydrateVerifiedBundleIdentity>
+  > = null;
   try {
     const runtimeMeta = await getInitializedMeta();
-    runtime = buildLaunchVerificationRuntime(runtimeMeta);
+    bundleIdentity = await hydrateVerifiedBundleIdentity(
+      runtimeMeta.bundleIdentity,
+    );
+    runtime = buildLaunchVerificationRuntime(runtimeMeta, bundleIdentity);
     sandboxHealth = buildSandboxHealth({
       ensureReadyAction,
       configReconcile,
@@ -971,11 +990,14 @@ async function buildJsonResponse(
   // Stale config that could not be reconciled is a hard fail.
   const configFresh = ensurePhase.status !== "pass" ||
     (!configReconcileError && configReconcile !== null && configReconcile.verified);
-  const ok = phasesOk && configFresh;
+  const bundleVerified =
+    !process.env.OPENCLAW_BUNDLE_URL?.trim() || bundleIdentity !== null;
+  const ok = phasesOk && configFresh && bundleVerified;
   const payload: LaunchVerificationPayload = {
     ok, mode, startedAt,
     completedAt: new Date().toISOString(),
-    phases, featureSupport: getHostedFeatureSupportMatrix(), diagnostics, runtime, sandboxHealth,
+    phases, featureSupport: getHostedFeatureSupportMatrix(), bundleIdentity,
+    diagnostics, runtime, sandboxHealth,
   };
   const readiness = await writeChannelReadiness(payload);
 

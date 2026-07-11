@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { SingleMeta } from "@/shared/types";
+import {
+  OPENCLAW_BUNDLE_IDENTITY_PATH,
+} from "@/server/openclaw/bootstrap";
+import {
+  _resetBundleIdentityForTesting,
+  _setBundleAdmissionForTesting,
+  REQUIRED_OPENCLAW_BUNDLE_ASSETS,
+  type VerifiedBundleAdmission,
+} from "@/server/openclaw/bundle-identity";
 
 import {
   ensureFreshGatewayToken,
@@ -44,7 +53,6 @@ import {
 } from "@/server/observability/operation-context";
 import {
   OPENCLAW_BIN,
-  OPENCLAW_BUNDLE_PATH,
   OPENCLAW_CONFIG_PATH,
   OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
   OPENCLAW_GATEWAY_RESTART_SCRIPT_PATH,
@@ -79,6 +87,12 @@ const ENV_OVERRIDES: Record<string, string | undefined> = {
   AI_GATEWAY_API_KEY: undefined,
   VERCEL_OIDC_TOKEN: undefined,
   OPENCLAW_SANDBOX_SLEEP_AFTER_MS: undefined,
+  OPENCLAW_PACKAGE_SPEC: undefined,
+  OPENCLAW_BUNDLE_URL: undefined,
+  OPENCLAW_BUNDLE_UI_URL: undefined,
+  OPENCLAW_BUNDLE_MANIFEST_URL: undefined,
+  OPENCLAW_BUNDLE_SOURCE_SHA: undefined,
+  OPENCLAW_BUNDLE_SHA256: undefined,
 };
 
 async function withTestEnv(
@@ -97,6 +111,7 @@ async function withTestEnv(
 
   _setSandboxControllerForTesting(fake);
   _resetSandboxSleepConfigCacheForTesting();
+  _resetBundleIdentityForTesting();
 
   try {
     await fn();
@@ -104,6 +119,7 @@ async function withTestEnv(
     _setSandboxControllerForTesting(null);
     _resetStoreForTesting();
     _resetSandboxSleepConfigCacheForTesting();
+    _resetBundleIdentityForTesting();
     for (const key of Object.keys(originals)) {
       if (originals[key] === undefined) {
         delete process.env[key];
@@ -940,6 +956,69 @@ test("probeGatewayReady returns ready=false when fetch throws (simulating gone s
  * Used by triggerRestore to pre-register a "resumed" handle so get() succeeds.
  */
 const LIFECYCLE_SANDBOX_NAME = "oc-openclaw-single";
+const BUNDLE_VERSION = "2026.7.2";
+const BUNDLE_FORK_SHA = "1".repeat(40);
+const BUNDLE_CANONICAL_SHA = "3".repeat(64);
+const BUNDLE_RELEASE_URL =
+  "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2";
+const BUNDLE_ADMISSION: VerifiedBundleAdmission = {
+  identity: {
+    packageSpec: `openclaw@${BUNDLE_VERSION}`,
+    version: BUNDLE_VERSION,
+    forkSha: BUNDLE_FORK_SHA,
+    upstreamSha: "2".repeat(40),
+    canonicalSha256: BUNDLE_CANONICAL_SHA,
+    capabilities: [
+      "admin-http-rpc-v1",
+      "cron-projection-v1",
+      "gateway-suspend-v1",
+      "telegram-durable-ack-v1",
+    ],
+    verified: true,
+  },
+  canonicalTarball: `openclaw-sandbox-bundle-v${BUNDLE_VERSION}-1111111.tar.gz`,
+  canonicalTarballUrl:
+    `${BUNDLE_RELEASE_URL}/openclaw-sandbox-bundle-v${BUNDLE_VERSION}-1111111.tar.gz`,
+  assets: Object.fromEntries(
+    [
+      ...REQUIRED_OPENCLAW_BUNDLE_ASSETS,
+      `openclaw-sandbox-bundle-v${BUNDLE_VERSION}-1111111.tar.gz`,
+    ].map((name, index) => [
+      name,
+      {
+        role: name,
+        bytes: index + 1,
+        sha256:
+          name.startsWith("openclaw-sandbox-bundle-")
+            ? BUNDLE_CANONICAL_SHA
+            : index.toString(16).padStart(64, "0"),
+      },
+    ]),
+  ),
+  externalPlugins: [
+    {
+      id: "slack",
+      packageName: "@openclaw/slack",
+      version: BUNDLE_VERSION,
+      spec: `@openclaw/slack@${BUNDLE_VERSION}`,
+      artifact: "external-plugin-slack.tgz",
+      integrity: "sha512-AAAA",
+      shasum: "4".repeat(40),
+      sha256: "5".repeat(64),
+    },
+  ],
+};
+
+function configureBundleLifecycleTest(): void {
+  process.env.OPENCLAW_PACKAGE_SPEC = `openclaw@${BUNDLE_VERSION}`;
+  process.env.OPENCLAW_BUNDLE_URL = `${BUNDLE_RELEASE_URL}/openclaw.bundle.mjs`;
+  process.env.OPENCLAW_BUNDLE_UI_URL = `${BUNDLE_RELEASE_URL}/control-ui.tar.gz`;
+  process.env.OPENCLAW_BUNDLE_MANIFEST_URL =
+    `${BUNDLE_RELEASE_URL}/asset-manifest.json`;
+  process.env.OPENCLAW_BUNDLE_SOURCE_SHA = BUNDLE_FORK_SHA;
+  process.env.OPENCLAW_BUNDLE_SHA256 = BUNDLE_CANONICAL_SHA;
+  _setBundleAdmissionForTesting(BUNDLE_ADMISSION);
+}
 
 /**
  * Pre-register a handle for the lifecycle's derived sandbox name.
@@ -1242,11 +1321,13 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
   const originalFetch = globalThis.fetch;
 
   await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
     await mutateMeta((meta) => {
       meta.status = "stopped";
       meta.snapshotId = null;
       meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
       meta.gatewayToken = "test-gw-token";
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
     });
 
     const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
@@ -1255,13 +1336,13 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
       if (
         cmd === "bash" &&
         args?.[0] === "-c" &&
-        args[1]?.includes(OPENCLAW_BUNDLE_PATH)
+        args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH)
       ) {
         return {
           exitCode: 0,
           output: async (stream?: "stdout" | "stderr" | "both") => {
             if (stream === "stderr") return "";
-            return "yes\n";
+            return `${JSON.stringify(BUNDLE_ADMISSION.identity)}\n`;
           },
         };
       }
@@ -1291,13 +1372,112 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
       assert.ok(fastRestoreCommand, "bundle runtime marker should route to fast restore");
 
       const fullBootstrapCommand = handle.commands.find(
-        (c) => c.cmd === "bash" && c.args?.[1]?.includes("curl -fsSL") && c.args?.[1]?.includes(OPENCLAW_BUNDLE_PATH),
+        (c) => c.cmd === "bash" && c.args?.[1]?.includes("curl -fsSL"),
       );
       assert.equal(fullBootstrapCommand, undefined, "resume must not re-download the bundle");
 
       const meta = await getInitializedMeta();
       assert.equal(meta.status, "running");
       assert.ok(meta.lastRestoreMetrics, "fast restore metrics should be recorded");
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent bundle identity mismatch deletes and rebuilds before reuse", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = null;
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+
+    const staleHandle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    staleHandle.responders.push(...fake.defaultResponders);
+    staleHandle.responders.push((cmd, args) => {
+      if (
+        cmd === "bash" &&
+        args?.[0] === "-c" &&
+        args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH)
+      ) {
+        return {
+          exitCode: 0,
+          output: async (stream?: "stdout" | "stderr" | "both") => {
+            if (stream === "stderr") return "";
+            return `${JSON.stringify({
+              ...BUNDLE_ADMISSION.identity,
+              canonicalSha256: "9".repeat(64),
+            })}\n`;
+          },
+        };
+      }
+      return undefined;
+    });
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, staleHandle);
+
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      fake.setCreateFailure(
+        Object.assign(new Error("persistent sandbox name still releasing"), {
+          status: 409,
+        }),
+      );
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      let scheduledCallback: (() => Promise<void> | void) | null = null;
+      await ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "bundle-mismatch-test",
+        schedule(cb) {
+          scheduledCallback = cb;
+        },
+      });
+      assert.ok(scheduledCallback, "Background rebuild work should have been scheduled");
+      await (scheduledCallback as () => Promise<void>)();
+
+      assert.equal(staleHandle.deleteCalled, true, "stale bundle sandbox must be deleted");
+      assert.equal(
+        fake.getCalls.filter((call) => call.sandboxId === LIFECYCLE_SANDBOX_NAME)
+          .length,
+        2,
+        "replacement 409 should resolve and delete the conflicting named handle",
+      );
+      assert.equal(
+        staleHandle.commands.some(
+          (command) =>
+            command.cmd === "bash" &&
+            command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+        ),
+        false,
+        "stale bundle sandbox must never run fast restore",
+      );
+      const replacement = fake.lastCreated();
+      assert.ok(replacement, "identity mismatch should create a fresh sandbox");
+      assert.ok(
+        replacement.commands.some(
+          (command) => command.cmd === "bash" && command.args?.[1]?.includes("curl -fsSL"),
+        ),
+        "replacement should run full verified bundle bootstrap",
+      );
+      assert.ok(
+        replacement.commands.some(
+          (command) => command.cmd === "bash" && command.args?.[1]?.includes("identity.json.tmp"),
+        ),
+        "replacement should write a new receipt after bootstrap",
+      );
+
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.deepEqual(meta.bundleIdentity, BUNDLE_ADMISSION.identity);
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;

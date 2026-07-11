@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test, { afterEach, mock } from "node:test";
 
 import {
@@ -11,7 +12,6 @@ import {
   OPENCLAW_INSTALL_PATCH_SCRIPT_PATH,
   OPENCLAW_GATEWAY_RESTART_SCRIPT_PATH,
   OPENCLAW_GATEWAY_TOKEN_PATH,
-  OPENCLAW_BUNDLED_PLUGINS_DIR_PATH,
   OPENCLAW_IMAGE_GEN_SCRIPT_PATH,
   OPENCLAW_IMAGE_GEN_SKILL_PATH,
   OPENCLAW_WEB_SEARCH_SKILL_PATH,
@@ -36,15 +36,25 @@ import {
   OPENCLAW_WORKER_SANDBOX_SCRIPT_PATH,
   OPENCLAW_STARTUP_SCRIPT_PATH,
   OPENCLAW_STATE_DIR,
-  OPENCLAW_WORKSPACE_TEMPLATES_DIR,
 } from "@/server/openclaw/config";
-import { setupOpenClaw, waitForGatewayReady, detectDrift, CommandFailedError } from "@/server/openclaw/bootstrap";
+import {
+  buildVerifiedBundleInstallScript,
+  setupOpenClaw,
+  waitForGatewayReady,
+  detectDrift,
+  CommandFailedError,
+} from "@/server/openclaw/bootstrap";
+import type { VerifiedBundleAdmission } from "@/server/openclaw/bundle-identity";
 import { getOpenclawPackageSpec } from "@/server/env";
 import {
   createScenarioHarness,
   type CommandResponder,
 } from "@/test-utils/harness";
-import { OPENCLAW_BUNDLE_COMPATIBILITY_ERROR_CODE } from "@/server/openclaw/bundle-compatibility";
+import {
+  _resetBundleIdentityForTesting,
+  _setBundleAdmissionForTesting,
+  REQUIRED_OPENCLAW_BUNDLE_ASSETS,
+} from "@/server/openclaw/bundle-identity";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -52,6 +62,7 @@ import { OPENCLAW_BUNDLE_COMPATIBILITY_ERROR_CODE } from "@/server/openclaw/bund
 
 afterEach(() => {
   mock.restoreAll();
+  _resetBundleIdentityForTesting();
 });
 
 /** Create a sandbox handle seeded in the fake controller. */
@@ -83,6 +94,264 @@ async function withEnv<T>(
 // ---------------------------------------------------------------------------
 // setupOpenClaw — command sequence
 // ---------------------------------------------------------------------------
+
+test("verified bundle install checks the canonical archive and every contained asset before extraction", () => {
+  const canonicalTarball = "openclaw-sandbox-bundle-v2026.7.2-1111111.tar.gz";
+  const assetNames = [
+    "openclaw.bundle.mjs",
+    "channel-catalog.json",
+    "workspace-templates.tar.gz",
+    "channels.tar.gz",
+    "runtime-plugins.tar.gz",
+    "external-plugins.json",
+    "external-plugin-slack.tgz",
+    "bundle-deps.tar.gz",
+    "bundle-openclaw-pkg.tar.gz",
+    "control-ui.tar.gz",
+    "bundle-capabilities.json",
+    "bundle-contract.json",
+    "release.json",
+    canonicalTarball,
+  ];
+  const admission: VerifiedBundleAdmission = {
+    identity: {
+      packageSpec: "openclaw@2026.7.2",
+      version: "2026.7.2",
+      forkSha: "1".repeat(40),
+      upstreamSha: "2".repeat(40),
+      canonicalSha256: "3".repeat(64),
+      capabilities: [
+        "admin-http-rpc-v1",
+        "cron-projection-v1",
+        "gateway-suspend-v1",
+        "telegram-durable-ack-v1",
+      ],
+      verified: true,
+    },
+    canonicalTarball,
+    canonicalTarballUrl:
+      `https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/${canonicalTarball}`,
+    assets: Object.fromEntries(
+      assetNames.map((name, index) => [
+        name,
+        { role: name, bytes: index + 1, sha256: index === assetNames.length - 1 ? "3".repeat(64) : index.toString(16).padStart(64, "0") },
+      ]),
+    ),
+    externalPlugins: [
+      {
+        id: "slack",
+        packageName: "@openclaw/slack",
+        version: "2026.7.2",
+        spec: "@openclaw/slack@2026.7.2",
+        artifact: "external-plugin-slack.tgz",
+        integrity: "sha512-AAAA",
+        shasum: "4".repeat(40),
+        sha256: "5".repeat(64),
+      },
+    ],
+  };
+
+  const script = buildVerifiedBundleInstallScript(admission);
+  const syntax = spawnSync("bash", ["-n"], {
+    input: script,
+    encoding: "utf8",
+  });
+  assert.equal(syntax.status, 0, syntax.stderr);
+  const nestedTarCheck = script
+    .split("\n")
+    .find((line) => line.startsWith("bash -c "));
+  assert.ok(nestedTarCheck);
+  const nestedTarResult = spawnSync("bash", ["-u", "-c", nestedTarCheck], {
+    encoding: "utf8",
+  });
+  assert.notEqual(nestedTarResult.status, 0, "the fixture archive does not exist");
+  assert.doesNotMatch(
+    nestedTarResult.stderr,
+    /unbound variable|bad substitution|command not found/,
+    "embedded verification scripts must reach the nested shell without outer expansion",
+  );
+  const npmIntegrityCheck = script
+    .split("\n")
+    .find((line) => line.startsWith("node -e "));
+  assert.ok(npmIntegrityCheck);
+  const npmIntegrityResult = spawnSync("bash", ["-u", "-c", npmIntegrityCheck], {
+    encoding: "utf8",
+  });
+  assert.notEqual(npmIntegrityResult.status, 0, "the fixture package does not exist");
+  assert.doesNotMatch(
+    npmIntegrityResult.stderr,
+    /unbound variable|bad substitution|command not found/,
+    "embedded Node scripts must reach Node without outer shell expansion",
+  );
+  assert.match(script, /--proto '=https' --proto-redir '=https'/);
+  assert.match(script, /canonical bundle entries do not match asset-manifest\.json/);
+  assert.match(script, /external plugin npm integrity mismatch/);
+  assert.match(script, /runtime-plugins\.tar\.gz/);
+  assert.match(script, /admin-http-rpc\/index\.js/);
+  assert.match(script, /external-plugin-slack\.tgz/);
+  assert.match(script, /package\/openclaw\.plugin\.json/);
+  assert.match(script, /external plugin package identity mismatch/);
+  assert.match(script, /external plugin manifest identity mismatch/);
+  assert.doesNotMatch(
+    script,
+    /tar xzf [^\n]*external-plugin-slack\.tgz/,
+    "Slack must use the supported npm-pack installer instead of bundled extraction",
+  );
+  assert.match(script, /type != "-" && type != "d"/);
+  for (const assetName of assetNames) {
+    if (assetName === canonicalTarball) continue;
+    assert.match(script, new RegExp(assetName.replaceAll(".", "\\.")));
+  }
+});
+
+test("setupOpenClaw installs the exact external Slack package before writing the final receipt and starting the gateway", async () => {
+  const canonicalTarball = "openclaw-sandbox-bundle-v2026.7.2-1111111.tar.gz";
+  const admission: VerifiedBundleAdmission = {
+    identity: {
+      packageSpec: "openclaw@2026.7.2",
+      version: "2026.7.2",
+      forkSha: "1".repeat(40),
+      upstreamSha: "2".repeat(40),
+      canonicalSha256: "3".repeat(64),
+      capabilities: [
+        "admin-http-rpc-v1",
+        "cron-projection-v1",
+        "gateway-suspend-v1",
+        "telegram-durable-ack-v1",
+      ],
+      verified: true,
+    },
+    canonicalTarball,
+    canonicalTarballUrl:
+      `https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/${canonicalTarball}`,
+    assets: Object.fromEntries(
+      [
+        ...REQUIRED_OPENCLAW_BUNDLE_ASSETS,
+        canonicalTarball,
+      ].map((name, index) => [
+        name,
+        {
+          role: name,
+          bytes: index + 1,
+          sha256:
+            name === canonicalTarball
+              ? "3".repeat(64)
+              : index.toString(16).padStart(64, "0"),
+        },
+      ]),
+    ),
+    externalPlugins: [
+      {
+        id: "slack",
+        packageName: "@openclaw/slack",
+        version: "2026.7.2",
+        spec: "@openclaw/slack@2026.7.2",
+        artifact: "external-plugin-slack.tgz",
+        integrity: "sha512-AAAA",
+        shasum: "4".repeat(40),
+        sha256: "5".repeat(64),
+      },
+    ],
+  };
+  await withEnv(
+    {
+      NODE_ENV: "test",
+      OPENCLAW_PACKAGE_SPEC: undefined,
+      OPENCLAW_BUNDLE_URL:
+        "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/openclaw.bundle.mjs",
+      OPENCLAW_BUNDLE_UI_URL:
+        "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/control-ui.tar.gz",
+      OPENCLAW_BUNDLE_MANIFEST_URL:
+        "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/asset-manifest.json",
+      OPENCLAW_BUNDLE_SOURCE_SHA: "1".repeat(40),
+      OPENCLAW_BUNDLE_SHA256: "3".repeat(64),
+    },
+    async () => {
+      _setBundleAdmissionForTesting(admission);
+      const h = createScenarioHarness();
+      try {
+        const handle = await createHandle(h);
+        const result = await setupOpenClaw(handle, {
+          gatewayToken: "tok-external-slack",
+          proxyOrigin: "https://example.com",
+        });
+        const pluginInstallIndex = handle.commands.findIndex(
+          (command) =>
+            command.cmd === "node" &&
+            command.args?.includes(
+              "npm-pack:/home/vercel-sandbox/.openclaw-bundle/external-plugin-slack.tgz",
+            ),
+        );
+        const receiptIndex = handle.commands.findIndex(
+          (command) =>
+            command.cmd === "bash" &&
+            command.args?.[1]?.includes("identity.json.tmp"),
+        );
+        const startupIndex = handle.commands.findIndex(
+          (command) => command.args?.includes(OPENCLAW_STARTUP_SCRIPT_PATH),
+        );
+        assert.ok(pluginInstallIndex >= 0, "expected exact npm-pack Slack install");
+        assert.ok(receiptIndex > pluginInstallIndex, "receipt must follow plugin install");
+        assert.ok(startupIndex > receiptIndex, "gateway must start after receipt");
+        assert.deepEqual(result.bundleIdentity, admission.identity);
+        assert.equal(result.runtime.packageSpec, admission.identity.packageSpec);
+
+        const configFile = handle.writtenFiles.find(
+          (file) => file.path === OPENCLAW_CONFIG_PATH,
+        );
+        assert.ok(configFile);
+        const config = JSON.parse(configFile.content.toString("utf8")) as {
+          plugins: { allow: string[]; entries: Record<string, { enabled: boolean }> };
+        };
+        assert.equal(config.plugins.allow.includes("admin-http-rpc"), true);
+        assert.deepEqual(config.plugins.entries["admin-http-rpc"], { enabled: true });
+      } finally {
+        h.teardown();
+      }
+
+      _setBundleAdmissionForTesting(admission);
+      const failing = createScenarioHarness();
+      try {
+        const handle = await createHandle(failing);
+        handle.responders.push((command, args) => {
+          if (
+            command === "node" &&
+            args?.includes(
+              "npm-pack:/home/vercel-sandbox/.openclaw-bundle/external-plugin-slack.tgz",
+            )
+          ) {
+            return {
+              exitCode: 1,
+              output: async () => "offline Slack install failed",
+            };
+          }
+          return undefined;
+        });
+        await assert.rejects(
+          setupOpenClaw(handle, {
+            gatewayToken: "tok-external-slack-failure",
+            proxyOrigin: "https://example.com",
+          }),
+          /install external plugin slack/,
+        );
+        assert.equal(
+          handle.commands.some((command) =>
+            command.args?.[1]?.includes("identity.json.tmp")),
+          false,
+          "failed external plugin install must not write the identity receipt",
+        );
+        assert.equal(
+          handle.commands.some((command) =>
+            command.args?.includes(OPENCLAW_STARTUP_SCRIPT_PATH)),
+          false,
+          "failed external plugin install must not start the gateway",
+        );
+      } finally {
+        failing.teardown();
+      }
+    },
+  );
+});
 
 test("setupOpenClaw installs @buape/carbon peer dep during bootstrap", async () => {
   const h = createScenarioHarness();
@@ -194,296 +463,6 @@ test("setupOpenClaw executes commands in correct order", async () => {
   } finally {
     h.teardown();
   }
-});
-
-test("setupOpenClaw extracts bundle workspace templates into runtime working tree", async () => {
-  await withEnv({ OPENCLAW_BUNDLE_URL: "https://example.test/openclaw.bundle.mjs" }, async () => {
-    const h = createScenarioHarness();
-    try {
-      h.fakeFetch.onGet("asset-manifest.json", () => new Response("not found", { status: 404 }));
-      const handle = await createHandle(h);
-
-      await setupOpenClaw(handle, {
-        gatewayToken: "tok-bundle",
-        proxyOrigin: "https://example.com",
-      });
-
-      const bundleDownload = handle.commands.find(
-        (c) => c.cmd === "bash" && c.args?.[1]?.includes("workspace-templates.tar.gz"),
-      );
-      assert.ok(bundleDownload, "bundle download command should fetch workspace templates");
-      assert.ok(
-        bundleDownload.args?.[1]?.includes(`mkdir -p ${JSON.stringify(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`),
-        "workspace template directory should match the bundle runtime working tree",
-      );
-      assert.ok(
-        bundleDownload.args?.[1]?.includes(`tar xz -C ${JSON.stringify(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`),
-        "workspace templates should extract into the bundle runtime working tree",
-      );
-    } finally {
-      h.teardown();
-    }
-  });
-});
-
-test("setupOpenClaw warns and continues when bundle asset manifest is absent", async () => {
-  await withEnv({ OPENCLAW_BUNDLE_URL: "https://example.test/openclaw.bundle.mjs" }, async () => {
-    const { _resetLogBuffer, getServerLogs } = await import("@/server/log");
-    const h = createScenarioHarness();
-    try {
-      h.fakeFetch.onGet("asset-manifest.json", () => new Response("not found", { status: 404 }));
-      _resetLogBuffer();
-      const handle = await createHandle(h);
-
-      await setupOpenClaw(handle, {
-        gatewayToken: "tok-bundle-manifest-missing",
-        proxyOrigin: "https://example.com",
-      });
-
-      assert.ok(
-        getServerLogs().some((entry) => entry.message === "openclaw.setup.bundle_manifest_missing"),
-        "missing asset-manifest.json should be warning-only for legacy bundles",
-      );
-      assert.ok(
-        handle.commands.some((c) => c.cmd === "bash" && c.args?.[1]?.includes("openclaw.bundle.mjs")),
-        "legacy bundle bootstrap should continue after manifest warning",
-      );
-    } finally {
-      h.teardown();
-    }
-  });
-});
-
-test("setupOpenClaw fails before downloads when present bundle manifest is incompatible", async () => {
-  await withEnv({ OPENCLAW_BUNDLE_URL: "https://example.test/openclaw.bundle.mjs" }, async () => {
-    const h = createScenarioHarness();
-    try {
-      h.fakeFetch.onGet("asset-manifest.json", () =>
-        Response.json({ schemaVersion: 2, name: "openclaw-sandbox-bundle", profile: "sandbox" }),
-      );
-      const handle = await createHandle(h);
-
-      await assert.rejects(
-        setupOpenClaw(handle, {
-          gatewayToken: "tok-bundle-manifest-bad",
-          proxyOrigin: "https://example.com",
-        }),
-        new RegExp(OPENCLAW_BUNDLE_COMPATIBILITY_ERROR_CODE),
-      );
-
-      assert.equal(handle.commands.length, 0, "bootstrap should fail before sandbox downloads");
-    } finally {
-      h.teardown();
-    }
-  });
-});
-
-test("setupOpenClaw fails before downloads when present bundle manifest is malformed JSON", async () => {
-  await withEnv({ OPENCLAW_BUNDLE_URL: "https://example.test/openclaw.bundle.mjs" }, async () => {
-    const h = createScenarioHarness();
-    try {
-      h.fakeFetch.onGet("asset-manifest.json", () =>
-        new Response("not json", { status: 200, headers: { "content-type": "application/json" } }),
-      );
-      const handle = await createHandle(h);
-
-      await assert.rejects(
-        setupOpenClaw(handle, {
-          gatewayToken: "tok-bundle-manifest-malformed",
-          proxyOrigin: "https://example.com",
-        }),
-        new RegExp(OPENCLAW_BUNDLE_COMPATIBILITY_ERROR_CODE),
-      );
-
-      assert.equal(handle.commands.length, 0, "bootstrap should fail before sandbox downloads");
-    } finally {
-      h.teardown();
-    }
-  });
-});
-
-test("setupOpenClaw extracts bundled channel plugins into OpenClaw trusted dist extensions", async () => {
-  await withEnv({ OPENCLAW_BUNDLE_URL: "https://example.test/openclaw.bundle.mjs" }, async () => {
-    const h = createScenarioHarness();
-    try {
-      h.fakeFetch.onGet("asset-manifest.json", () => new Response("not found", { status: 404 }));
-      const handle = await createHandle(h);
-
-      await setupOpenClaw(handle, {
-        gatewayToken: "tok-bundle-channels",
-        proxyOrigin: "https://example.com",
-      });
-
-      const channelsDownload = handle.commands.find(
-        (c) => c.cmd === "bash" && c.args?.[1]?.includes("channels.tar.gz"),
-      );
-      assert.ok(channelsDownload, "bundle command should fetch channel plugins");
-      const script = channelsDownload.args?.[1] ?? "";
-      assert.ok(
-        script.includes(`mkdir -p ${JSON.stringify(OPENCLAW_BUNDLED_PLUGINS_DIR_PATH)}`),
-        "channel plugin directory should use the trusted bundled plugin path",
-      );
-      assert.ok(
-        script.includes(`tar xz -C ${JSON.stringify(OPENCLAW_BUNDLED_PLUGINS_DIR_PATH)}`),
-        "channel plugins should extract into the trusted bundled plugin path",
-      );
-      assert.equal(
-        OPENCLAW_BUNDLED_PLUGINS_DIR_PATH,
-        "/home/vercel-sandbox/dist/extensions",
-        "OpenClaw bundle discovery only trusts dist/extensions under the bundle package root",
-      );
-    } finally {
-      h.teardown();
-    }
-  });
-});
-
-test("setupOpenClaw preserves bundle package root identity after shim package extraction", async () => {
-  await withEnv({ OPENCLAW_BUNDLE_URL: "https://example.test/openclaw.bundle.mjs" }, async () => {
-    const h = createScenarioHarness();
-    try {
-      h.fakeFetch.onGet("asset-manifest.json", () => new Response("not found", { status: 404 }));
-      const handle = await createHandle(h);
-
-      await setupOpenClaw(handle, {
-        gatewayToken: "tok-bundle-package-root",
-        proxyOrigin: "https://example.com",
-      });
-
-      const openclawPkg = handle.commands.find(
-        (c) => c.cmd === "bash" && c.args?.[1]?.includes("bundle-openclaw-pkg.tar.gz"),
-      );
-      assert.ok(openclawPkg, "bundle command should fetch the openclaw shim package");
-      const script = openclawPkg.args?.[1] ?? "";
-      assert.ok(
-        script.includes(`tar xz -C /home/vercel-sandbox`),
-        "shim package should extract at the bundle package root",
-      );
-      assert.ok(
-        script.includes(
-          "cp /home/vercel-sandbox/node_modules/openclaw/dist/plugins/runtime/index.js /home/vercel-sandbox/dist/plugins/runtime/index.js",
-        ),
-        "shim package extraction should stage the plugin runtime at the bundle package root",
-      );
-      assert.ok(
-        script.includes(`echo '{"name":"openclaw","private":true,"version":"0.0.0","type":"module"}' > /home/vercel-sandbox/package.json`),
-        "shim package extraction must not leave the package root named as the sandbox runtime helper",
-      );
-    } finally {
-      h.teardown();
-    }
-  });
-});
-
-test("setupOpenClaw creates bundle compatibility shims after shared chunks extraction", async () => {
-  await withEnv({ OPENCLAW_BUNDLE_URL: "https://example.test/openclaw.bundle.mjs" }, async () => {
-    const h = createScenarioHarness();
-    try {
-      h.fakeFetch.onGet("asset-manifest.json", () => new Response("not found", { status: 404 }));
-      const handle = await createHandle(h);
-
-      await setupOpenClaw(handle, {
-        gatewayToken: "tok-bundle-shims",
-        proxyOrigin: "https://example.com",
-      });
-
-      const sharedChunks = handle.commands.find(
-        (c) => c.cmd === "bash" && c.args?.[1]?.includes("channel-shared-chunks.tar.gz"),
-      );
-      assert.ok(sharedChunks, "bundle command should fetch shared chunks");
-      const script = sharedChunks.args?.[1] ?? "";
-      assert.ok(
-        script.includes("agents/model-catalog.runtime.js"),
-        "shared chunks setup should create model-catalog compatibility shim",
-      );
-      assert.ok(
-        script.includes("$ROOT/dist/agents/model-catalog.runtime.js"),
-        "shared chunks setup should create dist model-catalog shim for dist/* imports",
-      );
-      assert.ok(
-        script.includes("config/config.js"),
-        "shared chunks setup should create config compatibility shim",
-      );
-      assert.ok(
-        script.includes("$ROOT/dist/config/config.js"),
-        "shared chunks setup should create dist config shim for dist/* imports",
-      );
-      assert.ok(
-        script.includes("find \"$ROOT\" -maxdepth 1 -type f \\( -name '*.js' -o -name '*.cjs' \\) -exec cp -f {} \"$ROOT/dist/\" \\;"),
-        "shared chunks setup should mirror root chunks into dist for channel relative imports",
-      );
-      assert.ok(
-        script.includes("run-model-catalog.runtime.js"),
-        "model-catalog shim should point to extracted root runtime",
-      );
-      assert.ok(
-        script.includes("agents/auth-profiles.runtime.js"),
-        "shared chunks setup should create auth-profiles compatibility shim",
-      );
-      assert.ok(
-        script.includes("ensureAuthProfileStore"),
-        "auth-profiles shim should select the auth chunk by export signature",
-      );
-      assert.ok(
-        script.includes("agents/pi-model-discovery-runtime.js"),
-        "shared chunks setup should create pi model discovery compatibility shim",
-      );
-      assert.ok(
-        script.includes("discoverModels"),
-        "pi model discovery shim should select the chunk by export signature",
-      );
-      assert.ok(
-        script.includes("export const discoverModels") && script.includes("export const ModelRegistry") && script.includes("export const AuthStorage"),
-        "pi model discovery shim should expose the non-minified discovery export name",
-      );
-      assert.ok(
-        script.includes("agents/models-config.runtime.js"),
-        "shared chunks setup should create models config runtime compatibility shim",
-      );
-      assert.ok(
-        script.includes("n as ensureOpenClawModelsJson"),
-        "models config shim should expose the non-minified ensure export name",
-      );
-      assert.ok(
-        script.includes("agents/pi-bundle-mcp-runtime.js"),
-        "shared chunks setup should create pi bundle MCP runtime compatibility shim",
-      );
-      assert.ok(
-        script.includes("r as createSessionMcpRuntime"),
-        "pi bundle MCP shim should expose the non-minified runtime factory export name",
-      );
-      assert.ok(
-        script.includes("plugins/provider-discovery.runtime.js"),
-        "shared chunks setup should create provider-discovery compatibility shim",
-      );
-      assert.ok(
-        script.includes("$ROOT/dist/plugins/provider-discovery.runtime.js"),
-        "shared chunks setup should create dist provider-discovery shim for dist/* imports",
-      );
-      assert.ok(
-        script.includes("export * from '../provider-discovery.runtime.js';"),
-        "provider-discovery shim should point to extracted root runtime",
-      );
-      assert.ok(
-        script.includes("export { t as resolvePluginDiscoveryProvidersRuntime } from '../provider-discovery.runtime.js';"),
-        "provider-discovery shim should expose the non-minified runtime export name",
-      );
-      assert.ok(
-        script.includes("getRuntimeConfig as i"),
-        "config shim should select the config IO chunk by export signature",
-      );
-      assert.ok(
-        script.includes("replaceConfigFile as r"),
-        "config shim should select the mutation chunk by export signature",
-      );
-      assert.ok(
-        script.includes("CONFIG_PATH as t"),
-        "config shim should select the gateway path chunk by export signature",
-      );
-    } finally {
-      h.teardown();
-    }
-  });
 });
 
 // ---------------------------------------------------------------------------

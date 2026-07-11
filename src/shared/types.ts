@@ -10,6 +10,10 @@ import {
   type ChannelName,
 } from "@/shared/channels";
 import { normalizeChannelDeliverySnapshot } from "@/shared/channel-delivery";
+import {
+  isVerifiedBundleIdentity,
+  type VerifiedBundleIdentity,
+} from "@/shared/bundle-identity";
 
 export const DEFAULT_OPENCLAW_INSTANCE_ID = "openclaw-single";
 export const INSTANCE_ID_OVERRIDE_GLOBAL_KEY = "__openclawInstanceIdOverrideForTesting";
@@ -445,6 +449,8 @@ export type SingleMeta = {
   /** Unix-epoch ms when restorePreparedStatus was last set to "ready". */
   restorePreparedAt: number | null;
   openclawVersion: string | null;
+  /** Exact bundle identity admitted and digest-verified during sandbox setup. */
+  bundleIdentity: VerifiedBundleIdentity | null;
   status: SingleStatus;
   gatewayToken: string;
   createdAt: number;
@@ -516,6 +522,7 @@ export function createDefaultMeta(
     restorePreparedReason: null,
     restorePreparedAt: null,
     openclawVersion: null,
+    bundleIdentity: null,
     status: "uninitialized",
     gatewayToken,
     createdAt: now,
@@ -683,6 +690,13 @@ export function ensureMetaShape(
     restorePreparedAt: legacyPreparedAt,
     openclawVersion:
       typeof raw.openclawVersion === "string" ? raw.openclawVersion : null,
+    bundleIdentity: isVerifiedBundleIdentity(
+      (raw as Record<string, unknown>).bundleIdentity,
+    )
+      ? structuredClone(
+          (raw as Record<string, unknown>).bundleIdentity as VerifiedBundleIdentity,
+        )
+      : null,
     status: isSingleStatus(raw.status) ? raw.status : "uninitialized",
     gatewayToken: typeof raw.gatewayToken === "string" ? raw.gatewayToken : "",
     createdAt,

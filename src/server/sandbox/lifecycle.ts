@@ -22,13 +22,21 @@ import {
 } from "@/server/env";
 import { applyFirewallPolicyToSandbox, toNetworkPolicy } from "@/server/firewall/policy";
 import { logError, logInfo, logWarn } from "@/server/log";
-import { setupOpenClaw, CommandFailedError } from "@/server/openclaw/bootstrap";
+import {
+  setupOpenClaw,
+  CommandFailedError,
+  OPENCLAW_BUNDLE_IDENTITY_PATH,
+} from "@/server/openclaw/bootstrap";
+import {
+  hydrateVerifiedBundleIdentity,
+  verifiedBundleIdentitiesEqual,
+} from "@/server/openclaw/bundle-identity";
+import { isVerifiedBundleIdentity } from "@/shared/bundle-identity";
 import {
   buildClearStaleGatewayLockShell,
   computeGatewayConfigHash,
   GATEWAY_CONFIG_HASH_VERSION,
   OPENCLAW_BIN,
-  OPENCLAW_BUNDLE_PATH,
   OPENCLAW_CONFIG_PATH,
   OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
   OPENCLAW_GATEWAY_RESTART_SCRIPT_PATH,
@@ -1278,6 +1286,7 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
       ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
       : undefined,
     whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
+    bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
 
   const sandboxId = meta.sandboxId;
@@ -1420,6 +1429,7 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
         }
       : undefined,
     whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
+    bundleCapabilities: meta.bundleIdentity?.capabilities,
   };
   const expectedHash = computeGatewayConfigHash(configHashInput);
 
@@ -1455,6 +1465,7 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
       ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
       : undefined,
     whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
+    bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
 
   let sandbox: SandboxHandle;
@@ -1871,6 +1882,7 @@ export async function prepareRestoreTarget(input: {
         }
       : undefined,
     whatsappConfig: toWhatsAppGatewayConfig(meta.channels.whatsapp),
+    bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
   const desiredAssetSha256 = buildRestoreAssetManifest().sha256;
   const preparedAt = Date.now();
@@ -3116,6 +3128,118 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     // If promotion succeeds, skip the normal get/create flow entirely.
     // Gated — no-op when OPENCLAW_HOT_SPARE_ENABLED is not "true".
     let sandbox: SandboxHandle | undefined;
+    let sandboxWasCreated = false;
+    const unhealthyResumeStatuses = new Set<string>([
+      "failed",
+      "error",
+      "aborted",
+      "stopped",
+    ]);
+    const createPersistentSandbox = async (
+      conflictMode: "resume" | "replace",
+    ): Promise<{ handle: SandboxHandle; created: boolean }> => {
+      const create = async () =>
+        getSandboxController().create({
+          name: sandboxName,
+          persistent: true,
+          ports: SANDBOX_PORTS,
+          timeout: sleepAfterMs,
+          resources: { vcpus },
+          ...(await buildRuntimeEnv()),
+        });
+
+      try {
+        return { handle: await create(), created: true };
+      } catch (createErr) {
+        const apiJson = (createErr as { json?: unknown }).json;
+        const status = (createErr as { status?: unknown }).status;
+        if (status !== 409) {
+          logError("sandbox.create.failed", ctx({
+            sandboxName,
+            error: createErr instanceof Error ? createErr.message : String(createErr),
+            ...(apiJson ? { apiJson } : {}),
+          }));
+          progress.appendLine(
+            "system",
+            `Create failed: ${createErr instanceof Error ? createErr.message : String(createErr)}`,
+          );
+          throw createErr;
+        }
+
+        logWarn("sandbox.create.name_conflict_recovery", ctx({
+          sandboxName,
+          conflictMode,
+          error: createErr instanceof Error ? createErr.message : String(createErr),
+          ...(apiJson ? { apiJson } : {}),
+        }));
+        progress.appendLine(
+          "system",
+          `Create 409 — recovering ${sandboxName}`,
+        );
+
+        if (conflictMode === "resume") {
+          try {
+            const recovered = await getSandboxController().get({
+              sandboxId: sandboxName,
+              resume: true,
+            });
+            if (unhealthyResumeStatuses.has(recovered.status)) {
+              throw new Error(
+                `name_conflict_resume_unhealthy_handle:${recovered.status}:${recovered.sandboxId}`,
+              );
+            }
+            progress.appendLine(
+              "system",
+              `Recovered: ${recovered.sandboxId} status=${recovered.status}`,
+            );
+            return { handle: recovered, created: false };
+          } catch (getErr) {
+            logError("sandbox.create.name_conflict_get_fallback_failed", ctx({
+              sandboxName,
+              error: getErr instanceof Error ? getErr.message : String(getErr),
+            }));
+            progress.appendLine(
+              "system",
+              `Get fallback failed: ${getErr instanceof Error ? getErr.message : String(getErr)}`,
+            );
+            throw createErr;
+          }
+        }
+
+        // Identity mismatch must never adopt the conflicting handle. Delete
+        // any still-bound name and retry one fresh create after the SDK calls
+        // complete, covering delayed persistent-name release without reusing
+        // partial bundle state.
+        try {
+          const conflicting = await getSandboxController().get({
+            sandboxId: sandboxName,
+            resume: true,
+          });
+          await conflicting.delete();
+        } catch (getOrDeleteErr) {
+          logWarn("sandbox.create.name_conflict_replacement_cleanup_failed", ctx({
+            sandboxName,
+            error:
+              getOrDeleteErr instanceof Error
+                ? getOrDeleteErr.message
+                : String(getOrDeleteErr),
+          }));
+        }
+        try {
+          return { handle: await create(), created: true };
+        } catch (retryErr) {
+          logError("sandbox.create.name_conflict_replacement_failed", ctx({
+            sandboxName,
+            error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+          }));
+          progress.appendLine(
+            "system",
+            `Replacement create failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
+          );
+          throw retryErr;
+        }
+      }
+    };
     if (isHotSpareEnabled()) {
       try {
         const promoteResult = await promoteHotSpare(current, {
@@ -3146,7 +3270,6 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     // Fall back to create() only if the sandbox doesn't exist yet, or if the
     // platform returns a handle that cannot be used for immediate commands.
     if (!sandbox) {
-    const unhealthyResumeStatuses = new Set<string>(["failed", "error", "aborted", "stopped"]);
     try {
       progress.appendLine("system", `Resuming persistent sandbox: ${sandboxName}`);
       const resumedHandle = await getSandboxController().get({ sandboxId: sandboxName, resume: true });
@@ -3205,92 +3328,97 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         });
       }
       progress.appendLine("system", `No existing sandbox — creating: ${sandboxName}`);
-      try {
-        sandbox = await getSandboxController().create({
-          name: sandboxName,
-          persistent: true,
-          ports: SANDBOX_PORTS,
-          timeout: sleepAfterMs,
-          resources: { vcpus },
-          ...(await buildRuntimeEnv()),
-        });
+      const createResult = await createPersistentSandbox("resume");
+      sandbox = createResult.handle;
+      sandboxWasCreated = createResult.created;
+      if (createResult.created) {
         progress.appendLine("system", `Created: ${sandbox.sandboxId}`);
-      } catch (createErr) {
-        const apiJson = (createErr as { json?: unknown }).json;
-        const status = (createErr as { status?: unknown }).status;
-        // A 409 from create() means the persistent sandbox name is already
-        // bound to a handle that our earlier get() missed (e.g. the platform
-        // raced a resume after our get() returned or a prior unhealthy
-        // delete didn't take). Instead of failing the restore, fall back to
-        // get() by name — the implicit resume on first runCommand will wake
-        // it. This is the recovery path alluded to at line 2694 above.
-        if (status === 409) {
-          logWarn("sandbox.create.name_conflict_recovery", ctx({
-            sandboxName,
-            error: createErr instanceof Error ? createErr.message : String(createErr),
-            ...(apiJson ? { apiJson } : {}),
-          }));
-          progress.appendLine(
-            "system",
-            `Create 409 — recovering via get(${sandboxName})`,
-          );
-          try {
-            sandbox = await getSandboxController().get({ sandboxId: sandboxName, resume: true });
-            if (unhealthyResumeStatuses.has(sandbox.status)) {
-              throw new Error(
-                `name_conflict_resume_unhealthy_handle:${sandbox.status}:${sandbox.sandboxId}`,
-              );
-            }
-            progress.appendLine(
-              "system",
-              `Recovered: ${sandbox.sandboxId} status=${sandbox.status}`,
-            );
-          } catch (getErr) {
-            logError("sandbox.create.name_conflict_get_fallback_failed", ctx({
-              sandboxName,
-              error: getErr instanceof Error ? getErr.message : String(getErr),
-            }));
-            progress.appendLine(
-              "system",
-              `Get fallback failed: ${getErr instanceof Error ? getErr.message : String(getErr)}`,
-            );
-            throw createErr;
-          }
-        } else {
-          logError("sandbox.create.failed", ctx({
-            sandboxName,
-            error: createErr instanceof Error ? createErr.message : String(createErr),
-            ...(apiJson ? { apiJson } : {}),
-          }));
-          progress.appendLine("system", `Create failed: ${createErr instanceof Error ? createErr.message : String(createErr)}`);
-          throw createErr;
-        }
       }
     }
     } // end if (!sandbox)
 
-    logInfo("sandbox.status_transition", ctx({ from: "creating", to: "setup", sandboxId: sandbox.sandboxId, sandboxStatus: sandbox.status, vcpus, sleepAfterMs }));
+    const initialSandbox = sandbox;
+    logInfo("sandbox.status_transition", ctx({ from: "creating", to: "setup", sandboxId: initialSandbox.sandboxId, sandboxStatus: initialSandbox.status, vcpus, sleepAfterMs }));
     await mutateMeta((meta) => {
       meta.status = "setup";
-      meta.sandboxId = sandbox.sandboxId;
-      meta.portUrls = resolvePortUrls(sandbox);
+      meta.sandboxId = initialSandbox.sandboxId;
+      meta.portUrls = resolvePortUrls(initialSandbox);
       meta.lastAccessedAt = Date.now();
     });
 
-    // Detect resumed persistent sandbox by checking for either runtime marker
-    // on disk instead of running OpenClaw. Bundle deployments do not install
-    // the legacy global binary, so checking only OPENCLAW_BIN misclassifies a
-    // stopped persistent bundle sandbox as fresh and reruns full bootstrap.
-    // NOTE: For stopped persistent sandboxes, this runCommand is also the
-    // implicit resume trigger — the platform auto-starts on first command.
-    const whichCheck = await sandbox.runCommand("bash", [
-      "-c",
-      [
-        `test -x "$(command -v ${OPENCLAW_BIN} 2>/dev/null)"`,
-        `test -f ${JSON.stringify(OPENCLAW_BUNDLE_PATH)}`,
-      ].join(" || ") + " && echo yes || echo no",
-    ]);
-    const isResumed = (await whichCheck.output("stdout")).trim() === "yes";
+    let isResumed: boolean;
+    if (process.env.OPENCLAW_BUNDLE_URL?.trim()) {
+      const latest = await getInitializedMeta();
+      const currentIdentity = await hydrateVerifiedBundleIdentity(
+        latest.bundleIdentity,
+      );
+      let markerIdentity: unknown = null;
+      let markerPresent = false;
+      try {
+        const markerResult = await sandbox.runCommand("bash", [
+          "-c",
+          `test -f ${JSON.stringify(OPENCLAW_BUNDLE_IDENTITY_PATH)} && cat ${JSON.stringify(OPENCLAW_BUNDLE_IDENTITY_PATH)}`,
+        ]);
+        if (markerResult.exitCode === 0) {
+          markerIdentity = JSON.parse(await markerResult.output("stdout"));
+          markerPresent = true;
+        }
+      } catch {
+        // An unreadable marker cannot authorize reuse. Replace this sandbox
+        // below rather than retrying against unknown partial bundle state.
+      }
+      isResumed = Boolean(
+        currentIdentity &&
+        isVerifiedBundleIdentity(markerIdentity) &&
+        verifiedBundleIdentitiesEqual(markerIdentity, currentIdentity),
+      );
+
+      // A bundle file can be left behind by a failed bootstrap. The identity
+      // receipt is written last, after digest checks and external plugin
+      // installation, so only that receipt can authorize persistent reuse.
+      if (!isResumed && !sandboxWasCreated) {
+        logWarn("sandbox.create.bundle_identity_mismatch", ctx({
+          sandboxId: sandbox.sandboxId,
+          markerPresent,
+          persistedIdentityPresent: latest.bundleIdentity !== null,
+        }));
+        progress.appendLine(
+          "system",
+          "Bundle identity missing or stale — replacing persistent sandbox",
+        );
+        await sandbox.delete();
+        const replacementSandbox = (
+          await createPersistentSandbox("replace")
+        ).handle;
+        sandbox = replacementSandbox;
+        sandboxWasCreated = true;
+        await mutateMeta((meta) => {
+          meta.status = "setup";
+          meta.sandboxId = replacementSandbox.sandboxId;
+          meta.portUrls = resolvePortUrls(replacementSandbox);
+          meta.bundleIdentity = null;
+          meta.snapshotId = null;
+          meta.snapshotConfigHash = null;
+          meta.snapshotDynamicConfigHash = null;
+          meta.snapshotAssetSha256 = null;
+          meta.persistedStateDynamicConfigHash = null;
+          meta.persistedStateAssetSha256 = null;
+          meta.persistedStateSavedAt = null;
+          meta.persistedStateSource = null;
+          meta.restorePreparedStatus = "dirty";
+          meta.restorePreparedReason = "snapshot-missing";
+          meta.restorePreparedAt = null;
+        });
+      }
+    } else {
+      // NOTE: This command is the implicit resume trigger for stopped npm
+      // sandboxes. Bundle mode deliberately uses the receipt path above.
+      const whichCheck = await sandbox.runCommand("bash", [
+        "-c",
+        `test -x "$(command -v ${OPENCLAW_BIN} 2>/dev/null)" && echo yes || echo no`,
+      ]);
+      isResumed = (await whichCheck.output("stdout")).trim() === "yes";
+    }
     progress.appendLine("system", isResumed ? "Persistent sandbox resumed" : "Fresh sandbox");
 
     if (isResumed) {
@@ -3317,6 +3445,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         telegramWebhookSecret: latest.channels.telegram?.webhookSecret,
         slackCredentials: validatedSlackCreds ?? undefined,
         whatsappConfig: toWhatsAppGatewayConfig(latest.channels.whatsapp),
+        bundleCapabilities: latest.bundleIdentity?.capabilities,
       });
       const assetSyncMs = Date.now() - assetSyncStart;
 
@@ -3511,6 +3640,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       meta.lastAccessedAt = Date.now();
       meta.startupScript = setupResult.startupScript;
       meta.openclawVersion = setupResult.openclawVersion;
+      meta.bundleIdentity = setupResult.bundleIdentity;
       meta.lastError = null;
       // Record token metadata from the credential used during boot.
       if (credential) {
@@ -3633,6 +3763,7 @@ async function syncRestoreAssetsIfNeeded(
     telegramWebhookSecret?: string;
     slackCredentials?: { botToken: string; signingSecret: string };
     whatsappConfig?: import("@/server/openclaw/config").WhatsAppGatewayConfig;
+    bundleCapabilities?: readonly string[];
   },
 ): Promise<{ skippedStaticAssetSync: boolean; assetSha256: string }> {
   const manifest = buildRestoreAssetManifest();
@@ -3655,6 +3786,7 @@ async function syncRestoreAssetsIfNeeded(
     telegramWebhookSecret: options.telegramWebhookSecret,
     slackCredentials: options.slackCredentials,
     whatsappConfig: options.whatsappConfig,
+    bundleCapabilities: options.bundleCapabilities,
   });
 
   const skippedStaticAssetSync = existingSha === manifest.sha256;
@@ -3839,6 +3971,7 @@ function clearSandboxRuntimeStateForReset(meta: SingleMeta): void {
   meta.lastAccessedAt = null;
   meta.startupScript = null;
   meta.openclawVersion = null;
+  meta.bundleIdentity = null;
   meta.lastError = null;
   meta.lifecycleAttemptId = null;
 

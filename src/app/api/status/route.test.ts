@@ -12,6 +12,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { computeGatewayConfigHash } from "@/server/openclaw/config";
+import {
+  _resetBundleIdentityForTesting,
+  _setBundleAdmissionForTesting,
+  type VerifiedBundleIdentity,
+} from "@/server/openclaw/bundle-identity";
 import { buildRestoreAssetManifest } from "@/server/openclaw/restore-assets";
 import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
 import {
@@ -59,6 +64,12 @@ async function withTestEnv(fn: () => Promise<void>): Promise<void> {
     "BASE_DOMAIN",
     "ADMIN_SECRET",
     "SESSION_SECRET",
+    "OPENCLAW_PACKAGE_SPEC",
+    "OPENCLAW_BUNDLE_URL",
+    "OPENCLAW_BUNDLE_UI_URL",
+    "OPENCLAW_BUNDLE_MANIFEST_URL",
+    "OPENCLAW_BUNDLE_SOURCE_SHA",
+    "OPENCLAW_BUNDLE_SHA256",
   ];
   const originals: Record<string, string | undefined> = {};
 
@@ -73,11 +84,18 @@ async function withTestEnv(fn: () => Promise<void>): Promise<void> {
   delete process.env.KV_URL;
   delete process.env.AI_GATEWAY_API_KEY;
   delete process.env.VERCEL_OIDC_TOKEN;
+  delete process.env.OPENCLAW_PACKAGE_SPEC;
+  delete process.env.OPENCLAW_BUNDLE_URL;
+  delete process.env.OPENCLAW_BUNDLE_UI_URL;
+  delete process.env.OPENCLAW_BUNDLE_MANIFEST_URL;
+  delete process.env.OPENCLAW_BUNDLE_SOURCE_SHA;
+  delete process.env.OPENCLAW_BUNDLE_SHA256;
   process.env.NEXT_PUBLIC_BASE_DOMAIN = "http://localhost:3000";
   process.env.ADMIN_SECRET = "test-admin-secret-for-scenarios";
   process.env.SESSION_SECRET = "test-session-secret-for-smoke-tests";
 
   _resetStoreForTesting();
+  _resetBundleIdentityForTesting();
 
   try {
     await fn();
@@ -85,6 +103,7 @@ async function withTestEnv(fn: () => Promise<void>): Promise<void> {
     resetAfterCallbacks();
     _setSandboxControllerForTesting(null);
     _resetStoreForTesting();
+    _resetBundleIdentityForTesting();
     for (const key of keys) {
       if (originals[key] === undefined) {
         delete process.env[key];
@@ -183,6 +202,91 @@ test("GET /api/status: includes firewall and channel state", async () => {
       body.featureSupport.entries.find((entry) => entry.id === "plugins-skills-bundled")?.hostedStatus,
       "bundled-only",
     );
+  });
+});
+
+test("GET /api/status: exposes only the persisted, currently admitted bundle identity", async () => {
+  await withTestEnv(async () => {
+    const identity: VerifiedBundleIdentity = {
+      packageSpec: "openclaw@2026.7.2",
+      version: "2026.7.2",
+      forkSha: "1".repeat(40),
+      upstreamSha: "2".repeat(40),
+      canonicalSha256: "3".repeat(64),
+      capabilities: [
+        "admin-http-rpc-v1",
+        "cron-projection-v1",
+        "gateway-suspend-v1",
+        "telegram-durable-ack-v1",
+      ],
+      verified: true,
+    };
+    _setBundleAdmissionForTesting({
+      identity,
+      canonicalTarball: "openclaw-sandbox-bundle.tar.gz",
+      canonicalTarballUrl: "https://internal.invalid/not-exposed",
+      assets: {},
+      externalPlugins: [],
+    });
+    await mutateMeta((meta) => {
+      meta.bundleIdentity = identity;
+    });
+
+    const route = getStatusRoute();
+    const result = await callRoute(route.GET!, buildAuthGetRequest("/api/status"));
+    assert.equal(result.status, 200);
+    const body = result.json as Record<string, unknown>;
+    assert.deepEqual(body.bundleIdentity, identity);
+    const serialized = JSON.stringify(body.bundleIdentity);
+    assert.equal(serialized.includes("url"), false);
+    assert.equal(serialized.includes("integrity"), false);
+    assert.equal(serialized.includes("plugin"), false);
+  });
+});
+
+test("GET /api/status: degrades unavailable bundle admission to an unknown identity", async () => {
+  await withTestEnv(async () => {
+    const identity: VerifiedBundleIdentity = {
+      packageSpec: "openclaw@2026.7.2",
+      version: "2026.7.2",
+      forkSha: "1".repeat(40),
+      upstreamSha: "2".repeat(40),
+      canonicalSha256: "3".repeat(64),
+      capabilities: [
+        "admin-http-rpc-v1",
+        "cron-projection-v1",
+        "gateway-suspend-v1",
+        "telegram-durable-ack-v1",
+      ],
+      verified: true,
+    };
+    process.env.OPENCLAW_BUNDLE_URL =
+      "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/openclaw.bundle.mjs";
+    process.env.OPENCLAW_BUNDLE_UI_URL =
+      "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/control-ui.tar.gz";
+    process.env.OPENCLAW_BUNDLE_MANIFEST_URL =
+      "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2/asset-manifest.json";
+    process.env.OPENCLAW_BUNDLE_SOURCE_SHA = identity.forkSha;
+    process.env.OPENCLAW_BUNDLE_SHA256 = identity.canonicalSha256;
+    await mutateMeta((meta) => {
+      meta.bundleIdentity = identity;
+    });
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalled = false;
+    globalThis.fetch = async () => {
+      fetchCalled = true;
+      return new Response("unavailable", { status: 503 });
+    };
+    try {
+      const route = getStatusRoute();
+      const result = await callRoute(route.GET!, buildAuthGetRequest("/api/status"));
+      assert.equal(result.status, 200);
+      assert.equal(fetchCalled, true);
+      assert.equal((result.json as Record<string, unknown>).bundleIdentity, null);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

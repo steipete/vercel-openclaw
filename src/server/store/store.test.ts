@@ -338,6 +338,31 @@ test("ensureMetaShape: preserves existing fields when all present", () => {
   });
 });
 
+test("ensureMetaShape: keeps only exact verified bundle identities", () => {
+  const identity = {
+    packageSpec: "openclaw@2026.7.2",
+    version: "2026.7.2",
+    forkSha: "1".repeat(40),
+    upstreamSha: "2".repeat(40),
+    canonicalSha256: "3".repeat(64),
+    capabilities: [
+      "admin-http-rpc-v1",
+      "cron-projection-v1",
+      "gateway-suspend-v1",
+      "telegram-durable-ack-v1",
+    ],
+    verified: true as const,
+  };
+  const valid = ensureMetaShape({ gatewayToken: "tok", bundleIdentity: identity });
+  assert.deepEqual(valid?.bundleIdentity, identity);
+
+  const invalid = ensureMetaShape({
+    gatewayToken: "tok",
+    bundleIdentity: { ...identity, releaseUrl: "https://must-not-leak.invalid" },
+  });
+  assert.equal(invalid?.bundleIdentity, null);
+});
+
 test("ensureMetaShape: handles completely empty object (worst-case legacy data)", () => {
   const result = ensureMetaShape({});
   // Empty object has no gatewayToken, so it gets "" which is falsy

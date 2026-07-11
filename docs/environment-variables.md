@@ -39,7 +39,7 @@ Set `VERCEL_AUTH_MODE=sign-in-with-vercel` to use Vercel OAuth instead of `ADMIN
 
 | Variable | Purpose |
 | -------- | ------- |
-| `OPENCLAW_PACKAGE_SPEC` | Pin to an exact version like `openclaw@1.2.3` for deterministic sandbox resumes and comparable benchmarks. When unset, the runtime falls back to a pinned known-good version (currently `openclaw@2026.4.12`) and the deployment contract warns on Vercel. |
+| `OPENCLAW_PACKAGE_SPEC` | Pin to an exact version like `openclaw@1.2.3` for deterministic npm-backed sandbox resumes and comparable benchmarks. When unset, the npm path falls back to a pinned known-good version (currently `openclaw@2026.4.12`) and the deployment contract warns on Vercel. Verified bundle mode instead derives the exact package spec from its admitted manifest. |
 | `OPENCLAW_INSTANCE_ID` | Optional Redis key namespace. On Vercel deployments, automatically uses `VERCEL_PROJECT_ID` when unset, giving each project its own namespace. Falls back to `openclaw-single` in local/non-Vercel environments. Can be set explicitly to override auto-detection. Changing it later points the app at a new namespace; it does not migrate existing state. |
 | `OPENCLAW_SANDBOX_VCPUS` | vCPU count for sandbox create/resume (1, 2, 4, or 8; default: 1). Keep fixed during benchmarks. |
 | `OPENCLAW_SANDBOX_SLEEP_AFTER_MS` | How long the sandbox stays alive after last activity, in milliseconds (60000–2700000; default: 1800000 = 30 min). Heartbeat and touch-throttle intervals are derived proportionally. Existing running sandboxes cannot be shortened in place. If you increase this value, the next touch/heartbeat can top the sandbox timeout up to the new target. If you decrease it, the lower value becomes exact on the next create or restore. |
@@ -48,8 +48,13 @@ Set `VERCEL_AUTH_MODE=sign-in-with-vercel` to use Vercel OAuth instead of `ADMIN
 
 | Variable | Purpose |
 | -------- | ------- |
-| `OPENCLAW_BUNDLE_URL` | Optional URL to a published `openclaw.bundle.mjs` release asset. `vclaw create --bundle-url` sets this when pinning a bundle. A compatible release must include the required sidecar assets documented in [Release and Reliability](getting-started/release-and-reliability.md). |
-| `OPENCLAW_BUNDLE_UI_URL` | Optional URL to the matching `control-ui.tar.gz` asset. `vclaw` derives this from `OPENCLAW_BUNDLE_URL` when using the standard release asset layout. |
+| `OPENCLAW_BUNDLE_URL` | Official `vercel-labs/openclaw` GitHub Release URL for `openclaw.bundle.mjs`. |
+| `OPENCLAW_BUNDLE_UI_URL` | Matching release URL for `control-ui.tar.gz`. |
+| `OPENCLAW_BUNDLE_MANIFEST_URL` | Matching release URL for schema-v2 `asset-manifest.json`. |
+| `OPENCLAW_BUNDLE_SOURCE_SHA` | Exact 40-character lowercase fork commit SHA recorded by the manifest. |
+| `OPENCLAW_BUNDLE_SHA256` | Exact lowercase SHA-256 of the canonical tarball named by the manifest. |
+
+Bundle pinning is optional, but the five bundle variables above are all-or-none. The admitted manifest is authoritative for the exact package spec; if `OPENCLAW_PACKAGE_SPEC` is also set, it must be exact and match. All URLs must be HTTPS assets from the same official release. `vclaw` sets the complete group and matching package spec; partial, legacy, or mismatched configuration fails closed. See [Release and Reliability](getting-started/release-and-reliability.md).
 
 ## Slack OAuth install (optional)
 

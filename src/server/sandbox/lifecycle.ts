@@ -98,6 +98,7 @@ import {
 } from "@/server/sandbox/host-suspension";
 import {
   estimateSandboxTimeoutRemainingMs,
+  SANDBOX_TIMEOUT_SAFETY_RUNWAY_MS,
   getSandboxPlatformTimeoutMs,
   getSandboxSleepAfterMs,
   getSandboxTimeoutExtensionMs,
@@ -2373,11 +2374,6 @@ export async function prepareRestoreTarget(input: {
   const syncDeadlineAtMs = Date.now() + PREPARE_RESTORE_SYNC_BUDGET_MS;
   const actions: PrepareRestoreAction[] = [];
   const meta = await getInitializedMeta();
-  const verifiedBundleIdentity = matchesConfiguredBundleIdentity(
-    meta.bundleIdentity,
-  )
-    ? meta.bundleIdentity
-    : null;
   const isDestructive = input.destructive ?? false;
   const ownsPrepareTarget = (candidate: SingleMeta): boolean =>
     candidate.sandboxId === meta.sandboxId
@@ -2974,11 +2970,18 @@ export async function ensureSandboxAliveThrough(deadlineMs: number): Promise<Sin
 
   const requiredRemainingMs = deadlineMs - Date.now();
   const remainingMs = sandbox.timeoutRemaining;
-  const extendByMs = Math.max(0, requiredRemainingMs + 2_000 - remainingMs);
+  const requiredNativeRemainingMs =
+    requiredRemainingMs + SANDBOX_TIMEOUT_SAFETY_RUNWAY_MS + 2_000;
+  const extendByMs = getSandboxTimeoutExtensionMs({
+    currentTotalMs: sandbox.timeout,
+    currentRemainingMs: remainingMs,
+    targetRemainingMs: requiredNativeRemainingMs,
+  });
   if (extendByMs > 0) {
     await sandbox.extendTimeout(extendByMs);
   }
-  const requiredVerifiedRemainingMs = Math.max(0, deadlineMs - Date.now());
+  const requiredVerifiedRemainingMs =
+    Math.max(0, deadlineMs - Date.now()) + SANDBOX_TIMEOUT_SAFETY_RUNWAY_MS;
   const verifiedRemainingMs = sandbox.timeoutRemaining;
   if (verifiedRemainingMs + 1_000 < requiredVerifiedRemainingMs) {
     throw new Error("sandbox timeout extension did not reach cron deadline");
@@ -5163,6 +5166,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           sandboxName,
           resumedHandle,
         );
+      sandbox = resumedHandle;
       sandboxIsBundleCandidate = resumedBundleCandidate;
       sandboxNeedsCandidateReplacement = resumedBundleCandidate;
       // Reject unhealthy statuses that @vercel/sandbox will happily return
@@ -5204,7 +5208,10 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           `resume_unhealthy_handle:${resumedHandle.status}:${resumedHandle.sandboxId}`,
         );
       }
-      progress.appendLine("system", `Resumed: ${sandbox.sandboxId} status=${sandbox.status}`);
+      progress.appendLine(
+        "system",
+        `Resumed: ${resumedHandle.sandboxId} status=${resumedHandle.status}`,
+      );
     } catch (resumeError) {
       if (
         resumeError instanceof SandboxLifecycleGuardRejectedError
@@ -5239,7 +5246,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         });
       }
       progress.appendLine("system", `No existing sandbox — creating: ${sandboxName}`);
-      const createResult = await createPersistentSandbox();
+      const createResult = await createPersistentSandbox("resume");
       sandbox = createResult.handle;
       sandboxIsBundleCandidate = createResult.bundleCandidate;
       sandboxNeedsCandidateReplacement = createResult.replaceBeforeBootstrap;
@@ -6361,7 +6368,6 @@ async function destroyCurrentSandboxWithoutSnapshot(
         sandboxId: lookupSandboxId,
         error: message,
       }));
-      markSandboxDestroyed();
       return;
     }
     if (error instanceof ApiError) throw error;

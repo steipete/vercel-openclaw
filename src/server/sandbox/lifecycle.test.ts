@@ -2172,6 +2172,7 @@ test("failed external plugin install deletes its bundle candidate before retry",
       assert.deepEqual(meta.bundleIdentity, BUNDLE_ADMISSION.identity);
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
     }
   });
 });
@@ -3859,7 +3860,7 @@ test("[lifecycle] cron alive-through force-extends timeout despite touch throttl
     const deadlineMs = now + 4 * 60_000;
     const result = await ensureSandboxAliveThrough(deadlineMs);
     assert.equal(result.status, "running");
-    assert.ok(handle.timeout >= deadlineMs - Date.now());
+    assert.ok(handle.timeoutRemaining >= deadlineMs - Date.now() - 1_000);
     assert.equal(fake.getCalls.at(-1)?.resume, false);
   });
 });

@@ -931,6 +931,7 @@ export async function processChannelStep(
         deliveryId,
         capabilityAdmissions.telegramDurableAcceptanceAdmitted,
         capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
+        origin,
       );
       diag.telegramReadinessMode = readinessMode;
       diag.telegramPreForwardProbeMs = Date.now() - preForwardProbeStartedAt;
@@ -1047,6 +1048,7 @@ export async function processChannelStep(
         deliveryId,
         false,
         capabilityAdmissions.gatewayAdmissionRejectionAdmitted,
+        origin,
       );
       forwardResult = {
         ok: retryingResult.ok,
@@ -1100,6 +1102,9 @@ export async function processChannelStep(
         extraForwardHeaders,
         rawBody,
         deliveryId,
+        false,
+        false,
+        origin,
       );
       forwardResult = {
         ok: retryingResult.ok,
@@ -2339,8 +2344,9 @@ async function forwardToNativeHandlerWithRetry(
   extraForwardHeaders: Record<string, string> | null = null,
   rawBody: string | null = null,
   deliveryId: string | null = null,
-  telegramDurableAcceptanceAdmitted = false,
-  gatewayAdmissionRejectionAdmitted = false,
+  telegramDurableAcceptanceAdmitted: boolean,
+  gatewayAdmissionRejectionAdmitted: boolean,
+  controlPlaneOrigin: string,
 ): Promise<RetryingForwardResult> {
   const startedAt = Date.now();
   const deadline = startedAt + RETRYING_FORWARD_TIMEOUT_MS;
@@ -2604,7 +2610,7 @@ async function forwardToNativeHandlerWithRetry(
           const recovery = await ensureUsableAiGatewayCredential({
             minRemainingMs: Number.POSITIVE_INFINITY,
             reason: `channel:${channel}:forward-recovery`,
-            controlPlaneOrigin: origin,
+            controlPlaneOrigin,
           });
           logInfo("channels.ai_gateway_credential_recovery", {
             channel,

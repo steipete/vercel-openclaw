@@ -1982,13 +1982,13 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
   const { getPublicOrigin } = await import("@/server/public-url");
   const proxyOrigin = getPublicOrigin();
 
-  const slackConfig = meta.channels.slack;
+  const slack = meta.channels.slack;
   const files = buildDynamicRestoreFiles({
     proxyOrigin,
     telegramBotToken: meta.channels.telegram?.botToken,
     telegramWebhookSecret: meta.channels.telegram?.webhookSecret,
-    slackCredentials: slackConfig
-      ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
+    slackCredentials: slack
+      ? { botToken: slack.botToken, signingSecret: slack.signingSecret }
       : undefined,
     bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
@@ -2049,7 +2049,7 @@ export async function syncGatewayConfigToSandbox(): Promise<LiveConfigSyncResult
     await waitForGatewayRootReady(sandbox);
     await waitForConfiguredChannelRoutesReady({
       sandbox,
-      slackConfigured: Boolean(slackConfig),
+      slackConfigured: Boolean(slack),
       telegramConfigured: Boolean(meta.channels.telegram),
     });
 
@@ -2159,13 +2159,13 @@ export async function ensureRunningSandboxDynamicConfigFresh(input: {
   }
 
   // Stale — rewrite dynamic config files.
-  const slackConfig = meta.channels.slack;
+  const slack = meta.channels.slack;
   const files = buildDynamicRestoreFiles({
     proxyOrigin: input.origin,
     telegramBotToken: meta.channels.telegram?.botToken,
     telegramWebhookSecret: meta.channels.telegram?.webhookSecret,
-    slackCredentials: slackConfig
-      ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
+    slackCredentials: slack
+      ? { botToken: slack.botToken, signingSecret: slack.signingSecret }
       : undefined,
     bundleCapabilities: meta.bundleIdentity?.capabilities,
   });
@@ -2574,13 +2574,13 @@ export async function prepareRestoreTarget(input: {
   }
   try {
     const sandbox = await getSandboxController().get({ sandboxId: assetMeta.sandboxId! });
-    const slackConfig = assetMeta.channels.slack;
+    const slack = assetMeta.channels.slack;
     await syncRestoreAssetsIfNeeded(sandbox, {
       origin: input.origin,
       telegramBotToken: assetMeta.channels.telegram?.botToken,
       telegramWebhookSecret: assetMeta.channels.telegram?.webhookSecret,
-      slackCredentials: slackConfig
-        ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
+      slackCredentials: slack
+        ? { botToken: slack.botToken, signingSecret: slack.signingSecret }
         : undefined,
       bundleCapabilities: assetMeta.bundleIdentity?.capabilities,
     });
@@ -5405,11 +5405,12 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
 
       const assetSyncStart = Date.now();
       const slackConfig = latest.channels.slack;
+      const tg = latest.channels.telegram;
       const validatedSlackCreds = await validateSlackCredentialsForRestore(slackConfig);
       await syncRestoreAssetsIfNeeded(sandbox, {
         origin,
-        telegramBotToken: latest.channels.telegram?.botToken,
-        telegramWebhookSecret: latest.channels.telegram?.webhookSecret,
+        telegramBotToken: tg?.botToken,
+        telegramWebhookSecret: tg?.webhookSecret,
         slackCredentials: validatedSlackCreds ?? undefined,
         bundleCapabilities: latest.bundleIdentity?.capabilities,
       });

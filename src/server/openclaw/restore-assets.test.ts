@@ -194,6 +194,7 @@ test("static restore files stage the host-owned cron projection plugin before bo
   assert.match(source, /scheduleSettlementSafety\(wakes\)/);
   assert.match(source, /return requestProjection\("changed"\)/);
   assert.match(source, /settlementTimer\?\.abort\(\)/);
+  assert.match(source, /host did not accept cron projection ownership/);
   assert.match(
     source,
     /restartPrefixes:[\s\S]*plugins\.entries\.vercel-cron-projection/,

@@ -10,6 +10,7 @@ import { getStore, type Store } from "@/server/store/store";
 const PROJECTION_CAS_ATTEMPTS = 12;
 export const CRON_PROJECTION_MAX_WAKES = 4_096;
 export const CRON_PROJECTION_MAX_BODY_BYTES = 512 * 1024;
+export const CRON_PROJECTION_SOURCE_LEASE_MS = 60_000;
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const MAX_SOURCE_CLOCK_SKEW_MS = 10 * 60_000;
 
@@ -58,6 +59,7 @@ export type CronDispatchState =
   | (CronDispatchIdentity & {
       status: "completed";
       completedAtMs: number;
+      workflowRunId: string;
     })
   | (CronDispatchIdentity & {
       status: "failed";
@@ -110,6 +112,7 @@ export type AcceptCronProjectionResult =
       status: "stale";
       record: CronProjectionRecordV1;
       supersededWorkflowRunId: null;
+      retryAfterMs: number | null;
     };
 
 export type FenceCronProjectionResult = {
@@ -279,7 +282,8 @@ function compareSource(
   current: CronProjectionRecordV1,
   input: CronProjectionInputV1,
   digest: string,
-): "newer" | "same" | "stale" {
+  now: number,
+): "newer" | "same" | "stale" | "leased" {
   if (
     current.gatewayGeneration !== null &&
     input.gatewayGeneration !== current.gatewayGeneration
@@ -295,10 +299,12 @@ function compareSource(
     }
     return "newer";
   }
-  if (input.sourceStartedAtMs !== current.source.startedAtMs) {
-    return input.sourceStartedAtMs > current.source.startedAtMs ? "newer" : "stale";
-  }
-  return sourceKey > current.source.key ? "newer" : "stale";
+  // Process clocks and UUID ordering cannot establish Gateway ownership.
+  // A live source renews this bounded host lease with every newer snapshot;
+  // after silence, any process from the same gateway generation may take over.
+  return current.acceptedAtMs + CRON_PROJECTION_SOURCE_LEASE_MS <= now
+    ? "newer"
+    : "leased";
 }
 
 export async function readCronProjection(
@@ -313,21 +319,17 @@ export async function readCronProjection(
 
 export type CronProjectionReadState =
   | { status: "absent" }
-  | { status: "corrupt" }
+  | { status: "corrupt"; token: string }
   | { status: "valid"; record: CronProjectionRecordV1 };
 
 export async function readCronProjectionState(
   store: Store = getStore(),
 ): Promise<CronProjectionReadState> {
-  const value = await store.getValue<unknown>(cronProjectionKey());
-  if (value === null) {
-    return (await store.hasValue(cronProjectionKey()))
-      ? { status: "corrupt" }
-      : { status: "absent" };
-  }
-  return isCronProjectionRecord(value)
-    ? { status: "valid", record: value }
-    : { status: "corrupt" };
+  const state = await store.getValueState<unknown>(cronProjectionKey());
+  if (state.status === "absent") return { status: "absent" };
+  return isCronProjectionRecord(state.value)
+    ? { status: "valid", record: state.value }
+    : { status: "corrupt", token: state.token };
 }
 
 export async function getCronProjectionDiagnostics(
@@ -405,7 +407,8 @@ export async function acceptCronProjection(
   for (let attempt = 0; attempt < PROJECTION_CAS_ATTEMPTS; attempt += 1) {
     const current = await readCronProjection(store);
     if (current) {
-      const comparison = compareSource(current, input, digest);
+      const acceptedAtMs = now();
+      const comparison = compareSource(current, input, digest, acceptedAtMs);
       if (comparison === "same") {
         return {
           status: "idempotent",
@@ -418,6 +421,19 @@ export async function acceptCronProjection(
           status: "stale",
           record: current,
           supersededWorkflowRunId: null,
+          retryAfterMs: null,
+        };
+      }
+      if (comparison === "leased") {
+        return {
+          status: "stale",
+          record: current,
+          supersededWorkflowRunId: null,
+          retryAfterMs: Math.max(
+            1_000,
+            current.acceptedAtMs + CRON_PROJECTION_SOURCE_LEASE_MS -
+              acceptedAtMs,
+          ),
         };
       }
       if (current.digest === digest) {
@@ -431,7 +447,7 @@ export async function acceptCronProjection(
             reason: input.reason,
             projectedAtMs: input.projectedAtMs,
           },
-          acceptedAtMs: now(),
+          acceptedAtMs,
         };
         if (
           await store.compareAndSetValue(
@@ -607,10 +623,6 @@ export async function fenceCronProjectionStateForReset(
   const now = options.now ?? Date.now;
   for (let attempt = 0; attempt < PROJECTION_CAS_ATTEMPTS; attempt += 1) {
     const state = await readCronProjectionState(store);
-    if (state.status === "corrupt") {
-      await store.deleteValue(cronProjectionKey());
-      continue;
-    }
     const current = state.status === "valid" ? state.record : null;
     const resetAtMs = now();
     const next: CronProjectionRecordV1 = {
@@ -633,13 +645,19 @@ export async function fenceCronProjectionStateForReset(
         legacyWakeClearedAtMs: resetAtMs,
       },
     };
-    if (
-      await store.compareAndSetValue(
-        cronProjectionKey(),
-        current?.revision ?? null,
-        next,
-      )
-    ) {
+    const saved =
+      state.status === "corrupt"
+        ? await store.compareAndSetValueToken(
+            cronProjectionKey(),
+            state.token,
+            next,
+          )
+        : await store.compareAndSetValue(
+            cronProjectionKey(),
+            current?.revision ?? null,
+            next,
+          );
+    if (saved) {
       return {
         record: next,
         supersededWorkflowRunId: activeWorkflowRunId(current),
@@ -800,7 +818,12 @@ export function isCronProjectionRecord(value: unknown): value is CronProjectionR
         isPositiveSafeInteger(dispatch.claimedAtMs)
       );
     case "completed":
-      return isPositiveSafeInteger(dispatch.completedAtMs);
+      return (
+        typeof dispatch.workflowRunId === "string" &&
+        dispatch.workflowRunId.length > 0 &&
+        dispatch.workflowRunId.length <= 256 &&
+        isPositiveSafeInteger(dispatch.completedAtMs)
+      );
     case "failed":
       return (
         isPositiveSafeInteger(dispatch.failedAtMs) &&

@@ -183,12 +183,18 @@ export default definePluginEntry({
             }),
             signal,
           });
+          let responseStatus;
           try {
             if (!response.ok) {
               throw new Error("host rejected cron projection with status " + response.status);
             }
+            const payload = await response.json();
+            responseStatus = payload?.status;
+            if (responseStatus !== "accepted" && responseStatus !== "idempotent") {
+              throw new Error("host did not accept cron projection ownership");
+            }
           } finally {
-            await response.body?.cancel();
+            if (!response.bodyUsed) await response.body?.cancel();
           }
           if (signal.aborted || targetRevision !== requestedRevision) continue;
           appliedRevision = targetRevision;

@@ -8,6 +8,7 @@ import {
   clearLegacyCronStateForReset,
   CRON_PROJECTION_MAX_BODY_BYTES,
   CRON_PROJECTION_MAX_WAKES,
+  CRON_PROJECTION_SOURCE_LEASE_MS,
   fenceCronProjectionStateForReset,
   getCronProjectionDiagnostics,
   isCronProjectionRecord,
@@ -147,8 +148,47 @@ test("cron projection rejects malformed persisted records", async () => {
 test("corrupt projection state is explicit rather than treated as absent", async () => {
   const store = new MemoryStore();
   await store.setValue(cronProjectionKey(), { schemaVersion: 1, revision: 1 });
-  assert.deepEqual(await readCronProjectionState(store), { status: "corrupt" });
+  assert.equal((await readCronProjectionState(store)).status, "corrupt");
   await assert.rejects(readCronProjection(store), /cron_projection_state_corrupt/);
+});
+
+test("a silent projection source yields its bounded lease without clock or UUID ordering", async () => {
+  const store = new MemoryStore();
+  const first = input(1, [{ jobId: "first", runAtMs: 100 }]);
+  first.sourceId = "gateway-source-old";
+  first.sourceStartedAtMs = 2_000;
+  await acceptCronProjection(first, { store, now: () => 1_000 });
+
+  const replacement = input(1, [{ jobId: "replacement", runAtMs: 200 }]);
+  replacement.sourceId = "gateway-source-new";
+  replacement.sourceStartedAtMs = 1_000;
+  const leased = await acceptCronProjection(replacement, {
+    store,
+    now: () => 1_001,
+  });
+  assert.equal(leased.status, "stale");
+  assert.equal(
+    leased.status === "stale" ? leased.retryAfterMs : null,
+    CRON_PROJECTION_SOURCE_LEASE_MS - 1,
+  );
+
+  const adopted = await acceptCronProjection(replacement, {
+    store,
+    now: () => 1_000 + CRON_PROJECTION_SOURCE_LEASE_MS,
+  });
+  assert.equal(adopted.status, "accepted");
+  assert.equal(adopted.record.nextRunAtMs, 200);
+
+  const oldRetry = await acceptCronProjection(
+    { ...first, sourceRevision: 2 },
+    { store, now: () => 1_001 + CRON_PROJECTION_SOURCE_LEASE_MS },
+  );
+  assert.equal(oldRetry.status, "stale");
+  assert.ok(
+    oldRetry.status === "stale" &&
+      oldRetry.retryAfterMs !== null &&
+      oldRetry.retryAfterMs > 0,
+  );
 });
 
 test("cron projection is idempotent, rejects stale revisions, and atomically replaces all", async () => {
@@ -376,6 +416,33 @@ test("reset fence leaves legacy cleanup to the post-destroy commit", async () =>
   await clearLegacyCronStateForReset(store);
   assert.equal(await store.hasValue(cronNextWakeKey()), false);
   assert.equal(await store.hasValue(cronJobsKey()), false);
+});
+
+test("reset atomically replaces the exact corrupt value without deleting a concurrent projection", async () => {
+  const store = new MemoryStore();
+  await store.setValue(cronProjectionKey(), { schemaVersion: 1, revision: 1 });
+  const replacementStore = new MemoryStore();
+  const replacement = await acceptCronProjection(
+    input(1, [{ jobId: "concurrent", runAtMs: 5_000 }]),
+    { store: replacementStore, now: () => 1_500 },
+  );
+  const compareToken = store.compareAndSetValueToken.bind(store);
+  let injected = false;
+  store.compareAndSetValueToken = async (key, token, next) => {
+    if (!injected) {
+      injected = true;
+      await store.setValue(key, replacement.record);
+    }
+    return compareToken(key, token, next);
+  };
+
+  const fenced = await fenceCronProjectionStateForReset({
+    gatewayGeneration: "2".repeat(32),
+    store,
+    now: () => 2_000,
+  });
+  assert.equal(fenced.record.projectionRevision, 2);
+  assert.equal(fenced.record.revision, replacement.record.revision + 1);
 });
 
 test("sandbox startup repairs a reset fence after gateway-token commit failure", async () => {

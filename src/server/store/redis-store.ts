@@ -74,6 +74,16 @@ redis.call("set", KEYS[1], ARGV[2])
 return 1
 `;
 
+const CAS_VALUE_TOKEN_LUA = `
+local current = redis.call("get", KEYS[1])
+if not current or current ~= ARGV[1] then
+  return 0
+end
+
+redis.call("set", KEYS[1], ARGV[2])
+return 1
+`;
+
 function toNumber(value: unknown): number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
@@ -198,6 +208,24 @@ export class RedisStore {
     }
   }
 
+  async getValueState<T>(key: string): Promise<
+    | { status: "absent" }
+    | { status: "present"; value: T | null; token: string }
+  > {
+    assertScopedRedisKey(key);
+    const raw = await this.redis.get(key);
+    if (raw === null) return { status: "absent" };
+    try {
+      return {
+        status: "present",
+        value: JSON.parse(raw) as T,
+        token: raw,
+      };
+    } catch {
+      return { status: "present", value: null, token: raw };
+    }
+  }
+
   async hasValue(key: string): Promise<boolean> {
     assertScopedRedisKey(key);
     return (await this.redis.exists(key)) === 1;
@@ -225,6 +253,22 @@ export class RedisStore {
       1,
       key,
       expectedRevision === null ? "absent" : String(expectedRevision),
+      JSON.stringify(next),
+    );
+    return toNumber(result) === 1;
+  }
+
+  async compareAndSetValueToken<T>(
+    key: string,
+    expectedToken: string,
+    next: T,
+  ): Promise<boolean> {
+    assertScopedRedisKey(key);
+    const result = await this.redis.eval(
+      CAS_VALUE_TOKEN_LUA,
+      1,
+      key,
+      expectedToken,
       JSON.stringify(next),
     );
     return toNumber(result) === 1;

@@ -21,6 +21,11 @@ import { cronWakeWorkflow } from "@/server/workflows/cron/cron-wake-workflow";
 
 export const cronProjectionRouteRuntime = {
   start: workflowApi.start,
+  async getRunStatus(runId: string) {
+    const run = workflowApi.getRun(runId);
+    if (!(await run.exists)) return "missing" as const;
+    return run.status;
+  },
 };
 
 function bearerToken(request: Request): string | null {
@@ -114,6 +119,8 @@ export async function POST(request: Request): Promise<Response> {
     dispatch = await reconcileCronProjection({
       enabled: true,
       origin: getPublicOrigin(request),
+      getWorkflowRunStatus: (runId) =>
+        cronProjectionRouteRuntime.getRunStatus(runId),
       startWorkflow: async (envelope) => {
         const run = await cronProjectionRouteRuntime.start(
           cronWakeWorkflow,
@@ -148,6 +155,23 @@ export async function POST(request: Request): Promise<Response> {
         dispatch: dispatch.status,
       },
       { status: 503 },
+    );
+  }
+  if (accepted.status === "stale") {
+    return Response.json(
+      {
+        error: "CRON_PROJECTION_SOURCE_STALE",
+        projectionRevision: accepted.record.projectionRevision,
+        retryAfterMs: accepted.retryAfterMs,
+        dispatch: dispatch.status,
+      },
+      {
+        status: 409,
+        headers:
+          accepted.retryAfterMs === null
+            ? undefined
+            : { "retry-after": String(Math.ceil(accepted.retryAfterMs / 1_000)) },
+      },
     );
   }
   return Response.json(

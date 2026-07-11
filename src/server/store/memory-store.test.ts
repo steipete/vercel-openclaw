@@ -176,6 +176,26 @@ test("memory-store: hasValue checks presence without decoding payload", async ()
   assert.equal(await store.hasValue("presence"), false);
 });
 
+test("memory-store: value-state tokens make exact replacement atomic", async () => {
+  const store = new MemoryStore();
+  await store.setValue("projection", { revision: 1, value: "old" });
+  const state = await store.getValueState<{ revision: number }>("projection");
+  assert.equal(state.status, "present");
+  if (state.status !== "present") return;
+  await store.setValue("projection", { revision: 2, value: "concurrent" });
+  assert.equal(
+    await store.compareAndSetValueToken("projection", state.token, {
+      revision: 3,
+      value: "wrong",
+    }),
+    false,
+  );
+  assert.deepEqual(await store.getValue("projection"), {
+    revision: 2,
+    value: "concurrent",
+  });
+});
+
 test("memory-store: unscoped keys remain allowed for local development", async () => {
   const store = makeStore();
   await store.setValue("plain-key", "value");

@@ -29,11 +29,20 @@ export type Store = {
   createMetaIfAbsent(meta: SingleMeta): Promise<boolean>;
   compareAndSetMeta(expectedVersion: number, next: SingleMeta): Promise<boolean>;
   getValue<T>(key: string): Promise<T | null>;
+  getValueState<T>(key: string): Promise<
+    | { status: "absent" }
+    | { status: "present"; value: T | null; token: string }
+  >;
   hasValue(key: string): Promise<boolean>;
   setValue<T>(key: string, value: T, ttlSeconds?: number): Promise<void>;
   compareAndSetValue<T extends { revision: number }>(
     key: string,
     expectedRevision: number | null,
+    next: T,
+  ): Promise<boolean>;
+  compareAndSetValueToken<T>(
+    key: string,
+    expectedToken: string,
     next: T,
   ): Promise<boolean>;
   deleteValue(key: string): Promise<void>;

@@ -14,8 +14,6 @@ import { cronProjectionKey } from "@/server/store/keyspace";
 import { getStore } from "@/server/store/store";
 
 const DISPATCH_START_LEASE_MS = 60_000;
-const DISPATCH_SCHEDULE_STALE_MS = 5 * 60_000;
-const DISPATCH_RUNNING_STALE_MS = 20 * 60_000;
 const DISPATCH_ACTIVE_HARD_CEILING_MS = 2 * 60 * 60_000;
 const DISPATCH_RETRY_MS = 60_000;
 export const CRON_PREWAKE_MAX_LEAD_MS = 5 * 60_000;
@@ -48,7 +46,11 @@ export type CronProjectionReconcileResult = {
 };
 
 export type CronWakeHandoffState = "ready" | "already" | "stale";
-export type CronWakeHandoffResult = "installed" | "already" | "stale";
+export type CronWakeHandoffResult =
+  | "installed"
+  | "owned"
+  | "occupied"
+  | "stale";
 
 export const cronDispatchWorkflowRuntime = {
   async cancel(runId: string): Promise<void> {
@@ -103,35 +105,21 @@ function shouldRearm(
     (dispatch.status === "scheduled" || dispatch.status === "running") &&
     dispatch.workflowRunId === workflowRunLoss.runId;
   const matchingRunLost = matchingRun && workflowRunLoss.status === "lost";
-  const matchingRunRunning = matchingRun && workflowRunLoss.status === "running";
   switch (dispatch.status) {
     case "failed":
       return dispatch.retryAtMs <= now;
     case "starting":
       return dispatch.startLeaseExpiresAtMs <= now;
     case "scheduled":
-      if (
-        matchingRunRunning &&
-        dispatch.scheduledAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS > now
-      ) {
-        return false;
-      }
       return (
         matchingRunLost ||
-        Math.max(dispatch.wakeAtMs, dispatch.scheduledAtMs) +
-          DISPATCH_SCHEDULE_STALE_MS <=
+        dispatch.scheduledAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS <=
           now
       );
     case "running":
-      if (
-        matchingRunRunning &&
-        dispatch.claimedAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS > now
-      ) {
-        return false;
-      }
       return (
         matchingRunLost ||
-        dispatch.claimedAtMs + DISPATCH_RUNNING_STALE_MS <= now
+        dispatch.claimedAtMs + DISPATCH_ACTIVE_HARD_CEILING_MS <= now
       );
     case "completed":
       // A completed projection contains only the old due time. Wait for the
@@ -627,6 +615,7 @@ export async function completeCronWake(
       wakeAtMs: envelope.wakeAtMs,
       attempt: latest.dispatch.attempt,
       completedAtMs: now,
+      workflowRunId,
     };
     return latest;
   });
@@ -680,18 +669,20 @@ export async function recordCronWakeHandoff(
   if (
     recorded?.projectionRevision === envelope.projectionRevision &&
     recorded.dispatch.status === "completed" &&
-    recorded.dispatch.token === envelope.token
+    recorded.dispatch.token === envelope.token &&
+    recorded.dispatch.workflowRunId === workflowRunId
   ) {
-    return "already";
+    return "owned";
   }
   if (
     recorded?.projectionRevision === envelope.projectionRevision &&
     (recorded.dispatch.status === "scheduled" ||
-      recorded.dispatch.status === "running") &&
+      recorded.dispatch.status === "running" ||
+      recorded.dispatch.status === "completed") &&
     recorded.dispatch.token === envelope.token &&
     recorded.dispatch.workflowRunId !== parentWorkflowRunId
   ) {
-    return "already";
+    return "occupied";
   }
   return "stale";
 }

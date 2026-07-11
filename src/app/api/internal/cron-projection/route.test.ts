@@ -14,7 +14,10 @@ import {
   _setBundleAdmissionForTesting,
 } from "@/server/openclaw/bundle-identity";
 import { cronDispatchWorkflowRuntime } from "@/server/cron/dispatch";
-import { readCronProjection } from "@/server/cron/projection";
+import {
+  mutateCronProjection,
+  readCronProjection,
+} from "@/server/cron/projection";
 import {
   _resetStoreForTesting,
   getInitializedMeta,
@@ -35,6 +38,7 @@ const bundleIdentity = {
 };
 const bundleReleaseUrl =
   "https://github.com/vercel-labs/openclaw/releases/download/v2026.7.2";
+const sourceStartedAtMs = Date.now();
 
 function configureBundleEnvironment(): void {
   process.env.OPENCLAW_BUNDLE_URL = `${bundleReleaseUrl}/openclaw.bundle.mjs`;
@@ -78,7 +82,7 @@ function input(revision: number, wakes: Array<{ jobId: string; runAtMs: number }
       .digest("hex")
       .slice(0, 32),
     sourceId: "gateway-source-route",
-    sourceStartedAtMs: projectedAtMs,
+    sourceStartedAtMs,
     sourceRevision: revision,
     reason: revision === 1 ? "startup" : "changed",
     projectedAtMs,
@@ -183,6 +187,7 @@ test("cron projection endpoint durably accepts a sanitized baseline and starts W
 
 test("identical lifecycle projections keep one sleeping Workflow", async () => {
   let starts = 0;
+  mock.method(cronProjectionRouteRuntime, "getRunStatus", async () => "running");
   mock.method(cronProjectionRouteRuntime, "start", async () => {
     starts += 1;
     return { runId: `wrun-${starts}` } as never;
@@ -207,6 +212,77 @@ test("identical lifecycle projections keep one sleeping Workflow", async () => {
       ? record.dispatch.workflowRunId
       : null,
     "wrun-1",
+  );
+});
+
+test("stale source ownership remains retriable instead of being acknowledged as applied", async () => {
+  let starts = 0;
+  mock.method(cronProjectionRouteRuntime, "start", async () => {
+    starts += 1;
+    return { runId: `wrun-${starts}` } as never;
+  });
+  mock.method(cronProjectionRouteRuntime, "getRunStatus", async () => "running");
+  const wake = [{ jobId: "private-job-name", runAtMs: 1_900_000_000_000 }];
+  assert.equal(
+    (
+      await POST(
+        projectionRequest(`Bearer ${gatewayValue}`, input(1, wake)),
+      )
+    ).status,
+    202,
+  );
+  const competing = {
+    ...input(1, [{ jobId: "replacement", runAtMs: 1_900_000_060_000 }]),
+    sourceId: "gateway-source-competing",
+    sourceStartedAtMs: sourceStartedAtMs - 10_000,
+  };
+  const response = await POST(
+    projectionRequest(`Bearer ${gatewayValue}`, competing),
+  );
+  assert.equal(response.status, 409);
+  const body = await response.json();
+  assert.equal(body.error, "CRON_PROJECTION_SOURCE_STALE");
+  assert.ok(body.retryAfterMs > 0);
+  assert.equal(starts, 1);
+});
+
+test("route reconciliation preserves a healthy long-running recovery Workflow", async () => {
+  let starts = 0;
+  const cancelled: string[] = [];
+  mock.method(cronProjectionRouteRuntime, "start", async () => {
+    starts += 1;
+    return { runId: "wrun-parent" } as never;
+  });
+  mock.method(cronProjectionRouteRuntime, "getRunStatus", async () => "running");
+  mock.method(cronDispatchWorkflowRuntime, "cancel", async (runId: string) => {
+    cancelled.push(runId);
+  });
+  const wake = [{ jobId: "private-job-name", runAtMs: 1_900_000_000_000 }];
+  await POST(projectionRequest(`Bearer ${gatewayValue}`, input(1, wake)));
+  await mutateCronProjection((record) => {
+    if (record.dispatch.status !== "scheduled") return null;
+    record.dispatch = {
+      ...record.dispatch,
+      status: "running",
+      workflowRunId: "wrun-recovery-child",
+      claimedAtMs: Date.now() - 30 * 60_000,
+    };
+    return record;
+  });
+
+  const response = await POST(
+    projectionRequest(`Bearer ${gatewayValue}`, input(2, wake)),
+  );
+  assert.equal(response.status, 202);
+  assert.equal(starts, 1);
+  assert.deepEqual(cancelled, []);
+  const record = await readCronProjection();
+  assert.equal(record?.dispatch.status, "running");
+  assert.equal(
+    record?.dispatch.status === "running"
+      ? record.dispatch.workflowRunId
+      : null,
+    "wrun-recovery-child",
   );
 });
 

@@ -99,6 +99,24 @@ export class MemoryStore {
     }
   }
 
+  async getValueState<T>(key: string): Promise<
+    | { status: "absent" }
+    | { status: "present"; value: T | null; token: string }
+  > {
+    this.gc();
+    const entry = this.values.get(key);
+    if (!entry) return { status: "absent" };
+    try {
+      return {
+        status: "present",
+        value: JSON.parse(entry.value) as T,
+        token: entry.value,
+      };
+    } catch {
+      return { status: "present", value: null, token: entry.value };
+    }
+  }
+
   async hasValue(key: string): Promise<boolean> {
     this.gc();
     return this.values.has(key);
@@ -138,6 +156,21 @@ export class MemoryStore {
       }
     }
 
+    this.values.set(key, {
+      value: JSON.stringify(next),
+      expiresAt: null,
+    });
+    return true;
+  }
+
+  async compareAndSetValueToken<T>(
+    key: string,
+    expectedToken: string,
+    next: T,
+  ): Promise<boolean> {
+    this.gc();
+    const current = this.values.get(key);
+    if (!current || current.value !== expectedToken) return false;
     this.values.set(key, {
       value: JSON.stringify(next),
       expiresAt: null,

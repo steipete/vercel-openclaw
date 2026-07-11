@@ -368,7 +368,7 @@ test("anti-entropy keeps a pending scheduled Workflow before its stale deadline"
   assert.equal(starts, 0);
 });
 
-test("anti-entropy replaces a pending scheduled Workflow after its stale deadline", async () => {
+test("anti-entropy preserves a pending scheduled Workflow until the hard ceiling", async () => {
   await acceptCronProjection(projection(1, now));
   await startCronProjectionDispatch({
     origin: "https://app.test",
@@ -391,10 +391,55 @@ test("anti-entropy replaces a pending scheduled Workflow after its stale deadlin
     now: () => now + 6 * 60_000,
   });
 
-  assert.equal(result.status, "started");
-  assert.equal(result.repaired, true);
+  assert.equal(result.status, "scheduled");
+  assert.equal(result.repaired, false);
+  assert.equal(starts, 0);
+  assert.deepEqual(cancelled, []);
+
+  const repaired = await reconcileCronProjection({
+    origin: "https://app.test",
+    enabled: true,
+    getWorkflowRunStatus: async () => "pending",
+    startWorkflow: async () => {
+      starts += 1;
+      return { runId: "wrun-pending-replacement" };
+    },
+    now: () => now + 3 * 60 * 60_000,
+  });
+  assert.equal(repaired.status, "started");
+  assert.equal(repaired.repaired, true);
   assert.equal(starts, 1);
   assert.deepEqual(cancelled, ["wrun-pending-stale"]);
+});
+
+test("unknown Workflow status defers replacement until the hard ceiling", async () => {
+  await acceptCronProjection(projection(1, now));
+  await startCronProjectionDispatch({
+    origin: "https://app.test",
+    startWorkflow: async () => ({ runId: "wrun-status-unknown" }),
+    now: () => now,
+  });
+  let starts = 0;
+  const reconcile = (at: number) =>
+    reconcileCronProjection({
+      origin: "https://app.test",
+      enabled: true,
+      getWorkflowRunStatus: async () => {
+        throw new Error("workflow status unavailable");
+      },
+      startWorkflow: async () => {
+        starts += 1;
+        return { runId: "wrun-unknown-replacement" };
+      },
+      now: () => at,
+    });
+
+  assert.equal((await reconcile(now + 30 * 60_000)).status, "scheduled");
+  assert.equal(starts, 0);
+  const repaired = await reconcile(now + 3 * 60 * 60_000);
+  assert.equal(repaired.status, "started");
+  assert.equal(repaired.repaired, true);
+  assert.equal(starts, 1);
 });
 
 test("anti-entropy immediately replaces a terminal running Workflow", async () => {
@@ -665,7 +710,7 @@ test("handoff redelivery preserves the first authoritative child", async () => {
       "wrun-parent-timer",
       now + 2,
     ),
-    "already",
+    "occupied",
   );
   assert.equal(
     await claimCronWake(
@@ -753,7 +798,7 @@ test("handoff accepts a child that completed before its record CAS", async () =>
       "wrun-parent-timer",
       now + 2,
     ),
-    "already",
+    "owned",
   );
   assert.equal((await readCronProjection())?.dispatch.status, "completed");
 });

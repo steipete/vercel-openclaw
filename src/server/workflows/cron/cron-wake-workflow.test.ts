@@ -7,6 +7,7 @@ import {
   getCronWakeDurableRetryMs,
   handoffCronWakeStep,
   processCronWakeStep,
+  shouldCancelCronWakeHandoff,
 } from "@/server/workflows/cron/cron-wake-workflow";
 
 test("cron wake step retry budget reaches the explicit terminal attempt", () => {
@@ -50,4 +51,11 @@ test("cron wake retries every credential outcome without a usable credential", (
     }),
     { usable: true },
   );
+});
+
+test("handoff cancellation distinguishes an orphan from its fast completed child", () => {
+  assert.equal(shouldCancelCronWakeHandoff("installed"), false);
+  assert.equal(shouldCancelCronWakeHandoff("owned"), false);
+  assert.equal(shouldCancelCronWakeHandoff("occupied"), true);
+  assert.equal(shouldCancelCronWakeHandoff("stale"), true);
 });

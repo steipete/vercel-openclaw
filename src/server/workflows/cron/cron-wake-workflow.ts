@@ -35,13 +35,18 @@ export const CRON_WAKE_POST_DUE_SAFETY_MS = 15 * 60_000;
 
 export type CronWakeHandoffOutcome =
   | { status: "settled" }
-  | { status: "monitor" }
   | { status: "retry"; retryAfterMs: number };
 
 export type CronWakeProcessOutcome =
   | { status: "settled" }
   | { status: "completed" }
   | { status: "retry"; retryAfterMs: number };
+
+export function shouldCancelCronWakeHandoff(
+  result: Awaited<ReturnType<typeof recordCronWakeHandoff>>,
+): boolean {
+  return result === "occupied" || result === "stale";
+}
 
 class CronWakeCredentialUnavailableError extends Error {
   constructor(
@@ -88,15 +93,6 @@ export async function cronWakeWorkflow(
   while (true) {
     const outcome = await handoffCronWakeStep(envelope);
     if (outcome.status === "settled") return;
-    if (outcome.status === "monitor") {
-      let monitorAfterMs = CRON_WAKE_MONITOR_INTERVAL_MS;
-      while (true) {
-        await sleep(monitorAfterMs);
-        const monitor = await settleCronWakeStep(envelope);
-        if (monitor.status === "settled") return;
-        monitorAfterMs = monitor.retryAfterMs;
-      }
-    }
     await sleep(
       getCronWakeDurableRetryMs(recoveryCycle, outcome.retryAfterMs),
     );
@@ -151,7 +147,7 @@ export async function handoffCronWakeStep(
       parentWorkflowRunId,
     );
     if (handoffState === "stale") return { status: "settled" };
-    if (handoffState === "already") return { status: "monitor" };
+    if (handoffState === "already") return { status: "settled" };
     const run = await start(
       cronWakeExecutionWorkflow,
       [envelope, parentWorkflowRunId],
@@ -162,10 +158,10 @@ export async function handoffCronWakeStep(
       run.runId,
       parentWorkflowRunId,
     );
-    if (recorded !== "installed") {
+    if (shouldCancelCronWakeHandoff(recorded)) {
       await cancelSupersededCronWake(run.runId);
     }
-    return { status: recorded === "stale" ? "settled" : "monitor" };
+    return { status: "settled" };
   } catch {
     const attempt = getStepMetadata().attempt;
     if (attempt < CRON_WAKE_MAX_STEP_ATTEMPTS) {

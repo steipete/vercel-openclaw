@@ -22,6 +22,7 @@ import {
   ensureSandboxRunning,
   ensureSandboxReady,
   waitForSandboxReady,
+  ensureSandboxAliveThrough,
   ensureRunningSandboxDynamicConfigFresh,
   syncGatewayConfigToSandbox,
   getRunningSandboxTimeoutRemainingMs,
@@ -39,7 +40,6 @@ import {
   reconcileStaleRunningStatus,
   reconcileSnapshottingStatus,
   resetSandbox,
-  CRON_JOBS_KEY,
 } from "@/server/sandbox/lifecycle";
 import {
   _resetSandboxSleepConfigCacheForTesting,
@@ -3776,6 +3776,54 @@ test("[lifecycle] probeGatewayReady setup + ready -> transitions to running", as
 // Edge-branch: touchRunningSandbox extend timeout error handling
 // ---------------------------------------------------------------------------
 
+test("[lifecycle] cron alive-through force-extends timeout despite touch throttle", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const now = Date.now();
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-cron-alive-through";
+      meta.lastAccessedAt = now;
+    });
+    const handle = new FakeSandboxHandle(
+      "sbx-cron-alive-through",
+      fake.events,
+      30_000,
+    );
+    fake.handlesByIds.set("sbx-cron-alive-through", handle);
+
+    const deadlineMs = now + 4 * 60_000;
+    const result = await ensureSandboxAliveThrough(deadlineMs);
+    assert.equal(result.status, "running");
+    assert.ok(handle.timeout >= deadlineMs - Date.now());
+    assert.equal(fake.getCalls.at(-1)?.resume, false);
+  });
+});
+
+test("[lifecycle] cron alive-through uses aged session remaining time, not default timeout", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const now = Date.now();
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-cron-aged-session";
+      meta.lastAccessedAt = now;
+    });
+    const handle = new FakeSandboxHandle(
+      "sbx-cron-aged-session",
+      fake.events,
+      30 * 60_000,
+    );
+    handle.setSessionAgeMsForTesting(29 * 60_000);
+    fake.handlesByIds.set("sbx-cron-aged-session", handle);
+
+    const deadlineMs = now + 10 * 60_000;
+    await ensureSandboxAliveThrough(deadlineMs);
+    assert.ok(handle.extendedTimeouts[0]! >= 8 * 60_000);
+    assert.ok(handle.timeoutRemainingMs >= deadlineMs - Date.now() - 1_000);
+  });
+});
+
 test("[lifecycle] touchRunningSandbox extend timeout throws -> marks sandbox unavailable", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
@@ -6400,6 +6448,7 @@ test("resetSandbox clears restoreOracle to idle defaults", async () => {
 
     let meta = await getInitializedMeta();
     assert.equal(meta.restoreOracle.status, "pending");
+    const priorGatewayValue = meta.gatewayToken;
 
     // Reset should restore idle defaults and delete the sandbox
     const beforeSandboxId = meta.sandboxId;
@@ -6418,6 +6467,7 @@ test("resetSandbox clears restoreOracle to idle defaults", async () => {
     assert.equal(meta.restoreOracle.lastError, null);
     assert.equal(meta.restoreOracle.consecutiveFailures, 0);
     assert.equal(meta.restoreOracle.lastResult, null);
+    assert.notEqual(meta.gatewayToken, priorGatewayValue);
   });
 });
 
@@ -6613,173 +6663,6 @@ test("markRestoreTargetDirty preserves running oracle status", async () => {
     assert.equal(meta.restorePreparedStatus, "dirty");
     assert.equal(meta.restoreOracle.status, "running", "Should not overwrite running oracle status");
     assert.equal(meta.restoreOracle.pendingReason, "static-assets-changed", "Should still set pending reason");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Cron jobs persistence
-// ---------------------------------------------------------------------------
-
-test("stopSandbox persists cron jobs JSON to store", async () => {
-  const fake = new FakeSandboxController();
-  const cronJobsJson = JSON.stringify({
-    version: 1,
-    jobs: [{
-      id: "test-job",
-      enabled: true,
-      state: { nextRunAtMs: Date.now() + 60_000 },
-    }],
-  });
-
-  await withTestEnv(fake, async () => {
-    // Create a handle via the controller so it has the shared eventLog.
-    const handle = await fake.create({ ports: [3000], timeout: 300_000 });
-    // Pre-populate cron/jobs.json so readFileToBuffer finds it.
-    await handle.writeFiles([{
-      path: "/home/vercel-sandbox/.openclaw/cron/jobs.json",
-      content: Buffer.from(cronJobsJson),
-    }]);
-
-    await mutateMeta((meta) => {
-      meta.status = "running";
-      meta.sandboxId = handle.sandboxId;
-      meta.gatewayToken = "test-gw-token";
-    });
-
-    await stopSandbox();
-
-    const record = await getStore().getValue<{ version: number; jobCount: number; jobIds: string[]; source: string }>(CRON_JOBS_KEY());
-    assert.ok(record, "Structured cron record should be persisted to store");
-    assert.equal(record.version, 1);
-    assert.equal(record.jobCount, 1);
-    assert.deepEqual(record.jobIds, ["test-job"]);
-    assert.equal(record.source, "stop");
-  });
-});
-
-test("v2 persistent resume does not restore cron jobs from store", async () => {
-  const fake = new FakeSandboxController();
-  const originalFetch = globalThis.fetch;
-  const cronJobsJson = JSON.stringify({
-    version: 1,
-    jobs: [{
-      id: "avatar-quote",
-      enabled: true,
-      state: { nextRunAtMs: Date.now() + 60_000 },
-    }],
-  });
-
-  await withTestEnv(fake, async () => {
-    await mutateMeta((meta) => {
-      meta.status = "stopped";
-      meta.snapshotId = "snap-cron-restore";
-      meta.gatewayToken = "test-gw-token";
-    });
-
-    // Pre-populate the store with cron jobs
-    await getStore().setValue(CRON_JOBS_KEY(), cronJobsJson);
-
-    globalThis.fetch = async () =>
-      new Response('<div id="openclaw-app"></div>', { status: 200 });
-
-    try {
-      const { meta } = await triggerRestore(fake, {
-        tokenOverride: "test-ai-key",
-      });
-
-      assert.equal(meta.status, "running");
-
-      // v2: persistent resume doesn't do cron restoration from store
-      assert.equal(
-        meta.lastRestoreMetrics?.cronRestoreOutcome,
-        undefined,
-        "v2 persistent resume should not have cronRestoreOutcome",
-      );
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-});
-
-test("v2 persistent resume does not track cronRestoreOutcome even with store data", async () => {
-  const fake = new FakeSandboxController();
-  const originalFetch = globalThis.fetch;
-  const cronJobsJson = JSON.stringify({
-    version: 1,
-    jobs: [
-      {
-        id: "avatar-quote",
-        enabled: true,
-        state: { nextRunAtMs: Date.now() + 60_000 },
-      },
-      {
-        id: "daily-standup",
-        enabled: true,
-        state: { nextRunAtMs: Date.now() + 120_000 },
-      },
-    ],
-  });
-
-  await withTestEnv(fake, async () => {
-    await mutateMeta((meta) => {
-      meta.status = "stopped";
-      meta.snapshotId = "snap-cron-restore-unverified";
-      meta.gatewayToken = "test-gw-token";
-    });
-
-    await getStore().setValue(CRON_JOBS_KEY(), cronJobsJson);
-
-    globalThis.fetch = async () =>
-      new Response('<div id="openclaw-app"></div>', { status: 200 });
-
-    try {
-      const { meta } = await triggerRestore(fake, {
-        tokenOverride: "test-ai-key",
-      });
-
-      assert.equal(meta.status, "running");
-      // v2: persistent resume doesn't set cronRestoreOutcome
-      assert.equal(meta.lastRestoreMetrics?.cronRestoreOutcome, undefined);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-});
-
-test("persistent resume skips cron restore when store has no jobs", async () => {
-  const fake = new FakeSandboxController();
-  const originalFetch = globalThis.fetch;
-
-  await withTestEnv(fake, async () => {
-    await mutateMeta((meta) => {
-      meta.status = "stopped";
-      meta.snapshotId = "snap-no-cron";
-      meta.gatewayToken = "test-gw-token";
-    });
-
-    // No cron jobs in store
-
-    globalThis.fetch = async () =>
-      new Response('<div id="openclaw-app"></div>', { status: 200 });
-
-    try {
-      const { handle, meta } = await triggerRestore(fake, {
-        tokenOverride: "test-ai-key",
-      });
-
-      assert.equal(meta.status, "running");
-
-      // Verify NO cron jobs.json was written
-      const cronWrite = handle.writtenFiles.find(
-        (f) => f.path.includes("cron/jobs.json"),
-      );
-      assert.ok(!cronWrite, "Should not write cron jobs when store is empty");
-
-      // v2 persistent resume path does not track cronRestoreOutcome in lastRestoreMetrics
-      // (cron restore is handled by the old snapshot-based restore path which is no longer used)
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
   });
 });
 

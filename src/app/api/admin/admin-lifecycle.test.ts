@@ -177,8 +177,36 @@ function makeFakeHandle(
   return {
     sandboxId,
     get timeout() { return 1800000; },
+    get timeoutRemaining() { return 1800000; },
     get status() { return "running" as const; },
-    async runCommand() {
+    async runCommand(commandOrOptions) {
+      if (
+        typeof commandOrOptions === "object"
+        && commandOrOptions.cmd === "node"
+        && commandOrOptions.args?.some((value) =>
+          value.includes("/api/v1/admin/rpc")
+        )
+      ) {
+        const request = JSON.parse(
+          commandOrOptions.env?.OPENCLAW_ADMIN_RPC_BODY ?? "{}",
+        ) as { method?: string };
+        const payload = request.method === "gateway.suspend.resume"
+          ? { ok: true, status: "running", resumed: true }
+          : request.method === "gateway.suspend.status"
+            ? { status: "running" }
+            : {
+                status: "ready",
+                suspensionId: `suspension-${sandboxId}`,
+                expiresAtMs: Date.now() + 120_000,
+                activeCount: 0,
+                blockers: [],
+              };
+        const output = JSON.stringify({
+          status: 200,
+          body: JSON.stringify({ ok: true, payload }),
+        });
+        return { exitCode: 0, output: async () => output };
+      }
       return { exitCode: 0, output: async () => "" };
     },
     async writeFiles() {},

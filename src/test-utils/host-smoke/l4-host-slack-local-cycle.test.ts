@@ -236,7 +236,11 @@ test("L4-host Slack local cycle: fast path, stop, wake workflow, fast path after
             reconcileDiscordIntegration: async () => null,
             runWithBootMessages: async () => {
               await h.driveToRunning();
-              return { meta: await h.getMeta(), bootMessageSent: false };
+              return {
+                meta: await h.getMeta(),
+                bootMessageSent: false,
+                admissionReady: true,
+              };
             },
             ensureSandboxReady: async () => h.getMeta(),
             getSandboxDomain: async () => (await h.getMeta()).portUrls?.["3000"] ?? sandboxUrl,

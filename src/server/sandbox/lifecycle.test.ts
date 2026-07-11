@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { SingleMeta } from "@/shared/types";
+import { ApiError } from "@/shared/http";
+import {
+  createDefaultHotSpareState,
+  type SingleMeta,
+} from "@/shared/types";
 import {
   OPENCLAW_BUNDLE_IDENTITY_PATH,
 } from "@/server/openclaw/bootstrap";
@@ -17,11 +21,13 @@ import {
   ensureUsableAiGatewayCredential,
   ensureSandboxRunning,
   ensureSandboxReady,
+  waitForSandboxReady,
   ensureRunningSandboxDynamicConfigFresh,
   syncGatewayConfigToSandbox,
   getRunningSandboxTimeoutRemainingMs,
   isPreparedRestoreReusable,
   markRestoreTargetDirty,
+  prepareRestoreTarget,
   probeGatewayReady,
   reconcileSandboxHealth,
   stopSandbox,
@@ -29,6 +35,8 @@ import {
   getSandboxDomain,
   touchRunningSandbox,
   markSandboxUnavailable,
+  _resetReconcileStaleRunningDebounceForTesting,
+  reconcileStaleRunningStatus,
   reconcileSnapshottingStatus,
   resetSandbox,
   CRON_JOBS_KEY,
@@ -45,7 +53,20 @@ import {
   getStore,
   mutateMeta,
 } from "@/server/store/store";
-import { lifecycleLockKey } from "@/server/store/keyspace";
+import {
+  hostSuspensionOperationKey,
+  lifecycleLockKey,
+  sandboxDeadlineKey,
+  sandboxDeadlineLockKey,
+} from "@/server/store/keyspace";
+import {
+  HOST_STOP_REQUEST_MAX_MS,
+  readHostSuspensionState,
+  type HostSuspensionState,
+} from "@/server/sandbox/host-suspension";
+import {
+  _setHostStopWorkflowStarterForTesting,
+} from "@/server/workflows/sandbox/host-stop-runtime";
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
 import {
@@ -93,6 +114,7 @@ const ENV_OVERRIDES: Record<string, string | undefined> = {
   OPENCLAW_BUNDLE_MANIFEST_URL: undefined,
   OPENCLAW_BUNDLE_SOURCE_SHA: undefined,
   OPENCLAW_BUNDLE_SHA256: undefined,
+  OPENCLAW_HOT_SPARE_ENABLED: undefined,
 };
 
 async function withTestEnv(
@@ -152,6 +174,36 @@ function isPreSnapshotCleanupCommand(command: {
 
 function findPreSnapshotCleanupCommand(handle: FakeSandboxHandle) {
   return handle.commands.find(isPreSnapshotCleanupCommand);
+}
+
+function hostSuspensionState(
+  sandboxId: string,
+  overrides: Partial<HostSuspensionState> = {},
+): HostSuspensionState {
+  const now = Date.now();
+  return {
+    version: 1,
+    operationId: "operation-test",
+    requestId: "operation-test",
+    sandboxId,
+    lifecycleAttemptId: null,
+    intent: "stop",
+    reason: "test-stop",
+    phase: "stop-requesting",
+    ingressFenced: true,
+    suspensionId: `suspension-${sandboxId}`,
+    leaseExpiresAtMs: now + 120_000,
+    stopRequestDeadlineAtMs: now + 60_000,
+    monitorHeartbeatAtMs: now,
+    startedAtMs: now - 1_000,
+    updatedAtMs: now,
+    stoppedAtMs: null,
+    resumedAtMs: null,
+    lastError: null,
+    lastErrorCode: null,
+    lastErrorClass: null,
+    ...overrides,
+  };
 }
 
 function isPreSnapshotCleanupEvent(
@@ -228,6 +280,44 @@ test("stopSandbox transitions to snapshotting and preserves sandboxId", async ()
     assert.ok(handle, "handle should exist");
     assert.equal(handle.stopCalled, true);
     assert.equal(handle.lastStopOptions?.blocking, false);
+  });
+});
+
+test("stopSandbox preserves the released runtime path when suspend RPC is unavailable", async () => {
+  const fake = new FakeSandboxController();
+  const handle = new FakeSandboxHandle("sbx-legacy-stop", fake.events);
+  handle.responders.push((cmd, args) => {
+    if (
+      cmd !== "node"
+      || !args?.some((value) => value.includes("/api/v1/admin/rpc"))
+    ) return undefined;
+    const stdout = JSON.stringify({ status: 404, body: "Not Found" });
+    return { exitCode: 0, output: async () => stdout };
+  });
+  fake.handlesByIds.set(handle.sandboxId, handle);
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+    });
+
+    const result = await stopSandbox();
+
+    assert.equal(result.status, "snapshotting");
+    assert.equal(handle.stopCalled, true);
+    assert.equal(
+      await getStore().getValue(hostSuspensionOperationKey()),
+      null,
+      "the failed capability probe must not become a synthetic stopped fence",
+    );
+    handle.setStatus("running");
+    const laggingStatus = await reconcileSnapshottingStatus();
+    assert.equal(
+      laggingStatus.status,
+      "snapshotting",
+      "an accepted legacy stop gets the same SDK-status propagation grace",
+    );
   });
 });
 
@@ -947,6 +1037,117 @@ test("probeGatewayReady returns ready=false when fetch throws (simulating gone s
   });
 });
 
+test("probeGatewayReady thaws admission and requires /readyz before reporting ready", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-admission-probe";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.portUrls = { "3000": `https://${sandboxId}.example` };
+      meta.gatewayToken = "test-token";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+    const requestedUrls: string[] = [];
+    let forceAdmissionUnavailable = false;
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.endsWith("/readyz")) {
+        const suspension = await getStore().getValue<HostSuspensionState>(
+          hostSuspensionOperationKey(),
+        );
+        const unavailable = forceAdmissionUnavailable
+          || suspension?.ingressFenced === true;
+        return Response.json(
+          { ready: !unavailable },
+          { status: unavailable ? 503 : 200 },
+        );
+      }
+      return new Response('<div id="openclaw-app"></div>', { status: 200 });
+    };
+
+    try {
+      const result = await probeGatewayReady();
+      assert.equal(result.ready, true);
+      assert.deepEqual(requestedUrls, [
+        `https://${sandboxId}.example`,
+        `https://${sandboxId}.example/readyz`,
+      ]);
+      const suspension = await getStore().getValue<HostSuspensionState>(
+        hostSuspensionOperationKey(),
+      );
+      assert.equal(suspension?.phase, "running");
+      assert.equal(suspension?.ingressFenced, false);
+
+      forceAdmissionUnavailable = true;
+      const blocked = await probeGatewayReady();
+      assert.equal(blocked.ready, false);
+      assert.equal(blocked.statusCode, 503);
+      assert.match(blocked.error ?? "", /work admission is not ready/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("stale readiness probe cannot promote a replacement same-name generation", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-same-name";
+    fake.handlesByIds.set(sandboxId, new FakeSandboxHandle(sandboxId, fake.events));
+    await mutateMeta((meta) => {
+      meta.status = "booting";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = "attempt-old";
+      meta.gatewayToken = "test-token";
+      meta.portUrls = { "3000": `https://${sandboxId}.example` };
+    });
+    let releaseFetch!: () => void;
+    const fetchGate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    let signalFetch!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => {
+      signalFetch = resolve;
+    });
+    globalThis.fetch = async () => {
+      signalFetch();
+      await fetchGate;
+      return new Response('<div id="openclaw-app"></div>', { status: 200 });
+    };
+
+    try {
+      const staleProbe = probeGatewayReady();
+      await fetchStarted;
+      await mutateMeta((meta) => {
+        meta.status = "booting";
+        meta.sandboxId = sandboxId;
+        meta.lifecycleAttemptId = "attempt-new";
+      });
+      releaseFetch();
+      assert.equal((await staleProbe).ready, true);
+      const replacement = await getInitializedMeta();
+      assert.equal(replacement.status, "booting");
+      assert.equal(replacement.lifecycleAttemptId, "attempt-new");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Restore-path file-write parity tests
 // ---------------------------------------------------------------------------
@@ -956,6 +1157,7 @@ test("probeGatewayReady returns ready=false when fetch throws (simulating gone s
  * Used by triggerRestore to pre-register a "resumed" handle so get() succeeds.
  */
 const LIFECYCLE_SANDBOX_NAME = "oc-openclaw-single";
+const BUNDLE_CANDIDATE_TAG = "openclaw-bundle-candidate";
 const BUNDLE_VERSION = "2026.7.2";
 const BUNDLE_FORK_SHA = "1".repeat(40);
 const BUNDLE_CANONICAL_SHA = "3".repeat(64);
@@ -1009,6 +1211,28 @@ const BUNDLE_ADMISSION: VerifiedBundleAdmission = {
   ],
 };
 
+function bundleCandidate(
+  ownershipToken: string,
+  overrides: Partial<NonNullable<SingleMeta["bundleCandidate"]>> = {},
+): NonNullable<SingleMeta["bundleCandidate"]> {
+  return {
+    lookupId: LIFECYCLE_SANDBOX_NAME,
+    sandboxId: LIFECYCLE_SANDBOX_NAME,
+    ownershipToken,
+    replacesOwnershipToken: null,
+    lifecycleAttemptId: "interrupted-attempt",
+    createdAt: Date.now() - 1_000,
+    ...overrides,
+  };
+}
+
+function tagBundleCandidate(
+  handle: FakeSandboxHandle,
+  ownershipToken: string,
+): void {
+  handle.tags = { [BUNDLE_CANDIDATE_TAG]: ownershipToken };
+}
+
 function configureBundleLifecycleTest(): void {
   process.env.OPENCLAW_PACKAGE_SPEC = `openclaw@${BUNDLE_VERSION}`;
   process.env.OPENCLAW_BUNDLE_URL = `${BUNDLE_RELEASE_URL}/openclaw.bundle.mjs`;
@@ -1018,6 +1242,19 @@ function configureBundleLifecycleTest(): void {
   process.env.OPENCLAW_BUNDLE_SOURCE_SHA = BUNDLE_FORK_SHA;
   process.env.OPENCLAW_BUNDLE_SHA256 = BUNDLE_CANONICAL_SHA;
   _setBundleAdmissionForTesting(BUNDLE_ADMISSION);
+}
+
+async function runScheduledEnsure(reason: string): Promise<void> {
+  let scheduled: (() => Promise<void> | void) | null = null;
+  await ensureSandboxRunning({
+    origin: "https://test.example.com",
+    reason,
+    schedule(callback) {
+      scheduled = callback;
+    },
+  });
+  assert.ok(scheduled, `Expected scheduled lifecycle work for ${reason}`);
+  await (scheduled as () => Promise<void> | void)();
 }
 
 /**
@@ -1331,6 +1568,7 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
     });
 
     const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.setStatus("stopped");
     handle.responders.push(...fake.defaultResponders);
     handle.responders.push((cmd, args) => {
       if (
@@ -1349,6 +1587,12 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
       return undefined;
     });
     fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (params) => {
+      const found = await originalGet(params);
+      if (params.resume === true) handle.setStatus("running");
+      return found;
+    };
 
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
@@ -1370,6 +1614,11 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
         (c) => c.cmd === "bash" && c.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
       );
       assert.ok(fastRestoreCommand, "bundle runtime marker should route to fast restore");
+      assert.deepEqual(
+        fake.getCalls.slice(0, 2).map((call) => call.resume),
+        [false, true],
+        "bundle discovery must observe before explicitly resuming an admitted identity",
+      );
 
       const fullBootstrapCommand = handle.commands.find(
         (c) => c.cmd === "bash" && c.args?.[1]?.includes("curl -fsSL"),
@@ -1386,7 +1635,145 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
   });
 });
 
-test("persistent bundle identity mismatch deletes and rebuilds before reuse", async () => {
+test("bundle identity drift never wakes a stopped persistent sandbox", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.bundleIdentity = {
+        ...structuredClone(BUNDLE_ADMISSION.identity),
+        canonicalSha256: "9".repeat(64),
+      };
+    });
+    const stale = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    stale.setStatus("stopped");
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, stale);
+
+    _setAiGatewayTokenOverrideForTesting("test-ai-key");
+    try {
+      await runScheduledEnsure("bundle-drift-no-wake");
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+      assert.ok(fake.getCalls.length > 0);
+      assert.equal(
+        fake.getCalls.every((call) => call.resume === false),
+        true,
+      );
+      assert.equal(stale.commands.length, 0);
+      assert.equal(stale.stopCalled, false);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("invalid desired bundle admission never quiesces a healthy running sandbox", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await h.getMeta();
+    const handle = h.controller.getHandle(before.sandboxId!);
+    assert.ok(handle);
+    const commandCount = handle.commands.length;
+    process.env.OPENCLAW_BUNDLE_URL = `${BUNDLE_RELEASE_URL}/openclaw.bundle.mjs`;
+
+    await assert.rejects(
+      ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "invalid-bundle-admission",
+      }),
+      (error: unknown) =>
+        error instanceof ApiError
+        && error.code === "OPENCLAW_BUNDLE_ADMISSION_FAILED",
+    );
+
+    assert.equal(handle.stopCalled, false);
+    assert.equal(handle.commands.length, commandCount);
+    assert.equal((await h.getMeta()).status, "running");
+  });
+});
+
+test("admitted bundle drift fences a running npm sandbox before reuse", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await h.getMeta();
+    const handle = h.controller.getHandle(before.sandboxId!);
+    assert.ok(handle);
+    configureBundleLifecycleTest();
+
+    const result = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "running-mode-drift",
+    });
+
+    assert.equal(result.state, "waiting");
+    assert.equal(handle.stopCalled, true);
+    assert.equal(result.meta.status, "error");
+    assert.match(result.meta.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+  });
+});
+
+test("removing bundle mode fences the running bundle generation", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await h.getMeta();
+    const handle = h.controller.getHandle(before.sandboxId!);
+    assert.ok(handle);
+    await h.mutateMeta((meta) => {
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+
+    const result = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "bundle-mode-removed",
+    });
+
+    assert.equal(result.state, "waiting");
+    assert.equal(handle.stopCalled, true);
+    assert.match(result.meta.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+  });
+});
+
+test("bundle lifecycle never promotes the alternate-name hot-spare prototype", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    process.env.OPENCLAW_HOT_SPARE_ENABLED = "true";
+    const hotSpareId = "oc-spare-openclaw-single";
+    await mutateMeta((meta) => {
+      meta.hotSpare = {
+        ...createDefaultHotSpareState(),
+        status: "ready",
+        candidateSandboxId: hotSpareId,
+        createdAt: Date.now(),
+        preparedAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+    });
+    fake.handlesByIds.set(
+      hotSpareId,
+      new FakeSandboxHandle(hotSpareId, fake.events),
+    );
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("bundle-hot-spare-disabled");
+      assert.equal(fake.retrieved.includes(hotSpareId), false);
+      assert.equal((await getInitializedMeta()).status, "running");
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent bundle identity mismatch quiesces and requires explicit migration", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
 
@@ -1427,11 +1814,6 @@ test("persistent bundle identity mismatch deletes and rebuilds before reuse", as
       new Response('<div id="openclaw-app"></div>', { status: 200 });
 
     try {
-      fake.setCreateFailure(
-        Object.assign(new Error("persistent sandbox name still releasing"), {
-          status: 409,
-        }),
-      );
       _setAiGatewayTokenOverrideForTesting("test-ai-key");
       let scheduledCallback: (() => Promise<void> | void) | null = null;
       await ensureSandboxRunning({
@@ -1441,16 +1823,11 @@ test("persistent bundle identity mismatch deletes and rebuilds before reuse", as
           scheduledCallback = cb;
         },
       });
-      assert.ok(scheduledCallback, "Background rebuild work should have been scheduled");
+      assert.ok(scheduledCallback, "Background migration check should have been scheduled");
       await (scheduledCallback as () => Promise<void>)();
 
-      assert.equal(staleHandle.deleteCalled, true, "stale bundle sandbox must be deleted");
-      assert.equal(
-        fake.getCalls.filter((call) => call.sandboxId === LIFECYCLE_SANDBOX_NAME)
-          .length,
-        2,
-        "replacement 409 should resolve and delete the conflicting named handle",
-      );
+      assert.equal(staleHandle.deleteCalled, false, "existing state must never be deleted");
+      assert.equal(staleHandle.stopCalled, true, "existing runtime must be quiesced");
       assert.equal(
         staleHandle.commands.some(
           (command) =>
@@ -1460,27 +1837,760 @@ test("persistent bundle identity mismatch deletes and rebuilds before reuse", as
         false,
         "stale bundle sandbox must never run fast restore",
       );
-      const replacement = fake.lastCreated();
-      assert.ok(replacement, "identity mismatch should create a fresh sandbox");
-      assert.ok(
-        replacement.commands.some(
-          (command) => command.cmd === "bash" && command.args?.[1]?.includes("curl -fsSL"),
-        ),
-        "replacement should run full verified bundle bootstrap",
-      );
-      assert.ok(
-        replacement.commands.some(
-          (command) => command.cmd === "bash" && command.args?.[1]?.includes("identity.json.tmp"),
-        ),
-        "replacement should write a new receipt after bootstrap",
-      );
+      assert.equal(fake.created.length, 0);
 
       const meta = await getInitializedMeta();
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+      assert.equal(meta.sandboxId, LIFECYCLE_SANDBOX_NAME);
+      assert.deepEqual(meta.bundleIdentity, BUNDLE_ADMISSION.identity);
+      await assert.rejects(
+        waitForSandboxReady({
+          origin: "https://test.example.com",
+          reason: "bundle-mismatch-public-wait",
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof ApiError);
+          assert.equal(error.code, "OPENCLAW_BUNDLE_MIGRATION_REQUIRED");
+          return true;
+        },
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("bundle migration retains the discovered sandbox ID for reset", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  const discoveredSandboxId = "sbx-discovered-existing";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = null;
+      meta.gatewayToken = "gw-token";
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    const staleHandle = new FakeSandboxHandle(discoveredSandboxId, fake.events);
+    staleHandle.responders.push(...fake.defaultResponders);
+    staleHandle.responders.push((cmd, args) => {
+      if (
+        cmd === "bash"
+        && args?.[0] === "-c"
+        && args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH)
+      ) {
+        return {
+          exitCode: 0,
+          output: async (stream?: "stdout" | "stderr" | "both") =>
+            stream === "stderr"
+              ? ""
+              : `${JSON.stringify({
+                  ...BUNDLE_ADMISSION.identity,
+                  canonicalSha256: "9".repeat(64),
+                })}\n`,
+        };
+      }
+      return undefined;
+    });
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, staleHandle);
+    fake.handlesByIds.set(discoveredSandboxId, staleHandle);
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("bundle-discovered-id-mismatch");
+      const failed = await getInitializedMeta();
+      assert.equal(failed.status, "error");
+      assert.equal(failed.sandboxId, discoveredSandboxId);
+
+      await resetSandbox({
+        origin: "https://test.example.com",
+        reason: "bundle-discovered-id-reset",
+      });
+      assert.equal(staleHandle.deleteCalled, true);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("bundle migration parks durable stop state before the platform request", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "gw-token";
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+
+    const staleHandle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    staleHandle.responders.push(...fake.defaultResponders);
+    staleHandle.responders.push((cmd, args) => {
+      if (
+        cmd === "bash"
+        && args?.[0] === "-c"
+        && args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH)
+      ) {
+        return {
+          exitCode: 0,
+          output: async (stream?: "stdout" | "stderr" | "both") =>
+            stream === "stderr"
+              ? ""
+              : `${JSON.stringify({
+                  ...BUNDLE_ADMISSION.identity,
+                  canonicalSha256: "9".repeat(64),
+                })}\n`,
+        };
+      }
+      return undefined;
+    });
+    let signalStopEntered!: () => void;
+    const stopEntered = new Promise<void>((resolve) => {
+      signalStopEntered = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopRelease = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    staleHandle.stop = async (options) => {
+      staleHandle.stopCalled = true;
+      staleHandle.lastStopOptions = options;
+      signalStopEntered();
+      await stopRelease;
+      staleHandle.setStatus("stopped");
+      throw new Error("connection lost after stop acceptance");
+    };
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, staleHandle);
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      let scheduled: (() => Promise<void> | void) | null = null;
+      await ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "bundle-migration-durable-stop",
+        schedule(callback) {
+          scheduled = callback;
+        },
+      });
+      assert.ok(scheduled);
+      const lifecycle = (scheduled as () => Promise<void>)();
+      await stopEntered;
+
+      const parked = await getInitializedMeta();
+      assert.equal(parked.status, "snapshotting");
+      assert.equal(parked.sandboxId, LIFECYCLE_SANDBOX_NAME);
+      assert.deepEqual(staleHandle.lastStopOptions, { blocking: false });
+      const suspension = await readHostSuspensionState();
+      assert.equal(suspension?.phase, "stop-requesting");
+      assert.equal(suspension?.ingressFenced, true);
+
+      releaseStop();
+      await lifecycle;
+      const migrated = await getInitializedMeta();
+      assert.equal(migrated.status, "error");
+      assert.match(migrated.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+    } finally {
+      releaseStop();
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("bundle migration monitor finalizes the durable terminal error", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-bundle-migration-monitor";
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = sandboxId;
+      meta.portUrls = null;
+      meta.lifecycleAttemptId = "bundle-migration-attempt";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        operationId: "bundle-migration-operation",
+        requestId: "bundle-migration-operation",
+        reason: "sandbox.bundle_migration_required",
+        lifecycleAttemptId: "bundle-migration-attempt",
+        phase: "stopping",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+    const stopped = new FakeSandboxHandle(sandboxId, fake.events);
+    stopped.setStatus("stopped");
+    fake.handlesByIds.set(sandboxId, stopped);
+
+    const reconciled = await reconcileSnapshottingStatus();
+    assert.equal(reconciled.status, "error");
+    assert.equal(reconciled.sandboxId, sandboxId);
+    assert.match(
+      reconciled.lastError ?? "",
+      /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/,
+    );
+
+    let scheduled = false;
+    await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "bundle-migration-terminal-retry",
+      schedule() {
+        scheduled = true;
+      },
+    });
+    assert.equal(scheduled, false);
+  });
+});
+
+test("failed external plugin install deletes its bundle candidate before retry", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    let pluginFailuresRemaining = 1;
+    fake.defaultResponders.push((cmd, args) => {
+      if (
+        pluginFailuresRemaining > 0
+        && cmd === "node"
+        && args?.[0]?.includes("openclaw.bundle.mjs")
+        && args[1] === "plugins"
+        && args[2] === "install"
+      ) {
+        pluginFailuresRemaining -= 1;
+        return {
+          exitCode: 1,
+          output: async (stream?: "stdout" | "stderr" | "both") =>
+            stream === "stdout" ? "" : "injected external plugin failure",
+        };
+      }
+      return undefined;
+    });
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      let scheduled: (() => Promise<void> | void) | null = null;
+      await ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "bundle-plugin-failure",
+        schedule(callback) {
+          scheduled = callback;
+        },
+      });
+      assert.ok(scheduled);
+      await (scheduled as () => Promise<void>)();
+
+      const failedCandidate = fake.created[0];
+      assert.ok(failedCandidate);
+      assert.equal(failedCandidate.deleteCalled, true);
+      let meta = await getInitializedMeta();
+      assert.equal(meta.status, "error");
+      assert.equal(meta.sandboxId, null);
+      assert.equal(meta.bundleCandidate, null);
+      assert.equal(meta.bundleIdentity, null);
+
+      scheduled = null;
+      await ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "bundle-plugin-retry",
+        schedule(callback) {
+          scheduled = callback;
+        },
+      });
+      assert.ok(scheduled);
+      await (scheduled as () => Promise<void>)();
+
+      assert.equal(fake.created.length, 2);
+      assert.notEqual(fake.created[1]?.sandboxId, failedCandidate.sandboxId);
+      meta = await getInitializedMeta();
       assert.equal(meta.status, "running");
+      assert.equal(meta.bundleCandidate, null);
       assert.deepEqual(meta.bundleIdentity, BUNDLE_ADMISSION.identity);
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("retry replaces a durably marked interrupted bundle candidate", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  const candidateOwner = "interrupted-candidate-token";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "gw-token";
+      meta.lifecycleAttemptId = "interrupted-attempt";
+      meta.bundleCandidate = bundleCandidate(candidateOwner);
+    });
+    const interrupted = new FakeSandboxHandle(
+      LIFECYCLE_SANDBOX_NAME,
+      fake.events,
+    );
+    tagBundleCandidate(interrupted, candidateOwner);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, interrupted);
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      let scheduled: (() => Promise<void> | void) | null = null;
+      await ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "interrupted-bundle-candidate",
+        schedule(callback) {
+          scheduled = callback;
+        },
+      });
+      assert.ok(scheduled);
+      await (scheduled as () => Promise<void>)();
+
+      assert.equal(interrupted.deleteCalled, true);
+      assert.equal(fake.created.length, 1);
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.bundleCandidate, null);
+      assert.deepEqual(meta.bundleIdentity, BUNDLE_ADMISSION.identity);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("lost create response keeps tagged intent and retry rebuilds the candidate", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    const originalCreate = fake.create.bind(fake);
+    let loseResponse = true;
+    let firstOwner: string | null = null;
+    fake.create = async (params) => {
+      if (!loseResponse) return originalCreate(params);
+      const intent = (await getInitializedMeta()).bundleCandidate;
+      assert.ok(intent, "candidate intent must precede the create POST");
+      assert.equal(intent.lookupId, LIFECYCLE_SANDBOX_NAME);
+      assert.equal(intent.sandboxId, null);
+      firstOwner = intent.ownershipToken;
+      const remotelyCreated = await originalCreate(params);
+      fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, remotelyCreated as FakeSandboxHandle);
+      loseResponse = false;
+      throw new Error("connection lost after sandbox create");
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("bundle-lost-create-response");
+
+      let meta = await getInitializedMeta();
+      assert.equal(meta.status, "error");
+      assert.equal(meta.bundleCandidate?.sandboxId, null);
+      assert.equal(meta.bundleCandidate?.ownershipToken, firstOwner);
+      const interrupted = fake.created[0];
+      assert.ok(interrupted);
+      assert.equal(interrupted.deleteCalled, false);
+
+      await runScheduledEnsure("bundle-lost-create-response-retry");
+
+      assert.equal(interrupted.deleteCalled, true);
+      assert.equal(fake.created.length, 2);
+      assert.notEqual(
+        fake.created[1]?.tags?.[BUNDLE_CANDIDATE_TAG],
+        firstOwner,
+        "confirmed delete must rotate candidate ownership",
+      );
+      meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.bundleCandidate, null);
+      assert.deepEqual(meta.bundleIdentity, BUNDLE_ADMISSION.identity);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("production-shaped create 409 preserves replacement provenance across retry", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  const originalOwner = "candidate-before-delayed-release";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "gw-token";
+      meta.lifecycleAttemptId = "interrupted-attempt";
+      meta.bundleCandidate = bundleCandidate(originalOwner);
+    });
+    const interrupted = new FakeSandboxHandle(
+      LIFECYCLE_SANDBOX_NAME,
+      fake.events,
+    );
+    tagBundleCandidate(interrupted, originalOwner);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, interrupted);
+
+    const originalCreate = fake.create.bind(fake);
+    let conflictsRemaining = 2;
+    fake.create = async (params) => {
+      if (conflictsRemaining > 0) {
+        conflictsRemaining -= 1;
+        throw Object.assign(new Error("create conflict"), {
+          response: { status: 409 },
+        });
+      }
+      return originalCreate(params);
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("bundle-delayed-name-release");
+
+      let meta = await getInitializedMeta();
+      assert.equal(meta.status, "error");
+      assert.ok(meta.bundleCandidate);
+      assert.notEqual(meta.bundleCandidate.ownershipToken, originalOwner);
+      assert.equal(
+        meta.bundleCandidate.replacesOwnershipToken,
+        originalOwner,
+      );
+
+      await runScheduledEnsure("bundle-delayed-name-release-retry");
+
+      assert.equal(fake.created.length, 1);
+      meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.bundleCandidate, null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("transient bundle lookup failure never creates delete provenance", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    const existing = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, existing);
+    const originalGet = fake.get.bind(fake);
+    let failLookup = true;
+    fake.get = async (params) => {
+      if (failLookup) {
+        failLookup = false;
+        throw new Error("temporary sandbox control-plane outage");
+      }
+      return originalGet(params);
+    };
+
+    _setAiGatewayTokenOverrideForTesting("test-ai-key");
+    try {
+      await runScheduledEnsure("bundle-transient-get");
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "error");
+      assert.equal(meta.bundleCandidate, null);
+      assert.equal(fake.createCalls.length, 0);
+      assert.equal(existing.deleteCalled, false);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("candidate visible after an initial 404 is still replaced, not migrated", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  const candidateOwner = "eventually-visible-candidate";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.lifecycleAttemptId = "interrupted-attempt";
+      meta.bundleCandidate = bundleCandidate(candidateOwner);
+    });
+    const interrupted = new FakeSandboxHandle(
+      LIFECYCLE_SANDBOX_NAME,
+      fake.events,
+    );
+    tagBundleCandidate(interrupted, candidateOwner);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, interrupted);
+    const originalGet = fake.get.bind(fake);
+    let firstLookup = true;
+    fake.get = async (params) => {
+      if (firstLookup) {
+        firstLookup = false;
+        throw Object.assign(new Error("not visible yet"), {
+          response: { status: 404 },
+        });
+      }
+      return originalGet(params);
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("bundle-eventual-candidate");
+      assert.equal(interrupted.deleteCalled, true);
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.doesNotMatch(
+        meta.lastError ?? "",
+        /OPENCLAW_BUNDLE_MIGRATION_REQUIRED/,
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("candidate tag mismatch preserves the existing sandbox for migration", async () => {
+  const fake = new FakeSandboxController();
+  const expectedOwner = "expected-candidate-owner";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.lifecycleAttemptId = "interrupted-attempt";
+      meta.bundleCandidate = bundleCandidate(expectedOwner);
+    });
+    const unknown = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    tagBundleCandidate(unknown, "different-owner");
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, unknown);
+
+    _setAiGatewayTokenOverrideForTesting("test-ai-key");
+    try {
+      await runScheduledEnsure("bundle-candidate-tag-mismatch");
+      const meta = await getInitializedMeta();
+      assert.equal(unknown.deleteCalled, false);
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+      assert.equal(meta.bundleCandidate?.ownershipToken, expectedOwner);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("candidate delete takeover cannot overwrite the newer lifecycle generation", async () => {
+  const fake = new FakeSandboxController();
+  const staleOwner = "stale-delete-owner";
+  const newerOwner = "new-generation-owner";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.lifecycleAttemptId = "interrupted-attempt";
+      meta.bundleCandidate = bundleCandidate(staleOwner);
+    });
+    const interrupted = new FakeSandboxHandle(
+      LIFECYCLE_SANDBOX_NAME,
+      fake.events,
+    );
+    tagBundleCandidate(interrupted, staleOwner);
+    interrupted.deleteHook = async () => {
+      await mutateMeta((meta) => {
+        meta.status = "running";
+        meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+        meta.lifecycleAttemptId = "new-lifecycle-attempt";
+        meta.bundleCandidate = bundleCandidate(newerOwner, {
+          lifecycleAttemptId: "new-lifecycle-attempt",
+        });
+      });
+    };
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, interrupted);
+
+    _setAiGatewayTokenOverrideForTesting("test-ai-key");
+    try {
+      await runScheduledEnsure("bundle-delete-takeover");
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.lifecycleAttemptId, "new-lifecycle-attempt");
+      assert.equal(meta.bundleCandidate?.ownershipToken, newerOwner);
+      assert.equal(fake.createCalls.length, 0);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("post-receipt takeover cannot be overwritten or delete the verified sandbox", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  let takeoverApplied = false;
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    fake.onNetworkPolicy = async (policy) => {
+      const currentMeta = await getInitializedMeta();
+      if (!takeoverApplied && currentMeta.bundleIdentity !== null) {
+        takeoverApplied = true;
+        await mutateMeta((meta) => {
+          meta.status = "running";
+          meta.sandboxId = "sbx-new-generation";
+          meta.portUrls = { "3000": "https://sbx-new-generation.example" };
+          meta.lifecycleAttemptId = "new-lifecycle-attempt";
+          meta.bundleCandidate = null;
+          meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+        });
+      }
+      return policy;
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("bundle-post-receipt-takeover");
+      assert.equal(takeoverApplied, true);
+      assert.equal(fake.created[0]?.deleteCalled, false);
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.sandboxId, "sbx-new-generation");
+      assert.equal(meta.lifecycleAttemptId, "new-lifecycle-attempt");
+      assert.deepEqual(meta.bundleIdentity, BUNDLE_ADMISSION.identity);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("waitForSandboxReady preserves stable bundle lifecycle errors", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    for (const expected of [
+      { code: "OPENCLAW_BUNDLE_MIGRATION_REQUIRED", status: 409 },
+      { code: "OPENCLAW_BUNDLE_QUIESCE_FAILED", status: 502 },
+    ]) {
+      await mutateMeta((meta) => {
+        meta.status = "error";
+        meta.lastError = `${expected.code}: stable detail`;
+      });
+
+      await assert.rejects(
+        waitForSandboxReady({
+          origin: "https://test.example.com",
+          reason: "stable-bundle-error-test",
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof ApiError);
+          assert.equal(error.code, expected.code);
+          assert.equal(error.status, expected.status);
+          assert.equal(error.message, "stable detail");
+          return true;
+        },
+      );
+    }
+  });
+});
+
+test("terminal bundle errors stay parked while cleanup failures can retry", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    let scheduled: (() => Promise<void> | void) | null = null;
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.lastError = "OPENCLAW_BUNDLE_MIGRATION_REQUIRED: migrate first";
+    });
+    await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "terminal-bundle-error",
+      schedule(callback) {
+        scheduled = callback;
+      },
+    });
+    assert.equal(scheduled, null);
+
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.lastError =
+        "OPENCLAW_BUNDLE_CANDIDATE_CLEANUP_FAILED: transient delete failure";
+    });
+    await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "retry-bundle-cleanup",
+      schedule(callback) {
+        scheduled = callback;
+      },
+    });
+    assert.ok(scheduled, "cleanup failures should be retried by lifecycle work");
+  });
+});
+
+test("in-flight waiter rehydrates stable bundle errors at its timeout boundary", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    for (const expected of [
+      { code: "OPENCLAW_BUNDLE_MIGRATION_REQUIRED", status: 409 },
+      { code: "OPENCLAW_BUNDLE_QUIESCE_FAILED", status: 502 },
+    ]) {
+      await mutateMeta((meta) => {
+        meta.status = "creating";
+        meta.sandboxId = null;
+        meta.lastError = null;
+      });
+      const waiter = waitForSandboxReady({
+        origin: "https://test.example.com",
+        reason: "in-flight-stable-bundle-error",
+        timeoutMs: 40,
+        pollIntervalMs: 100,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await mutateMeta((meta) => {
+        meta.status = "error";
+        meta.lastError = `${expected.code}: transitioned while waiting`;
+      });
+
+      await assert.rejects(waiter, (error: unknown) => {
+        assert.ok(error instanceof ApiError);
+        assert.equal(error.code, expected.code);
+        assert.equal(error.status, expected.status);
+        return true;
+      });
     }
   });
 });
@@ -3396,7 +4506,7 @@ test("[failure] bootstrap (setupOpenClaw) failure sets status to error", async (
   });
 });
 
-test("[failure] stop failure during stop propagates error", async () => {
+test("[failure] ambiguous stop failure remains snapshotting and fenced", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
     await mutateMeta((meta) => {
@@ -3412,14 +4522,94 @@ test("[failure] stop failure during stop propagates error", async () => {
     };
     fake.handlesByIds.set("sbx-snap-fail", handle);
 
-    await assert.rejects(
-      () => stopSandbox(),
-      (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.ok(error.message.includes("stop failed unexpectedly"));
-        return true;
-      },
+    const result = await stopSandbox();
+    assert.equal(result.status, "snapshotting");
+    const suspension = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
     );
+    assert.equal(suspension?.phase, "stop-requesting");
+    assert.equal(suspension?.ingressFenced, true);
+  });
+});
+
+test("[failure] abandoned prepared suspension resumes admission after caller deadline", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-abandoned-prepare";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        phase: "prepared",
+        stopRequestDeadlineAtMs: null,
+        updatedAtMs: Date.now() - HOST_STOP_REQUEST_MAX_MS - 1,
+      }),
+    );
+
+    const result = await reconcileSnapshottingStatus();
+    const suspension = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.equal(result.status, "running");
+    assert.match(result.lastError ?? "", /admission resumed/i);
+    assert.equal(suspension?.phase, "failed");
+    assert.equal(suspension?.ingressFenced, false);
+  });
+});
+
+test("[failure] gone sandbox clears orphaned suspension and deadline state", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-gone-during-stop";
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.portUrls = { "3000": `https://${sandboxId}-3000.fake.vercel.run` };
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    await getStore().setValue(sandboxDeadlineKey(), { sandboxId });
+    fake.get = async () => {
+      throw new Error("404 sandbox not found");
+    };
+
+    const result = await stopSandbox();
+    assert.equal(result.status, "uninitialized");
+    assert.equal(result.sandboxId, null);
+    assert.equal(
+      await getStore().getValue(hostSuspensionOperationKey()),
+      null,
+    );
+    assert.equal(await getStore().getValue(sandboxDeadlineKey()), null);
+  });
+});
+
+test("[failure] unrelated lookup error containing 404 does not project stopped", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-transient-lookup";
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = sandboxId;
+    });
+    fake.get = async () => {
+      throw new Error("transient lookup failed after reading 404 records");
+    };
+
+    const result = await reconcileSnapshottingStatus();
+    assert.equal(result.status, "snapshotting");
+    assert.equal(result.sandboxId, sandboxId);
   });
 });
 
@@ -3862,7 +5052,7 @@ test("reconcileSandboxHealth skips stale invalidation when sandbox was already r
 // Lifecycle top-up timeout semantics (acceptance criteria)
 // ---------------------------------------------------------------------------
 
-test("touchRunningSandbox tops up by difference when remaining < target (300000 target, 120000 remaining -> extend 180000)", async () => {
+test("touchRunningSandbox tops up to desired idle plus safety runway", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
     process.env.OPENCLAW_SANDBOX_SLEEP_AFTER_MS = "300000";
@@ -3876,16 +5066,51 @@ test("touchRunningSandbox tops up by difference when remaining < target (300000 
 
     // Pre-create handle with 120000ms remaining
     const handle = new FakeSandboxHandle("sbx-topup-math", fake.events, 120_000);
+    Object.defineProperty(handle, "timeoutRemaining", {
+      configurable: true,
+      get: () => 120_000,
+    });
     fake.handlesByIds.set("sbx-topup-math", handle);
 
     const result = await touchRunningSandbox();
     assert.equal(result.status, "running");
     assert.equal(handle.extendedTimeouts.length, 1, "Should extend timeout exactly once");
-    assert.equal(handle.extendedTimeouts[0], 180_000, "Should extend by 300000 - 120000 = 180000");
+    assert.equal(handle.extendedTimeouts[0], 480_000, "Should extend by 600000 - 120000 = 480000");
   });
 });
 
-test("touchRunningSandbox does not extend when remaining >= target (300000 target, 420000 remaining -> no extend)", async () => {
+test("touchRunningSandbox returns current lifecycle state when deadline stop wins", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-touch-deadline-race";
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lastAccessedAt = null;
+    });
+    fake.handlesByIds.set(
+      sandboxId,
+      new FakeSandboxHandle(sandboxId, fake.events, 600_000),
+    );
+    const store = getStore();
+    const deadlineToken = await store.acquireLock(sandboxDeadlineLockKey(), 30);
+    assert.ok(deadlineToken);
+
+    const touch = touchRunningSandbox();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.portUrls = null;
+    });
+    await store.releaseLock(sandboxDeadlineLockKey(), deadlineToken);
+
+    const result = await touch;
+    assert.equal(result.status, "snapshotting");
+    assert.equal(result.sandboxId, sandboxId);
+  });
+});
+
+test("touchRunningSandbox does not extend when remaining exceeds the platform target", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
     process.env.OPENCLAW_SANDBOX_SLEEP_AFTER_MS = "300000";
@@ -3897,8 +5122,8 @@ test("touchRunningSandbox does not extend when remaining >= target (300000 targe
       meta.lastAccessedAt = null;
     });
 
-    // Pre-create handle with 420000ms remaining (above target)
-    const handle = new FakeSandboxHandle("sbx-topup-skip", fake.events, 420_000);
+    // Desired idle is 300000ms and the stop runway is another 300000ms.
+    const handle = new FakeSandboxHandle("sbx-topup-skip", fake.events, 720_000);
     fake.handlesByIds.set("sbx-topup-skip", handle);
 
     const result = await touchRunningSandbox();
@@ -3907,7 +5132,7 @@ test("touchRunningSandbox does not extend when remaining >= target (300000 targe
   });
 });
 
-test("touchRunningSandbox does not extend when remaining == target exactly", async () => {
+test("touchRunningSandbox does not extend at the platform target exactly", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
     process.env.OPENCLAW_SANDBOX_SLEEP_AFTER_MS = "300000";
@@ -3919,7 +5144,11 @@ test("touchRunningSandbox does not extend when remaining == target exactly", asy
       meta.lastAccessedAt = null;
     });
 
-    const handle = new FakeSandboxHandle("sbx-topup-exact", fake.events, 300_000);
+    const handle = new FakeSandboxHandle("sbx-topup-exact", fake.events, 600_000);
+    Object.defineProperty(handle, "timeoutRemaining", {
+      configurable: true,
+      get: () => 600_000,
+    });
     fake.handlesByIds.set("sbx-topup-exact", handle);
 
     const result = await touchRunningSandbox();
@@ -3977,16 +5206,14 @@ test("create flow passes configured sleepAfterMs as timeout to controller.create
 
       const handle = fake.created[0];
       assert.ok(handle, "Should have created a sandbox");
-      // The handle's initial timeout should match the configured sleepAfterMs
+      // Native timeout includes the durable stop coordinator's safety runway.
       // (FakeSandboxHandle stores the timeout passed via params.timeout)
       // After create + bootstrap the handle may have had extendTimeout called,
       // so check the initial timeout via the created params instead.
-      // Since our FakeSandboxHandle now receives params.timeout in constructor,
-      // the initial timeoutMs was 300000 and any extensions add to it.
       const totalTimeout = handle.timeout;
       const totalExtended = handle.extendedTimeouts.reduce((a, b) => a + b, 0);
       const initialTimeout = totalTimeout - totalExtended;
-      assert.equal(initialTimeout, 300_000, "Create should pass sleepAfterMs=300000 as timeout");
+      assert.equal(initialTimeout, 600_000, "Create should include the 300000ms stop runway");
       assert.ok(
         Object.prototype.hasOwnProperty.call((await getInitializedMeta()).portUrls ?? {}, String(OPENCLAW_TELEGRAM_WEBHOOK_PORT)),
         `Create should expose port ${OPENCLAW_TELEGRAM_WEBHOOK_PORT} in portUrls`,
@@ -3997,7 +5224,7 @@ test("create flow passes configured sleepAfterMs as timeout to controller.create
   });
 });
 
-test("restore flow passes configured sleepAfterMs as timeout to controller.create()", async () => {
+test("restore flow tops up a legacy persisted sandbox with the stop runway", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
 
@@ -4019,10 +5246,12 @@ test("restore flow passes configured sleepAfterMs as timeout to controller.creat
         tokenOverride: "test-ai-key",
       });
 
-      const totalTimeout = handle.timeout;
-      const totalExtended = handle.extendedTimeouts.reduce((a, b) => a + b, 0);
-      const initialTimeout = totalTimeout - totalExtended;
-      assert.equal(initialTimeout, 300_000, "Restore should pass sleepAfterMs=300000 as timeout");
+      assert.ok(handle.timeout >= 600_000 && handle.timeout < 601_000);
+      assert.equal(handle.extendedTimeouts.length, 1);
+      assert.ok(
+        handle.extendedTimeouts[0] >= 300_000
+        && handle.extendedTimeouts[0] < 301_000,
+      );
       const meta = await getInitializedMeta();
       assert.ok(
         Object.prototype.hasOwnProperty.call(meta.portUrls ?? {}, String(OPENCLAW_TELEGRAM_WEBHOOK_PORT)),
@@ -4046,7 +5275,10 @@ test("getRunningSandboxTimeoutRemainingMs returns remaining ms for running sandb
     fake.handlesByIds.set("sbx-remaining", handle);
 
     const remaining = await getRunningSandboxTimeoutRemainingMs();
-    assert.equal(remaining, 250_000);
+    assert.ok(
+      remaining !== null && remaining <= 250_000 && remaining > 249_000,
+      `expected live remaining timeout near 250000ms, got ${remaining}`,
+    );
   });
 });
 
@@ -4775,6 +6007,197 @@ test("ensureRunningSandboxDynamicConfigFresh returns sandbox-unavailable when no
 // Restore target truth split
 // ---------------------------------------------------------------------------
 
+test("destructive restore preparation never stamps ready after persistent stop failure", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await h.getMeta();
+    const handle = h.controller.created.find(
+      (candidate) => candidate.sandboxId === before.sandboxId,
+    ) as FakeSandboxHandle | undefined;
+    assert.ok(handle);
+    handle.stop = async () => {
+      handle.stopCalled = true;
+      handle.setStatus("failed");
+    };
+
+    const result = await prepareRestoreTarget({
+      origin: "https://test.example.com",
+      reason: "persistent-stop-failure-test",
+      destructive: true,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.state, "failed");
+    assert.equal(result.reason, "prepare-failed");
+    assert.equal(
+      result.actions.find((action) => action.id === "snapshot")?.status,
+      "failed",
+    );
+    const after = await h.getMeta();
+    assert.equal(after.restorePreparedStatus, "failed");
+    assert.notEqual(after.persistedStateSource, "persistent-auto-save");
+    assert.equal(after.pendingPersistentAutoSave, null);
+    assert.equal(after.activePersistentStop, null);
+  });
+});
+
+test("restore preparation never attests config changed after runtime sync", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await h.getMeta();
+    const handle = h.controller.getHandle(before.sandboxId!);
+    assert.ok(handle);
+    const originalFetch = globalThis.fetch;
+    let mutated = false;
+    globalThis.fetch = async (input) => {
+      if (!String(input).endsWith("/readyz") && !mutated) {
+        mutated = true;
+        await h.mutateMeta((meta) => {
+          meta.channels.slack = {
+            signingSecret: "new-signing-secret",
+            botToken: "xoxb-new-token",
+            configuredAt: Date.now(),
+          };
+        });
+      }
+      return String(input).endsWith("/readyz")
+        ? Response.json({ ready: true })
+        : new Response('<div id="openclaw-app"></div>', { status: 200 });
+    };
+
+    try {
+      const result = await prepareRestoreTarget({
+        origin: "https://test.example.com",
+        reason: "config-interleave-test",
+        destructive: true,
+      });
+
+      assert.equal(result.ok, false);
+      assert.equal(handle.stopCalled, false);
+      const after = await h.getMeta();
+      assert.equal(after.restorePreparedStatus, "failed");
+      assert.equal(after.persistedStateSource, null);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("restore preparation deadline leaves durable completion to reconciliation", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await h.getMeta();
+    const handle = h.controller.created.find(
+      (candidate) => candidate.sandboxId === before.sandboxId,
+    ) as FakeSandboxHandle | undefined;
+    assert.ok(handle);
+
+    const originalNow = Date.now;
+    let clockOffsetMs = 0;
+    Date.now = () => originalNow() + clockOffsetMs;
+    handle.stop = async (options) => {
+      handle.stopCalled = true;
+      handle.lastStopOptions = options;
+      handle.setStatus("stopping");
+      // Consume nearly the entire function budget before confirmation starts.
+      clockOffsetMs = 270_001;
+    };
+
+    try {
+      const startedAt = originalNow();
+      const result = await prepareRestoreTarget({
+        origin: "https://test.example.com",
+        reason: "persistent-stop-deadline-test",
+        destructive: true,
+      });
+      assert.ok(originalNow() - startedAt < 2_000, "poll must honor the absolute budget");
+      assert.equal(result.ok, false);
+      assert.equal(result.state, "preparing");
+
+      let pending = await h.getMeta();
+      assert.equal(pending.status, "snapshotting");
+      assert.equal(pending.restorePreparedStatus, "preparing");
+      assert.equal(pending.persistedStateDynamicConfigHash, null);
+      assert.equal(pending.persistedStateAssetSha256, null);
+      assert.equal(pending.persistedStateSavedAt, null);
+      assert.equal(pending.pendingPersistentAutoSave?.sandboxId, before.sandboxId);
+      assert.equal(
+        pending.pendingPersistentAutoSave?.lifecycleAttemptId,
+        before.lifecycleAttemptId,
+      );
+      assert.equal(
+        pending.pendingPersistentAutoSave?.operationId,
+        pending.activePersistentStop?.operationId,
+      );
+      assert.ok(pending.pendingPersistentAutoSave?.dynamicConfigHash);
+      assert.ok(pending.pendingPersistentAutoSave?.assetSha256);
+      assert.ok(pending.activePersistentStop?.stopAttemptId);
+
+      handle.setStatus("stopped");
+      pending = await reconcileSnapshottingStatus();
+      assert.equal(pending.status, "stopped");
+      assert.equal(pending.restorePreparedStatus, "ready");
+      assert.equal(pending.persistedStateSource, "persistent-auto-save");
+      assert.ok(pending.persistedStateSavedAt);
+      assert.equal(pending.restoreOracle.status, "ready");
+      assert.equal(pending.pendingPersistentAutoSave, null);
+      assert.equal(pending.activePersistentStop, null);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+});
+
+test("restore preparation never stops a replacement sandbox generation", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const original = await h.getMeta();
+    const originalHandle = h.controller.getHandle(original.sandboxId!);
+    assert.ok(originalHandle);
+    const replacement = new FakeSandboxHandle("sbx-prepare-replacement", h.controller.events);
+    replacement.responders.push(...h.controller.defaultResponders);
+    h.controller.handlesByIds.set(replacement.sandboxId, replacement);
+
+    const store = getStore();
+    const acquireLock = store.acquireLock.bind(store);
+    let replaced = false;
+    store.acquireLock = async (key, ttlSeconds) => {
+      if (key === lifecycleLockKey() && !replaced) {
+        replaced = true;
+        await mutateMeta((meta) => {
+          meta.status = "running";
+          meta.sandboxId = replacement.sandboxId;
+          meta.lifecycleAttemptId = "replacement-attempt";
+          meta.portUrls = { "3000": "https://replacement.example.com" };
+          meta.restorePreparedStatus = "dirty";
+          meta.pendingPersistentAutoSave = null;
+          meta.activePersistentStop = null;
+        });
+      }
+      return acquireLock(key, ttlSeconds);
+    };
+
+    try {
+      const result = await prepareRestoreTarget({
+        origin: "https://test.example.com",
+        reason: "replacement-generation-test",
+        destructive: true,
+      });
+      assert.equal(result.ok, false);
+      assert.equal(replaced, true);
+      assert.equal(originalHandle.stopCalled, false);
+      assert.equal(replacement.stopCalled, false);
+      const current = await h.getMeta();
+      assert.equal(current.sandboxId, replacement.sandboxId);
+      assert.equal(current.lifecycleAttemptId, "replacement-attempt");
+      assert.equal(current.status, "running");
+      assert.equal(current.pendingPersistentAutoSave, null);
+    } finally {
+      store.acquireLock = acquireLock;
+    }
+  });
+});
+
 test("runtime reconcile updates runtimeDynamicConfigHash but not snapshotDynamicConfigHash", async () => {
   await withHarness(async (h) => {
     await h.driveToRunning();
@@ -4995,6 +6418,182 @@ test("resetSandbox clears restoreOracle to idle defaults", async () => {
     assert.equal(meta.restoreOracle.lastError, null);
     assert.equal(meta.restoreOracle.consecutiveFailures, 0);
     assert.equal(meta.restoreOracle.lastResult, null);
+  });
+});
+
+test("resetSandbox deletes first and clears corrupt durable suspension state", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await getInitializedMeta();
+    assert.ok(before.sandboxId);
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      { version: 99, corrupt: true },
+    );
+
+    const reset = await resetSandbox({
+      origin: "https://app.example.com",
+      reason: "corrupt-suspension-recovery-test",
+    });
+
+    assert.ok(
+      h.controller.getHandle(before.sandboxId)?.deleteCalled,
+      "destructive recovery must delete the sandbox",
+    );
+    assert.equal(
+      await getStore().getValue(hostSuspensionOperationKey()),
+      null,
+    );
+    assert.equal(reset.status, "uninitialized");
+    assert.equal(reset.sandboxId, null);
+  });
+});
+
+test("resetSandbox preserves the released runtime path when suspend RPC is unavailable", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await getInitializedMeta();
+    assert.ok(before.sandboxId);
+    const handle = h.controller.getHandle(before.sandboxId);
+    assert.ok(handle);
+    handle.responders.unshift((cmd, args) => {
+      if (
+        cmd !== "node"
+        || !args?.some((value) => value.includes("/api/v1/admin/rpc"))
+      ) return undefined;
+      const stdout = JSON.stringify({ status: 404, body: "Not Found" });
+      return { exitCode: 0, output: async () => stdout };
+    });
+
+    const reset = await resetSandbox({
+      origin: "https://app.example.com",
+      reason: "legacy-reset-test",
+    });
+
+    assert.equal(handle.deleteCalled, true);
+    assert.equal(reset.status, "uninitialized");
+    assert.equal(reset.sandboxId, null);
+    assert.equal(await getStore().getValue(hostSuspensionOperationKey()), null);
+  });
+});
+
+test("resetSandbox clears metadata and suspension when deadline cleanup fails after delete", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await getInitializedMeta();
+    assert.ok(before.sandboxId);
+    const handle = h.controller.getHandle(before.sandboxId);
+    assert.ok(handle);
+    const store = getStore();
+    const deleteValue = store.deleteValue.bind(store);
+    let injected = false;
+    store.deleteValue = async (key) => {
+      if (key === sandboxDeadlineKey() && !injected) {
+        injected = true;
+        throw new Error("deadline cleanup unavailable");
+      }
+      return deleteValue(key);
+    };
+
+    try {
+      await assert.rejects(
+        resetSandbox({
+          origin: "https://app.example.com",
+          reason: "post-delete-cleanup-failure-test",
+        }),
+        /deadline cleanup unavailable/,
+      );
+    } finally {
+      store.deleteValue = deleteValue;
+    }
+
+    const after = await getInitializedMeta();
+    assert.equal(handle.deleteCalled, true);
+    assert.equal(after.sandboxId, null);
+    assert.equal(after.status, "error");
+    assert.match(after.lastError ?? "", /deadline cleanup unavailable/);
+    assert.equal(await store.getValue(hostSuspensionOperationKey()), null);
+  });
+});
+
+test("resetSandbox preserves a live sandbox when Gateway suspension is busy", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await getInitializedMeta();
+    assert.ok(before.sandboxId);
+    const handle = h.controller.getHandle(before.sandboxId);
+    assert.ok(handle);
+    handle.responders.unshift((cmd, args) => {
+      if (cmd !== "node" || !args?.some((value) => value.includes("/api/v1/admin/rpc"))) {
+        return undefined;
+      }
+      const response = JSON.stringify({
+        status: 200,
+        body: JSON.stringify({
+          ok: true,
+          payload: {
+            status: "busy",
+            reason: "active agent run",
+            activeCount: 1,
+            blockers: [],
+            retryAfterMs: 500,
+          },
+        }),
+      });
+      return {
+        exitCode: 0,
+        output: async (stream) => stream === "stderr" ? "" : response,
+      };
+    });
+
+    await assert.rejects(
+      resetSandbox({
+        origin: "https://app.example.com",
+        reason: "busy-suspension-test",
+      }),
+      (error: unknown) =>
+        error instanceof ApiError
+        && error.status === 409
+        && error.code === "GATEWAY_SUSPEND_BUSY",
+    );
+
+    const after = await getInitializedMeta();
+    assert.equal(handle.deleteCalled, false);
+    assert.equal(after.status, "running");
+    assert.equal(after.sandboxId, before.sandboxId);
+    assert.equal(after.lifecycleAttemptId, before.lifecycleAttemptId);
+    assert.match(after.lastError ?? "", /active agent run/);
+  });
+});
+
+test("resetSandbox adopts a durable reset interrupted before delete", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await getInitializedMeta();
+    assert.ok(before.sandboxId);
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(before.sandboxId, {
+        intent: "reset",
+        lifecycleAttemptId: before.lifecycleAttemptId ?? null,
+        reason: "sandbox.reset",
+        phase: "stopping",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+
+    const reset = await resetSandbox({
+      origin: "https://app.example.com",
+      reason: "interrupted-reset-adoption-test",
+    });
+
+    assert.equal(h.controller.getHandle(before.sandboxId)?.deleteCalled, true);
+    assert.equal(reset.status, "uninitialized");
+    assert.equal(reset.sandboxId, null);
+    assert.equal(
+      await getStore().getValue(hostSuspensionOperationKey()),
+      null,
+    );
   });
 });
 
@@ -5593,10 +7192,10 @@ test("[lifecycle] ensureSandboxRunning running + expired timeout -> reconciles v
 });
 
 // ---------------------------------------------------------------------------
-// Q24: reconcileSnapshottingStatus stale guardrail (>5 min) forces stopped
+// Q24: stale platform transitions stay fenced until the SDK is terminal
 // ---------------------------------------------------------------------------
 
-test("[lifecycle] reconcileSnapshottingStatus stale snapshotting >5min -> force-stopped", async () => {
+test("[lifecycle] reconcileSnapshottingStatus stale snapshotting stays fenced", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
     // SDK still reports snapshotting (in-flight) but meta is stale.
@@ -5622,20 +7221,559 @@ test("[lifecycle] reconcileSnapshottingStatus stale snapshotting >5min -> force-
     const reconciled = await reconcileSnapshottingStatus();
     assert.equal(
       reconciled.status,
-      "stopped",
-      `Expected stale guardrail to force stopped, got ${reconciled.status}`,
+      "snapshotting",
+      `Expected SDK transitional state to remain authoritative, got ${reconciled.status}`,
     );
 
     const logs = getServerLogs();
     const staleLog = logs.find(
       (e) =>
         e.message === "sandbox.snapshotting_reconciled"
-        && (e.data as { outcome?: string })?.outcome === "stale-force-stopped",
+        && (e.data as { outcome?: string })?.outcome === "stale-still-transitional",
     );
     assert.ok(
       staleLog,
-      "Should emit sandbox.snapshotting_reconciled with outcome=stale-force-stopped",
+      "Should emit sandbox.snapshotting_reconciled with outcome=stale-still-transitional",
     );
+  });
+});
+
+test("stale-running reconciliation preserves transitional platform states", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-transitioning", fake.events);
+    handle.setStatus("stopping");
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "attempt-transitioning";
+    });
+    _resetReconcileStaleRunningDebounceForTesting();
+
+    const reconciled = await reconcileStaleRunningStatus();
+
+    assert.equal(reconciled.status, "running");
+    assert.equal(reconciled.sandboxId, handle.sandboxId);
+    assert.equal(reconciled.lifecycleAttemptId, "attempt-transitioning");
+  });
+});
+
+for (const platformState of ["stopped", "not-found"] as const) {
+  test(`stale-running reconciliation preserves a matching ${platformState} fenced operation`, async () => {
+    const fake = new FakeSandboxController();
+    await withTestEnv(fake, async () => {
+      const sandboxId = platformState === "not-found"
+        ? "oc-fenced-not-found"
+        : "sbx-fenced-stopped";
+      if (platformState === "stopped") {
+        const handle = new FakeSandboxHandle(sandboxId, fake.events);
+        handle.setStatus("stopped");
+        fake.handlesByIds.set(sandboxId, handle);
+      }
+      await mutateMeta((meta) => {
+        meta.status = "running";
+        meta.sandboxId = sandboxId;
+        meta.lifecycleAttemptId = "attempt-fenced-reconcile";
+      });
+      const suspension = hostSuspensionState(sandboxId, {
+        lifecycleAttemptId: "attempt-fenced-reconcile",
+        phase: "prepared",
+        stopRequestDeadlineAtMs: null,
+      });
+      await getStore().setValue(
+        hostSuspensionOperationKey(),
+        suspension,
+      );
+      _resetReconcileStaleRunningDebounceForTesting();
+
+      const reconciled = await reconcileStaleRunningStatus();
+
+      assert.equal(reconciled.status, "running");
+      assert.equal(reconciled.sandboxId, sandboxId);
+      assert.deepEqual(
+        await getStore().getValue(hostSuspensionOperationKey()),
+        suspension,
+      );
+    });
+  });
+}
+
+test("stale-running reconciliation adopts a fence published during platform lookup", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-fence-during-lookup";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    handle.setStatus("stopped");
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = "attempt-fence-during-lookup";
+    });
+    const suspension = hostSuspensionState(sandboxId, {
+      lifecycleAttemptId: "attempt-fence-during-lookup",
+      phase: "prepared",
+      stopRequestDeadlineAtMs: null,
+    });
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      await getStore().setValue(hostSuspensionOperationKey(), suspension);
+      return result;
+    };
+    _resetReconcileStaleRunningDebounceForTesting();
+
+    const reconciled = await reconcileStaleRunningStatus();
+
+    assert.equal(reconciled.status, "running");
+    assert.equal(reconciled.sandboxId, sandboxId);
+    assert.deepEqual(
+      await getStore().getValue(hostSuspensionOperationKey()),
+      suspension,
+    );
+  });
+});
+
+test("stale stop reconciliation cannot overwrite a replacement sandbox", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const oldHandle = new FakeSandboxHandle("sbx-reconcile-old", fake.events);
+    oldHandle.setStatus("stopped");
+    fake.handlesByIds.set(oldHandle.sandboxId, oldHandle);
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = oldHandle.sandboxId;
+      meta.portUrls = null;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(oldHandle.sandboxId, {
+        operationId: "operation-old",
+        requestId: "operation-old",
+        phase: "stopping",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+
+    const originalGet = fake.get.bind(fake);
+    let releaseLookup!: () => void;
+    let signalLookupStarted!: () => void;
+    const lookupStarted = new Promise<void>((resolve) => {
+      signalLookupStarted = resolve;
+    });
+    const lookupGate = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    fake.get = async (params) => {
+      const handle = await originalGet(params);
+      signalLookupStarted();
+      await lookupGate;
+      return handle;
+    };
+
+    const reconcile = reconcileSnapshottingStatus();
+    await lookupStarted;
+    const replacementId = "sbx-reconcile-replacement";
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = replacementId;
+      meta.portUrls = { "3000": `https://${replacementId}.example.com` };
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(replacementId, {
+        operationId: "operation-replacement",
+        requestId: "operation-replacement",
+        phase: "preparing",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+    releaseLookup();
+
+    const reconciled = await reconcile;
+    assert.equal(reconciled.status, "running");
+    assert.equal(reconciled.sandboxId, replacementId);
+    const suspension = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.equal(suspension?.operationId, "operation-replacement");
+    assert.equal(suspension?.phase, "preparing");
+  });
+});
+
+test("old fenced operation cannot adopt a same-name replacement generation", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-reused-name";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    handle.setStatus("running");
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = "attempt-new";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        lifecycleAttemptId: "attempt-old",
+        phase: "stop-requesting",
+        stopRequestDeadlineAtMs: Date.now() - 1,
+      }),
+    );
+
+    const reconciled = await reconcileSnapshottingStatus();
+
+    assert.equal(reconciled.status, "running");
+    assert.equal(reconciled.lifecycleAttemptId, "attempt-new");
+    assert.equal(handle.stopCalled, false);
+  });
+});
+
+test("stale stop reconciliation cannot certify a replacement stop on the same generation", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-same-generation-stop";
+    const lifecycleAttemptId = "attempt-same-generation";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    handle.setStatus("stopped");
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.restorePreparedStatus = "preparing";
+      meta.activePersistentStop = {
+        stopAttemptId: "stop-o1",
+        sandboxId,
+        lifecycleAttemptId,
+        operationId: "operation-o1",
+        reason: "sandbox.stop",
+        startedAt: Date.now(),
+      };
+      meta.pendingPersistentAutoSave = {
+        sandboxId,
+        lifecycleAttemptId,
+        operationId: "operation-o1",
+        dynamicConfigHash: "config-o1",
+        assetSha256: "assets-o1",
+        createdAt: Date.now(),
+      };
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        lifecycleAttemptId,
+        operationId: "operation-o1",
+        requestId: "operation-o1",
+        phase: "stopping",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (params) => {
+      const found = await originalGet(params);
+      await mutateMeta((meta) => {
+        meta.activePersistentStop = {
+          stopAttemptId: "stop-o2",
+          sandboxId,
+          lifecycleAttemptId,
+          operationId: "operation-o2",
+          reason: "sandbox.stop",
+          startedAt: Date.now(),
+        };
+        meta.pendingPersistentAutoSave = {
+          sandboxId,
+          lifecycleAttemptId,
+          operationId: "operation-o2",
+          dynamicConfigHash: "config-o2",
+          assetSha256: "assets-o2",
+          createdAt: Date.now(),
+        };
+      });
+      return found;
+    };
+
+    const reconciled = await reconcileSnapshottingStatus();
+
+    assert.equal(reconciled.status, "snapshotting");
+    assert.equal(reconciled.activePersistentStop?.stopAttemptId, "stop-o2");
+    assert.equal(reconciled.pendingPersistentAutoSave?.dynamicConfigHash, "config-o2");
+    assert.equal(reconciled.persistedStateDynamicConfigHash, null);
+    assert.equal(reconciled.restorePreparedStatus, "preparing");
+  });
+});
+
+test("reconcileSnapshottingStatus preserves metadata when suspension state is corrupt", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = "sbx-corrupt-suspension";
+    });
+    await getStore().setValue(hostSuspensionOperationKey(), {
+      version: 99,
+      corrupt: true,
+    });
+
+    const reconciled = await reconcileSnapshottingStatus();
+
+    assert.equal(reconciled.status, "snapshotting");
+    assert.equal(reconciled.sandboxId, "sbx-corrupt-suspension");
+  });
+});
+
+test("terminal SDK status projects even when monitor repair is unavailable", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-terminal-no-monitor", fake.events);
+    handle.setStatus("stopped");
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = handle.sandboxId;
+      meta.portUrls = null;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        phase: "stopping",
+        stopRequestDeadlineAtMs: null,
+        monitorHeartbeatAtMs: Date.now() - 60_000,
+      }),
+    );
+    const failingStarter = (async () => {
+      throw new Error("workflow unavailable");
+    }) as NonNullable<Parameters<
+      typeof _setHostStopWorkflowStarterForTesting
+    >[0]>;
+    _setHostStopWorkflowStarterForTesting(failingStarter);
+
+    try {
+      const reconciled = await reconcileSnapshottingStatus();
+      assert.equal(reconciled.status, "stopped");
+    } finally {
+      _setHostStopWorkflowStarterForTesting(null);
+    }
+  });
+});
+
+test("missing sandbox during stop is deleted state, not a reusable stop", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-deleted-during-stop";
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = sandboxId;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+      meta.persistedStateSource = "persistent-auto-save";
+      meta.restorePreparedStatus = "ready";
+      meta.restorePreparedReason = "prepared";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        phase: "stopping",
+        stopRequestDeadlineAtMs: null,
+      }),
+    );
+    await getStore().setValue(sandboxDeadlineKey(), { sandboxId });
+    fake.get = async () => {
+      throw new Error("404 sandbox not found");
+    };
+
+    const reconciled = await reconcileSnapshottingStatus();
+
+    assert.equal(reconciled.status, "uninitialized");
+    assert.equal(reconciled.sandboxId, null);
+    assert.equal(reconciled.bundleIdentity, null);
+    assert.equal(reconciled.persistedStateSource, null);
+    assert.equal(reconciled.restorePreparedStatus, "failed");
+    assert.equal(reconciled.restorePreparedReason, "prepare-failed");
+    assert.equal(await getStore().getValue(hostSuspensionOperationKey()), null);
+    assert.equal(await getStore().getValue(sandboxDeadlineKey()), null);
+  });
+});
+
+test("reconcileSnapshottingStatus rolls back when accepted stop remains running", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-stop-not-applied", fake.events);
+    handle.stop = async () => {
+      handle.stopCalled = true;
+      // Platform accepted the call but never left running.
+    };
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+      meta.portUrls = { "3000": handle.domain(3000) };
+    });
+
+    const stoppingMeta = await stopSandbox();
+    assert.equal(stoppingMeta.status, "snapshotting");
+
+    const state = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.ok(state);
+    await getStore().setValue(hostSuspensionOperationKey(), {
+      ...state,
+      updatedAtMs: Date.now() - 20_000,
+    });
+
+    const reconciled = await reconcileSnapshottingStatus();
+    assert.equal(reconciled.status, "running");
+    assert.equal(reconciled.portUrls?.["3000"], handle.domain(3000));
+    const rolledBack = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.equal(rolledBack?.phase, "failed");
+    assert.equal(rolledBack?.ingressFenced, false);
+    const deadline = await getStore().getValue<{ sandboxId?: string }>(
+      sandboxDeadlineKey(),
+    );
+    assert.equal(deadline?.sandboxId, handle.sandboxId);
+  });
+});
+
+test("reconcileSnapshottingStatus keeps a running stop request fenced before its absolute deadline", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-stop-request-pending", fake.events);
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = handle.sandboxId;
+      meta.portUrls = null;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId),
+    );
+
+    const reconciled = await reconcileSnapshottingStatus();
+    assert.equal(reconciled.status, "snapshotting");
+    const state = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.equal(state?.phase, "stop-requesting");
+    assert.equal(state?.ingressFenced, true);
+  });
+});
+
+test("reconcileSnapshottingStatus rolls back a running stop request after its absolute deadline", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-stop-request-expired", fake.events);
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "snapshotting";
+      meta.sandboxId = handle.sandboxId;
+      meta.portUrls = null;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        stopRequestDeadlineAtMs: Date.now() - 1,
+        leaseExpiresAtMs: Date.now() + 1,
+      }),
+    );
+
+    const reconciled = await reconcileSnapshottingStatus();
+    assert.equal(reconciled.status, "running");
+    assert.equal(reconciled.portUrls?.["3000"], handle.domain(3000));
+    const state = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.equal(state?.phase, "failed");
+    assert.equal(state?.ingressFenced, false);
+    assert.equal(state?.stopRequestDeadlineAtMs, null);
+    assert.equal(
+      handle.commands.filter((command) =>
+        command.cmd === "node"
+        && command.args?.some((value) => value.includes("/api/v1/admin/rpc"))
+      ).length,
+      1,
+      "expired request should status-check Gateway without renewing the lease",
+    );
+  });
+});
+
+test("reconcileSnapshottingStatus renews a near-expiry lease while platform stop is transitional", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-stop-lease-renew", fake.events);
+    handle.stop = async () => {
+      handle.stopCalled = true;
+      handle.setStatus("snapshotting");
+    };
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+      meta.portUrls = { "3000": handle.domain(3000) };
+    });
+
+    await stopSandbox();
+    const state = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.ok(state);
+    await getStore().setValue(hostSuspensionOperationKey(), {
+      ...state,
+      leaseExpiresAtMs: Date.now() + 1,
+    });
+
+    const reconciled = await reconcileSnapshottingStatus();
+    assert.equal(reconciled.status, "snapshotting");
+    const renewed = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.equal(renewed?.phase, "stopping");
+    assert.ok((renewed?.leaseExpiresAtMs ?? 0) > Date.now() + 60_000);
+  });
+});
+
+test("reconcileSnapshottingStatus keeps snapshotting and fenced when lease renewal fails", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-stop-renew-fails", fake.events);
+    handle.stop = async () => {
+      handle.stopCalled = true;
+      handle.setStatus("snapshotting");
+    };
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+      meta.portUrls = { "3000": handle.domain(3000) };
+    });
+
+    await stopSandbox();
+    const state = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.ok(state);
+    await getStore().setValue(hostSuspensionOperationKey(), {
+      ...state,
+      leaseExpiresAtMs: Date.now() + 1,
+    });
+    handle.responders.unshift((cmd, args) => {
+      if (cmd === "node" && args?.some((value) => value.includes("/api/v1/admin/rpc"))) {
+        return { exitCode: 1, output: async () => "control path unavailable" };
+      }
+      return undefined;
+    });
+
+    const reconciled = await reconcileSnapshottingStatus();
+    assert.equal(reconciled.status, "snapshotting");
+    const failedRenewal = await getStore().getValue<HostSuspensionState>(
+      hostSuspensionOperationKey(),
+    );
+    assert.equal(failedRenewal?.ingressFenced, true);
+    assert.notEqual(failedRenewal?.phase, "stopped");
   });
 });
 

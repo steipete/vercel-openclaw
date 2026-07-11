@@ -2,6 +2,8 @@ import { jsonError } from "@/shared/http";
 import { requireMutationAuth } from "@/server/auth/route-auth";
 import { snapshotSandbox } from "@/server/sandbox/lifecycle";
 
+export const maxDuration = 300;
+
 export async function POST(request: Request): Promise<Response> {
   const auth = await requireMutationAuth(request);
   if (auth instanceof Response) {

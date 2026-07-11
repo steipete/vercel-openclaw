@@ -1,6 +1,6 @@
 # Sandbox Lifecycle and Restore
 
-The project uses `@vercel/sandbox@^2.0.0-beta` with one named persistent OpenClaw sandbox. The normal lifecycle relies on Sandbox v2 persistent auto-save on stop and explicit resume by name; manual `snapshot()` calls are reserved for diagnostic/checkpoint flows.
+The project uses `@vercel/sandbox@^2.0.0-beta` with one named persistent OpenClaw sandbox. The normal lifecycle relies on Sandbox v2 persistent auto-save on stop and explicit resume by name. Every main-sandbox stop, including the legacy manual snapshot endpoint, uses the same cooperative stop controller; it never calls the SDK's direct `snapshot()` path.
 
 ## Lifecycle states
 
@@ -21,23 +21,78 @@ The sandbox moves through these states:
 Calling ensure does not always mean "create from scratch." The app picks the cheapest path:
 
 - If no sandbox exists yet, it creates one from scratch with `{ name: "oc-xxx", persistent: true }` (full bootstrap).
-- If the persistent sandbox exists, it first tries `Sandbox.get({ name, resume: true })` through the local controller. That is the normal wake/resume path.
-- If `get({ resume: true })` fails or the handle is unhealthy, it falls back to `Sandbox.create({ name, persistent: true, ... })`. A name-conflict create falls back to `get({ resume: true })` again.
+- If the persistent sandbox exists, npm mode uses `Sandbox.get({ name, resume: true })` for the normal wake path. Bundle mode always discovers with `resume: false` and explicitly resumes only after the stored exact identity is admitted for the current deployment.
+- A definitive not-found result falls back to `Sandbox.create({ name, persistent: true, ... })`. Name-conflict and interrupted-candidate recovery also discover with `resume: false`, so identity or ownership checks happen before any wake.
 - If the sandbox is already running and healthy, it does nothing.
 
 The work is scheduled with `after()` so the API responds immediately with a waiting state. The browser polls until the sandbox is ready.
+
+Verified bundle bootstrap records a durable candidate identity before running
+untrusted setup work. The identity includes a random ownership tag attached to
+the Sandbox create request, so a reused persistent name never authorizes deletion
+of another generation. The tag rotates after every confirmed delete. Lifecycle
+lease renewal and generation-guarded metadata commits prevent an expired function
+from deleting or publishing a newer attempt. The host deletes a newly created
+candidate if bootstrap fails before the exact receipt is committed, and a retry
+replaces any candidate left by an interrupted function. An existing persistent sandbox with a missing
+or mismatched bundle receipt is different: the host quiesces it and returns
+`OPENCLAW_BUNDLE_MIGRATION_REQUIRED` instead of deleting user state. A failed
+quiesce remains visible as `OPENCLAW_BUNDLE_QUIESCE_FAILED` through readiness
+polling.
+
+Bundle migration quiescing uses the same durable stop handoff: the host records
+the actual discovered sandbox ID and migration intent before the non-blocking
+platform request. If the function disappears, the Workflow monitor finishes the
+stop and projects `OPENCLAW_BUNDLE_MIGRATION_REQUIRED`; reset can then delete the
+preserved sandbox by its real ID.
+
+Bundle mode does not create or promote the experimental hot-spare sandbox. A
+hot spare uses a different persistent name and cannot preserve the canonical
+bundle generation or its user state safely.
 
 ## What stop and snapshot mean today
 
 For the main OpenClaw sandbox, stopping means `sandbox.stop({ blocking: false })` on a persistent sandbox. Vercel Sandbox v2 auto-saves persistent state during stop; the app does not need a manual snapshot ID for normal resume.
 
-Manual `snapshot()` remains available only for explicit/debug checkpoint APIs. A manual snapshot shuts the sandbox down, so those paths must not call `stop()` afterward.
+`POST /api/admin/snapshot` and `POST /api/admin/snapshots` are compatibility aliases for that cooperative persistent stop. The plural endpoint returns `record: null`; it does not create a manual snapshot-history record. Direct SDK snapshots remain limited to disposable diagnostic sandboxes, not the managed OpenClaw sandbox.
 
 The stop path parks metadata in `snapshotting` before calling `sandbox.stop({ blocking: false })`. That ordering closes the race where a concurrent heartbeat still sees `running` and resumes the sandbox while the stop request is being accepted. While metadata is `snapshotting`, status reconciliation must inspect the sandbox with `Sandbox.get({ resume: false })`; observation must not wake the sandbox being observed. Normal wake uses `Sandbox.get({ resume: true })`.
 
+### Cooperative stop protocol
+
+Cooperative Gateway suspension is capability-gated. The host enables the
+`admin-http-rpc` plugin only for an admitted bundle that declares
+`admin-http-rpc-v1`. The released npm-package runtime predates that contract;
+when the RPC route or suspend methods are absent, the controller preserves its
+legacy platform stop/delete behavior and does not leave a synthetic Gateway
+fence behind.
+
+With the admitted capability, before any irreversible platform stop or reset,
+the host:
+
+1. persists a host-suspension operation and fences app-owned ingress;
+2. calls the loopback-only OpenClaw Admin RPC `gateway.suspend.prepare` with a stable request ID;
+3. refuses the operation when OpenClaw reports active work;
+4. persists cron state and cleanup, renews the OpenClaw suspension lease, then records an absolute stop-request deadline;
+5. requests the non-blocking Sandbox stop and leaves reconciliation to a durable Workflow monitor.
+
+The monitor adopts interrupted operations by operation ID, renews the Gateway lease while the platform is transitional, and only records `stopped` after the SDK confirms a terminal stop. An ambiguous SDK response stays fenced. If the SDK remains `running` after the bounded request/grace window, the controller resumes Gateway admission before reopening host ingress. Reset uses the same prepare gate and then deletes directly because reset intentionally discards persistent state.
+
+Wake readiness is admission-aware: the host first verifies Control UI liveness,
+resumes any persisted Gateway suspension, and then requires `/readyz` to return
+success. A live but still-draining Gateway is never published as ready.
+
+Authenticated host mutations share the lifecycle lock. This makes mutation versus stop ordering explicit: the mutation completes first and stop waits/refuses, or the lifecycle transition wins and the mutation receives a retryable fence response. Gateway and channel ingress check the durable fence after their own authentication checks.
+
+### Desired-idle deadline and platform runway
+
+The durable deadline Workflow owns idle stop timing. Heartbeats move one deadline for the current sandbox generation; duplicate same-generation Workflow starts converge under the coordinator lock. Workflow creation happens while the coordinator lock is held, and the deadline plus run ID are persisted together. A process death can therefore leave only an orphan Workflow, which exits on its generation check, never a persisted deadline without a repair owner. At the deadline, the coordinator extends the native Sandbox timeout before attempting cooperative stop. Busy OpenClaw work is retried instead of interrupted.
+
+The portable Sandbox timeout ceiling is 45 minutes. The configured desired idle window is therefore capped at 40 minutes, reserving five minutes of native timeout runway for Workflow scheduling, busy refusal, lease renewal, and stop acceptance. The native timeout remains a final safety net, not the primary idle controller.
+
 ### Measuring snapshot duration
 
-Unit tests use `FakeSandboxHandle`, so they only prove that the host parks metadata in `snapshotting`, polls, and transitions after the SDK reports `stopped`. They do not measure Vercel's real snapshot duration.
+Unit tests use `FakeSandboxHandle`, so they prove host fencing, Gateway prepare/resume behavior, metadata parking, deadline generation guards, polling, and terminal projection. They do not measure Vercel's real snapshot duration.
 
 Use `scripts/bench-stop-cycle.mjs` for manual ops measurements against a deployed app. Run enough completed cycles for each workload, and prefer `--sdk-poll` so the benchmark records the platform status separately from the app's 5-minute stale guardrail.
 
@@ -122,6 +177,12 @@ A sandbox can be "running" right now but still not be a good future resume targe
 | `preparing` | A prepare cycle is in progress |
 | `ready` | The sandbox is a verified reusable resume target |
 | `failed` | Preparation was attempted and failed |
+
+Before the persistent stop, preparation stores the verified config and asset
+hashes as a pending attestation. The synchronous caller waits only within its
+absolute function budget. If Vercel finishes the stop later, durable status
+reconciliation promotes that pending attestation to `ready`; a timed-out
+function is not required to resume and repeat the preparation.
 
 ### Reasons
 

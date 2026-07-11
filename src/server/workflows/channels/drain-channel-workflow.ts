@@ -643,8 +643,11 @@ export async function processChannelStep(
 
     const revalidateSandboxBeforeForward =
       options?.workflowHandoff?.revalidateSandboxBeforeForward === true;
-    const readyMeta =
-      bootResult.meta.status === "running" && !revalidateSandboxBeforeForward
+    const useBootMetaDirectly =
+      bootResult.admissionReady &&
+      bootResult.meta.status === "running" &&
+      !revalidateSandboxBeforeForward;
+    const readyMeta = useBootMetaDirectly
       ? bootResult.meta
       : await ensureSandboxReady({
           origin,
@@ -667,8 +670,7 @@ export async function processChannelStep(
     diag.readyMetaPortUrlKeys = effectiveReadyMeta.portUrls ? Object.keys(effectiveReadyMeta.portUrls) : null;
     diag.readyMetaPortUrls = effectiveReadyMeta.portUrls;
     diag.readyMetaHasWebhookSecret = Boolean(effectiveReadyMeta.channels?.telegram?.webhookSecret);
-    diag.usedBootMetaDirectly =
-      bootResult.meta.status === "running" && !revalidateSandboxBeforeForward;
+    diag.usedBootMetaDirectly = useBootMetaDirectly;
     diag.revalidatedSandboxBeforeForward = revalidateSandboxBeforeForward;
     diag.telegramRestoreContractStatus = telegramRestoreContract?.status ?? null;
     diag.telegramRestoreContractRecordedAt =

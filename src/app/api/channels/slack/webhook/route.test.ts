@@ -17,6 +17,8 @@ import {
   channelPendingBootMessageKey,
   channelUserMessageDedupKey,
 } from "@/server/channels/keys";
+import { hostSuspensionOperationKey } from "@/server/store/keyspace";
+import type { HostSuspensionState } from "@/server/sandbox/host-suspension";
 import { getStore } from "@/server/store/store";
 import {
   withHarness,
@@ -206,6 +208,63 @@ test("Slack webhook: valid event enqueues job and returns 200", async () => {
     } finally {
       startMock.mock.restore();
     }
+  });
+});
+
+test("Slack webhook: bot reply cleanup bypasses a host ingress fence", async () => {
+  await withHarness(async (h) => {
+    await configureSlack(h);
+    const now = Date.now();
+    await getStore().setValue<HostSuspensionState>(hostSuspensionOperationKey(), {
+      version: 1,
+      operationId: "operation-fenced",
+      requestId: "operation-fenced",
+      sandboxId: "sbx-fenced",
+      lifecycleAttemptId: null,
+      intent: "stop",
+      reason: "test-stop",
+      phase: "prepared",
+      ingressFenced: true,
+      suspensionId: "suspension-fenced",
+      leaseExpiresAtMs: now + 120_000,
+      stopRequestDeadlineAtMs: null,
+      monitorHeartbeatAtMs: now,
+      startedAtMs: now,
+      updatedAtMs: now,
+      stoppedAtMs: null,
+      resumedAtMs: null,
+      lastError: null,
+      lastErrorCode: null,
+      lastErrorClass: null,
+    });
+    const pendingKey = channelPendingBootMessageKey("slack", "C-bot", "thread-1");
+    await getStore().setValue(pendingKey, ["boot-ts"]);
+    let deleteCalls = 0;
+    h.fakeFetch.onPost(/slack\.com\/api\/chat\.delete$/, () => {
+      deleteCalls += 1;
+      return Response.json({ ok: true });
+    });
+    const payload = {
+      type: "event_callback",
+      event_id: "Ev_BOT_CLEANUP_FENCED",
+      event: {
+        type: "message",
+        channel: "C-bot",
+        thread_ts: "thread-1",
+        ts: "bot-reply-ts",
+        bot_id: "B-bot",
+        text: "reply",
+      },
+    };
+
+    const result = await callRoute(
+      getSlackWebhookRoute().POST,
+      buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET, payload }),
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal(deleteCalls, 1);
+    assert.equal(await getStore().getValue(pendingKey), null);
   });
 });
 

@@ -952,20 +952,6 @@ export function CommandShell({ initialStatus, initialView = "status" }: Props) {
               </div>
               <div className="hero-actions">
                 <button
-                  className="btn btn-ghost"
-                  onClick={() => doAction("Snapshot", "/api/admin/snapshot")}
-                  disabled={
-                    pending !== null ||
-                    status.status === "uninitialized" ||
-                    status.status === "stopped" ||
-                    status.status === "snapshotting"
-                  }
-                  title="Stop the sandbox (auto-snapshots on stop)"
-                  aria-label="Take snapshot — stops the sandbox, which auto-snapshots"
-                >
-                  Snapshot
-                </button>
-                <button
                   className="btn btn-danger"
                   onClick={() => doAction("Stop", "/api/admin/stop")}
                   disabled={
@@ -1714,35 +1700,6 @@ export function CommandShell({ initialStatus, initialView = "status" }: Props) {
             <section>
               <div className="section-header">
                 <h2 className="section-title">Snapshots</h2>
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  disabled={pending !== null || status.status !== "running"}
-                  onClick={async () => {
-                    if (
-                      typeof window !== "undefined" &&
-                      !window.confirm(
-                        "Take snapshot? This stops the running sandbox to snapshot, then restarts.",
-                      )
-                    )
-                      return;
-                    const r = await doAction(
-                      "Create snapshot",
-                      "/api/admin/snapshots",
-                      {
-                        method: "POST",
-                        headers: { "content-type": "application/json" },
-                        body: JSON.stringify({ reason: "manual" }),
-                      },
-                    );
-                    await fetchSnapshots();
-                    if (r.ok) {
-                      void doAction("Restarting", "/api/admin/ensure");
-                    }
-                  }}
-                >
-                  Take snapshot
-                </button>
               </div>
               {snapshotsLoading && (
                 <p className="muted-copy">Loading…</p>

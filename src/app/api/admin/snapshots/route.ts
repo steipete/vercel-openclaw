@@ -1,17 +1,13 @@
-import { randomUUID } from "node:crypto";
-
-import { getSandboxController } from "@/server/sandbox/controller";
-
-import type { SnapshotRecord } from "@/shared/types";
 import { ApiError, jsonError } from "@/shared/http";
 import {
   requireJsonRouteAuth,
   requireMutationAuth,
   authJsonOk,
 } from "@/server/auth/route-auth";
-import { getInitializedMeta, mutateMeta } from "@/server/store/store";
+import { snapshotSandbox } from "@/server/sandbox/lifecycle";
+import { getInitializedMeta } from "@/server/store/store";
 
-const MAX_SNAPSHOT_HISTORY = 50;
+export const maxDuration = 300;
 
 export async function GET(request: Request): Promise<Response> {
   const auth = await requireJsonRouteAuth(request);
@@ -36,44 +32,17 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  let body: { reason?: string } = {};
   try {
-    body = await request.json();
-  } catch {
-    // No body is fine — reason is optional
-  }
-
-  const reason = typeof body.reason === "string" ? body.reason : "manual";
-
-  try {
-    const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
-    const snapshot = await sandbox.snapshot();
-
-    const record: SnapshotRecord = {
-      id: randomUUID(),
-      snapshotId: snapshot.snapshotId,
-      timestamp: Date.now(),
-      reason,
-    };
-
-    const updated = await mutateMeta((next) => {
-      next.snapshotId = snapshot.snapshotId;
-      next.sandboxId = null;
-      next.portUrls = null;
-      next.status = "stopped";
-      next.lastAccessedAt = Date.now();
-      next.lastError = null;
-      next.snapshotHistory = [record, ...next.snapshotHistory].slice(
-        0,
-        MAX_SNAPSHOT_HISTORY,
-      );
-    });
+    // Persistent Sandbox v2 auto-saves on cooperative stop. Keep this legacy
+    // UI endpoint on the canonical quiesce path instead of bypassing Gateway
+    // admission with the SDK's direct snapshot call.
+    const updated = await snapshotSandbox();
 
     return authJsonOk(
       {
         status: updated.status,
-        snapshotId: snapshot.snapshotId,
-        record,
+        snapshotId: null,
+        record: null,
       },
       auth,
     );

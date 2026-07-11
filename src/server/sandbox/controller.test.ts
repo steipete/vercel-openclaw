@@ -180,6 +180,10 @@ test("controller: FakeSandboxHandle preserves create-time timeout", async () => 
   const handle = new FakeSandboxHandle("sbx-timeout", events, 300_000);
 
   assert.equal(handle.timeout, 300_000, "initial timeout should match create param");
+  assert.ok(
+    handle.timeoutRemaining <= 300_000 && handle.timeoutRemaining > 299_000,
+    "remaining timeout should count down from the current session expiry",
+  );
 });
 
 test("controller: FakeSandboxHandle.extendTimeout is additive", async () => {

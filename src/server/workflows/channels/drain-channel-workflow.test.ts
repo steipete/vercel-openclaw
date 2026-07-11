@@ -83,6 +83,7 @@ function createWorkflowDependencies(
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "running", sandboxId: "sbx-stale" }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     ensureSandboxReady: async () =>
       asMeta({
@@ -200,6 +201,7 @@ test("processChannelStep skips ensureSandboxReady when boot returns running", as
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "running", sandboxId: "sbx-booted" }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     ensureSandboxReady: async () => {
       ensureCalls += 1;
@@ -230,6 +232,7 @@ test("processChannelStep revalidates lifecycle after fast-path admission closes"
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "running", sandboxId: "sbx-quiescing" }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
     ensureSandboxReady: async () => {
       ensureCalls += 1;
@@ -278,6 +281,50 @@ test("processChannelStep revalidates lifecycle after fast-path admission closes"
   assert.equal(forwardedSandboxId, "sbx-resumed");
 });
 
+test("processChannelStep rechecks admission when raw metadata is running", async () => {
+  let ensureCalls = 0;
+  let forwardedSandboxId: string | null = null;
+
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-fenced" }),
+      bootMessageSent: false,
+      admissionReady: false,
+    }),
+    ensureSandboxReady: async () => {
+      ensureCalls += 1;
+      return asMeta({
+        status: "running",
+        sandboxId: "sbx-admitted",
+        channels: { telegram: null, slack: null, discord: null, whatsapp: null },
+      });
+    },
+    forwardToNativeHandlerWithRetry: async (
+      _channel: unknown,
+      _payload: unknown,
+      meta: SingleMeta,
+    ): Promise<RetryingForwardResult> => {
+      forwardedSandboxId = meta.sandboxId ?? null;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 50,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep("slack", {}, "test", "req-fenced", null, {
+    dependencies,
+  });
+
+  assert.equal(ensureCalls, 1);
+  assert.equal(forwardedSandboxId, "sbx-admitted");
+});
+
 test("processChannelStep re-enters lifecycle when workflow admission closes", async () => {
   let ensureCalls = 0;
   let ensureReason: string | null = null;
@@ -289,6 +336,7 @@ test("processChannelStep re-enters lifecycle when workflow admission closes", as
         bundleIdentity: VERIFIED_DELIVERY_BUNDLE_IDENTITY,
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     hydrateVerifiedBundleIdentity: async () =>
       VERIFIED_DELIVERY_BUNDLE_IDENTITY,
@@ -364,6 +412,7 @@ test("processChannelStep clears Telegram boot message after durable acceptance",
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "running", sandboxId: "sbx-telegram-accepted" }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
       ok: true,
@@ -417,6 +466,7 @@ test("processChannelStep closes unknown Telegram acceptance without redrive", as
         portUrls: { "8787": "https://telegram.example.test" },
       }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
       ok: false,
@@ -496,6 +546,7 @@ test("processChannelStep falls back to ensureSandboxReady when boot returns non-
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "booting", sandboxId: "sbx-stale" }),
       bootMessageSent: true,
+      admissionReady: false,
     }),
     ensureSandboxReady: async () => {
       ensureCalls += 1;
@@ -531,6 +582,7 @@ test("processChannelStep restores Telegram config from workflow handoff when sto
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "running", sandboxId: "sbx-handoff" }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     forwardToNativeHandlerWithRetry: async (_channel: unknown, _payload: unknown, meta: SingleMeta): Promise<RetryingForwardResult> => {
       forwardedWebhookSecret = meta.channels.telegram?.webhookSecret ?? null;
@@ -582,6 +634,7 @@ test("processChannelStep preserves existing Telegram config over workflow handof
         },
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     forwardToNativeHandlerWithRetry: async (_channel: unknown, _payload: unknown, meta: SingleMeta): Promise<RetryingForwardResult> => {
       forwardedWebhookSecret = meta.channels.telegram?.webhookSecret ?? null;
@@ -619,6 +672,7 @@ test("processChannelStep fails closed when post-wake bundle identity cannot be v
         bundleIdentity: VERIFIED_DELIVERY_BUNDLE_IDENTITY,
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     hydrateVerifiedBundleIdentity: async () => null,
     forwardToNativeHandlerWithRetry: async (
@@ -664,6 +718,7 @@ test("processChannelStep admits capabilities verified after a cold wake", async 
         bundleIdentity: VERIFIED_DELIVERY_BUNDLE_IDENTITY,
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     hydrateVerifiedBundleIdentity: async (identity) =>
       identity === VERIFIED_DELIVERY_BUNDLE_IDENTITY
@@ -716,6 +771,7 @@ test("processChannelStep uses the current verified post-wake capabilities", asyn
         bundleIdentity: currentIdentity,
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     hydrateVerifiedBundleIdentity: async () => currentIdentity,
     forwardToNativeHandlerWithRetry: async (
@@ -1089,6 +1145,7 @@ test("processChannelStep skips probe loop when lastRestoreMetrics.telegramListen
         } as RestorePhaseMetrics,
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     probeTelegramNativeHandlerLocally: async () => {
       localProbeCalls += 1;
@@ -1158,6 +1215,7 @@ test("processChannelStep preserves probe behavior when telegramListenerReady !==
         } as RestorePhaseMetrics,
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     probeTelegramNativeHandlerLocally: async () => {
       localProbeCalls += 1;
@@ -1212,6 +1270,7 @@ test("processChannelStep emits channels.telegram_wake_summary for Telegram reque
         lastRestoreMetrics: fakeRestoreMetrics as RestorePhaseMetrics,
       }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
   });
 
@@ -1284,6 +1343,7 @@ test("processChannelStep collapses Telegram public probe into forward retry loop
         } as RestorePhaseMetrics,
       }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
     probeTelegramNativeHandlerLocally: async () => ({
       status: 404,
@@ -1441,6 +1501,7 @@ test("processChannelStep forward captures Telegram webhook secret and correct po
         },
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     forwardToNativeHandlerWithRetry: async (
       channel: unknown,
@@ -1484,6 +1545,7 @@ test("processChannelStep forward passes meta with portUrls from boot result", as
         channels: { telegram: null, slack: null, discord: null, whatsapp: null },
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     forwardToNativeHandlerWithRetry: async (
       _channel: unknown,
@@ -1525,6 +1587,7 @@ test("processChannelStep uses local Telegram native handler readiness before for
         },
       }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
     waitForTelegramNativeHandler: async () => {
       probeCallCount += 1;
@@ -1597,6 +1660,7 @@ test("processChannelStep skips public Telegram probe when local handler is not r
         },
       }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
     probeTelegramNativeHandlerLocally: async () => ({
       status: 404,
@@ -1644,6 +1708,7 @@ test("processChannelStep still forwards when both Telegram probes time out", asy
         },
       }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
     probeTelegramNativeHandlerLocally: async () => ({
       status: 404,
@@ -1688,6 +1753,7 @@ test("processChannelStep accepts local Telegram empty 200 without retrying", asy
         },
       }),
       bootMessageSent: false,
+      admissionReady: true,
     }),
     probeTelegramNativeHandlerLocally: async () => ({
       status: 401,
@@ -1899,6 +1965,7 @@ test("processChannelStep clears Slack boot message after native acceptance", asy
     runWithBootMessages: async () => ({
       meta: asMeta({ status: "running", sandboxId: "sbx-slack-accepted" }),
       bootMessageSent: true,
+      admissionReady: true,
     }),
     forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => ({
       ok: true,

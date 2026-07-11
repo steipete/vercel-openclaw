@@ -207,6 +207,7 @@ test("host suspension blocks authenticated mutations but preserves explicit life
       operationId: "operation-route-auth",
       requestId: "operation-route-auth",
       sandboxId: "sbx-route-auth",
+      lifecycleAttemptId: null,
       reason: "test",
       intent: "stop",
       phase: "stopping",

@@ -1095,8 +1095,8 @@ async function runCli(
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   try {
     const { stdout, stderr } = await execFileAsync(
-      "npx",
-      ["tsx", CLI_PATH, ...args],
+      process.execPath,
+      ["--import", "tsx", CLI_PATH, ...args],
       { timeout: 30_000, env: { ...process.env, NODE_NO_WARNINGS: "1" } },
     );
     return { code: 0, stdout, stderr };

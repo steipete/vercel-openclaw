@@ -130,6 +130,7 @@ function installFailingSandboxSync(): {
       return {
         sandboxId: "sandbox-123",
         get timeout() { return 1800000; },
+        get timeoutRemaining() { return 1800000; },
         get status() { return "running" as const; },
         async runCommand() {
           return { exitCode: 0, output: async () => "" };
@@ -300,6 +301,7 @@ function installSucceedingSandboxController(opts?: {
       return {
         sandboxId: "sandbox-123",
         get timeout() { return 1800000; },
+        get timeoutRemaining() { return 1800000; },
         get status() { return "running" as const; },
         async runCommand(_cmd: string, args?: string[]) {
           const cmdStr = [_cmd, ...(args ?? [])].join(" ");

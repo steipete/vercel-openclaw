@@ -14,6 +14,7 @@ function state(overrides: Partial<HostSuspensionState> = {}): HostSuspensionStat
     operationId: "operation-1",
     requestId: "operation-1",
     sandboxId: "sbx-1",
+    lifecycleAttemptId: "attempt-1",
     intent: "stop",
     reason: "test",
     phase: "stopping",
@@ -139,9 +140,10 @@ test("host stop monitor adopts an interrupted reset delete", async () => {
     reconciled: { status: "uninitialized", sandboxId: null } as SingleMeta,
   });
   const resumeReset = testDeps.resumeReset;
-  testDeps.resumeReset = async () => {
+  testDeps.resumeReset = async (expected) => {
     resetCalls += 1;
-    return resumeReset();
+    assert.equal(expected.lifecycleAttemptId, "attempt-1");
+    return resumeReset(expected);
   };
 
   const result = await processHostStopMonitorStep("operation-1", testDeps);

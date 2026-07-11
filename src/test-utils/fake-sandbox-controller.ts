@@ -70,6 +70,7 @@ function writeToStream(stream: Writable | undefined, text: string): void {
 
 export class FakeSandboxHandle implements SandboxHandle {
   sandboxId: string;
+  tags: Record<string, string> | undefined = undefined;
   commands: Array<{ cmd: string; args?: string[]; env?: Record<string, string> }> = [];
   detachedCommands: Array<{ cmdId: string; cmd: string; args?: string[]; env?: Record<string, string>; killed: boolean }> = [];
   writtenFiles: Array<{ path: string; content: Buffer }> = [];
@@ -97,7 +98,11 @@ export class FakeSandboxHandle implements SandboxHandle {
   /** Optional hook to override `updateNetworkPolicy` behavior (e.g. to simulate failure). */
   networkPolicyHandler?: (policy: NetworkPolicy) => Promise<NetworkPolicy> | NetworkPolicy;
 
+  /** Optional hook that runs after a fake delete is accepted. */
+  deleteHook?: () => Promise<void> | void;
+
   private timeoutMs: number;
+  private timeoutExpiresAtMs: number;
   private _status: SandboxStatus;
 
   constructor(sandboxId: string, eventLog: SandboxEvent[], timeoutMs = 5 * 60 * 1000) {
@@ -105,11 +110,16 @@ export class FakeSandboxHandle implements SandboxHandle {
     this.portDomain = `https://${sandboxId}`;
     this.eventLog = eventLog;
     this.timeoutMs = timeoutMs;
+    this.timeoutExpiresAtMs = Date.now() + timeoutMs;
     this._status = "running";
   }
 
   get timeout(): number {
     return this.timeoutMs;
+  }
+
+  get timeoutRemaining(): number {
+    return Math.max(0, this.timeoutExpiresAtMs - Date.now());
   }
 
   get status(): SandboxStatus {
@@ -147,6 +157,43 @@ export class FakeSandboxHandle implements SandboxHandle {
         writeToStream(stderr, await result.output("stderr"));
         return result;
       }
+    }
+
+    // Default loopback Admin RPC contract used by lifecycle suspension tests.
+    // Individual tests can override this with a responder to inject busy,
+    // transport, status, or resume failures.
+    if (
+      cmd === "node"
+      && cmdArgs?.includes("-e")
+      && cmdArgs.some((value) => value.includes("/api/v1/admin/rpc"))
+    ) {
+      const request = JSON.parse(cmdEnv?.OPENCLAW_ADMIN_RPC_BODY ?? "{}") as {
+        method?: string;
+      };
+      const payload = request.method === "gateway.suspend.resume"
+        ? { ok: true, status: "running", resumed: true }
+        : request.method === "gateway.suspend.status"
+          ? { status: "running" }
+          : {
+              status: "ready",
+              suspensionId: `suspension-${this.sandboxId}`,
+              expiresAtMs: Date.now() + 120_000,
+              activeCount: 0,
+              blockers: [],
+            };
+      const stdoutJson = JSON.stringify({
+        status: 200,
+        body: JSON.stringify({ ok: true, payload }),
+      });
+      writeToStream(stdout, stdoutJson);
+      writeToStream(stderr, "");
+      return {
+        exitCode: 0,
+        output: async (stream?: "stdout" | "stderr" | "both") => {
+          if (stream === "stderr") return "";
+          return stdoutJson;
+        },
+      };
     }
 
     // Default: fast-restore script with stream-aware output
@@ -286,10 +333,12 @@ export class FakeSandboxHandle implements SandboxHandle {
       sandboxId: this.sandboxId,
       timestamp: Date.now(),
     });
+    await this.deleteHook?.();
   }
 
   async extendTimeout(duration: number): Promise<void> {
     this.timeoutMs += duration;
+    this.timeoutExpiresAtMs += duration;
     this.extendedTimeouts.push(duration);
     this.eventLog.push({
       kind: "extend_timeout",
@@ -385,6 +434,7 @@ export class FakeSandboxController implements SandboxController {
     const id = `sbx-fake-${this.counter}`;
     const isRestore = params.source?.type === "snapshot";
     const handle = new FakeSandboxHandle(id, this.events, params.timeout);
+    handle.tags = params.tags ? { ...params.tags } : undefined;
     handle.responders.push(...this.defaultResponders);
     if (params.env) {
       handle.createEnv = params.env;

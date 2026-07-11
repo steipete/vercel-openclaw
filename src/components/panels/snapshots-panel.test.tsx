@@ -165,6 +165,7 @@ test("SnapshotsPanel renders the danger zone at the bottom", () => {
   assert.ok(html.includes("Danger zone"));
   assert.ok(html.includes("Delete the current sandbox and snapshots"));
   assert.match(html, /<button[^>]*>Reset Sandbox<\/button>/);
+  assert.ok(!html.includes("Take snapshot"));
 });
 
 test("SnapshotsPanel hides reset when uninitialized or error with no sandbox", () => {

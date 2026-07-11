@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildAuthPostRequest, buildPostRequest, callRoute, drainAfterCallbacks, patchNextServerAfter, resetAfterCallbacks } from "@/test-utils/route-caller";
+import { buildAuthPostRequest, buildPostRequest, callRoute, patchNextServerAfter, resetAfterCallbacks } from "@/test-utils/route-caller";
 import { withHarness } from "@/test-utils/harness";
 import { loginWithAdminSecret } from "@/server/auth/admin-auth";
 
@@ -88,7 +88,11 @@ test("admin/reset POST: cookie-auth with same-origin Origin returns 200", async 
     const result = await callRoute(route.POST, request);
 
     assert.equal(result.status, 200);
-    assert.deepEqual(result.json, { ok: true, message: "Sandbox reset started" });
+    assert.deepEqual(result.json, {
+      ok: true,
+      message: "Sandbox reset completed",
+      status: "uninitialized",
+    });
   });
 });
 
@@ -101,11 +105,15 @@ test("admin/reset POST: bearer-auth succeeds without CSRF headers", async () => 
     const result = await callRoute(route.POST, request);
 
     assert.equal(result.status, 200);
-    assert.deepEqual(result.json, { ok: true, message: "Sandbox reset started" });
+    assert.deepEqual(result.json, {
+      ok: true,
+      message: "Sandbox reset completed",
+      status: "uninitialized",
+    });
   });
 });
 
-test("admin/reset POST: responds immediately and resets sandbox state after callbacks drain", async () => {
+test("admin/reset POST: confirms the durable reset before responding", async () => {
   await withHarness(async (h) => {
     const route = getAdminResetRoute();
     await h.driveToRunning();
@@ -123,12 +131,11 @@ test("admin/reset POST: responds immediately and resets sandbox state after call
     const result = await callRoute(route.POST, buildAuthPostRequest("/api/admin/reset", "{}"));
 
     assert.equal(result.status, 200);
-    assert.deepEqual(result.json, { ok: true, message: "Sandbox reset started" });
-
-    const queuedMeta = await h.getMeta();
-    assert.equal(queuedMeta.sandboxId, originalSandboxId);
-
-    await drainAfterCallbacks();
+    assert.deepEqual(result.json, {
+      ok: true,
+      message: "Sandbox reset completed",
+      status: "uninitialized",
+    });
 
     const afterMeta = await h.getMeta();
     assert.equal(afterMeta.status, "uninitialized");

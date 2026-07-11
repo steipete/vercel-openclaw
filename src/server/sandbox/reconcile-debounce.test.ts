@@ -5,7 +5,10 @@ import {
   _resetReconcileStaleRunningDebounceForTesting,
   reconcileStaleRunningStatus,
 } from "@/server/sandbox/lifecycle";
-import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
+import {
+  _setSandboxControllerForTesting,
+  getSandboxController,
+} from "@/server/sandbox/controller";
 import { _resetLogBuffer, getServerLogs } from "@/server/log";
 import { _resetStoreForTesting, mutateMeta } from "@/server/store/store";
 import { FakeSandboxController } from "@/test-utils/fake-sandbox-controller";
@@ -19,6 +22,10 @@ const TEST_ENV: Record<string, string | undefined> = {
 };
 
 async function withEnv<T>(fn: () => T | Promise<T>): Promise<T> {
+  _resetStoreForTesting();
+  _resetReconcileStaleRunningDebounceForTesting();
+  _resetLogBuffer();
+  _setSandboxControllerForTesting(null);
   const originals: Record<string, string | undefined> = {};
   for (const key of Object.keys(TEST_ENV)) {
     originals[key] = process.env[key];
@@ -63,6 +70,7 @@ test("reconcile: concurrent callers share one inner run (in-flight coalesce)", a
     await mutateMeta((meta) => {
       meta.status = "running";
       meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "reconcile-concurrent";
     });
 
     let innerGetCount = 0;
@@ -110,28 +118,27 @@ test("reconcile: completed result is reused within debounce window", async () =>
       persistent: true,
       ports: [3000],
     });
-    (handle as unknown as { setStatus: (s: string) => void }).setStatus("stopped");
+    (handle as unknown as { setStatus: (s: string) => void }).setStatus("running");
 
     await mutateMeta((meta) => {
       meta.status = "running";
       meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "reconcile-debounced";
     });
 
-    let innerGetCount = 0;
-    const originalGet = controller.get.bind(controller);
-    controller.get = (async (input: { sandboxId: string }) => {
-      innerGetCount += 1;
-      return originalGet(input);
-    }) as typeof controller.get;
-
+    assert.equal(getSandboxController(), controller);
     await reconcileStaleRunningStatus();
-    const afterFirst = innerGetCount;
+    const afterFirst = controller.getCalls.length;
     assert.equal(afterFirst, 1);
 
     // Second call inside the debounce window must NOT hit SDK.get again.
     const cached = await reconcileStaleRunningStatus();
-    assert.equal(innerGetCount, afterFirst, "debounce window reuses cached result");
-    assert.equal(cached.status, "stopped");
+    assert.equal(
+      controller.getCalls.length,
+      afterFirst,
+      "debounce window reuses cached result",
+    );
+    assert.equal(cached.status, "running");
 
     const debouncedLogs = getServerLogs().filter(
       (entry) =>
@@ -156,6 +163,7 @@ test("reconcile: reset clears cache so next call hits SDK again", async () => {
     await mutateMeta((meta) => {
       meta.status = "running";
       meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "reconcile-reset";
     });
 
     let innerGetCount = 0;

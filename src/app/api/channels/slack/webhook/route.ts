@@ -258,80 +258,15 @@ export async function POST(request: Request): Promise<Response> {
     });
   }
 
-  let verifiedBundleIdentity: Awaited<
-    ReturnType<typeof hydrateVerifiedBundleIdentity>
-  > = null;
-  try {
-    verifiedBundleIdentity = await hydrateVerifiedBundleIdentity(
-      meta.bundleIdentity,
-    );
-  } catch {
-    // Fail closed below. Bundle admission errors must not create a platform
-    // retry storm for an otherwise valid Slack webhook.
-  }
-  const gatewayAdmissionRejectionAdmitted =
-    verifiedBundleIdentity?.capabilities.includes(
-      OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
-    ) === true;
-  if (!gatewayAdmissionRejectionAdmitted) {
-    logWarn("slack.delivery.bundle_capability_missing", {
-      capabilityId: OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
-      bundleIdentityMissing: meta.bundleIdentity === null,
-      bundleIdentityVerified: verifiedBundleIdentity !== null,
-      requestId,
-    });
-  }
-
   const eventInfo = extractSlackEventInfo(payload);
-  const ingressFence = await getHostIngressFence();
-  // Bot replies still need to clear their pending wake placeholder while the
-  // host fence prevents new user work from entering the suspended gateway.
-  if (ingressFence && !eventInfo.botId) {
-    logInfo("channels.slack_host_ingress_fenced", {
-      requestId,
-      phase: ingressFence.phase,
-      operationId: ingressFence.operationId,
-    });
-    return buildHostIngressFencedResponse(ingressFence);
-  }
-
   const dedupId = extractSlackDedupId(payload);
-  let dedupLock: SlackWebhookDedupLock | null = null;
-  if (dedupId) {
-    const dedupKey = channelDedupKey("slack", dedupId);
-    const dedupResult = await tryAcquireChannelDedupLock({
-      channel: "slack",
-      key: dedupKey,
-      ttlSeconds: CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS,
-      requestId: requestId ?? null,
-      dedupId,
-      lockKind: "event-id",
-    });
-    if (dedupResult.kind === "duplicate") {
-      logInfo("channels.slack_webhook_dedup_skip", {
-        requestId,
-        dedupId,
-        ...eventInfo,
-      });
-      return Response.json({ ok: true });
-    }
-    if (dedupResult.kind === "acquired") {
-      dedupLock = dedupResult.lock;
-    }
-    // degraded: dedupLock stays null and we proceed without a lock.
-    // The helper already logged channels.dedup_lock_acquire_failed_degraded.
-  }
 
-  // Skip bot messages to avoid feedback loops. Before returning, sweep any
-  // "🦞 Bot waking up…" placeholder we parked in this thread — OpenClaw's
-  // reply arriving means the dead-time fill has served its purpose.
+  // Bot replies must clear their pending wake placeholder even while the host
+  // fence rejects new user work from entering the suspended gateway.
   if (eventInfo.botId) {
     if (eventInfo.channel) {
       // The write side keys pending-boot by Slack's actual thread_ts.
-      //   Threaded reply: bot.thread_ts == root → scope = thread_ts.
-      //   Top-level reply: no thread_ts, and the bot's own ts is unrelated
-      //     to the user message ts, so neither side can derive that ts.
-      //     Both sides use scope=undefined (channel-wide top-level list).
+      // Threaded replies share thread_ts; top-level replies share channel scope.
       const botReplyThreadTs =
         typeof eventInfo.threadTs === "string" && eventInfo.threadTs.length > 0
           ? eventInfo.threadTs
@@ -398,6 +333,66 @@ export async function POST(request: Request): Promise<Response> {
       eventType: eventInfo.eventType,
     });
     return Response.json({ ok: true });
+  }
+
+  const ingressFence = await getHostIngressFence();
+  if (ingressFence) {
+    logInfo("channels.slack_host_ingress_fenced", {
+      requestId,
+      phase: ingressFence.phase,
+      operationId: ingressFence.operationId,
+    });
+    return buildHostIngressFencedResponse(ingressFence);
+  }
+
+  let verifiedBundleIdentity: Awaited<
+    ReturnType<typeof hydrateVerifiedBundleIdentity>
+  > = null;
+  try {
+    verifiedBundleIdentity = await hydrateVerifiedBundleIdentity(
+      meta.bundleIdentity,
+    );
+  } catch {
+    // Fail closed below. Bundle admission errors must not create a platform
+    // retry storm for an otherwise valid Slack webhook.
+  }
+  const gatewayAdmissionRejectionAdmitted =
+    verifiedBundleIdentity?.capabilities.includes(
+      OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+    ) === true;
+  if (!gatewayAdmissionRejectionAdmitted) {
+    logWarn("slack.delivery.bundle_capability_missing", {
+      capabilityId: OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
+      bundleIdentityMissing: meta.bundleIdentity === null,
+      bundleIdentityVerified: verifiedBundleIdentity !== null,
+      requestId,
+    });
+  }
+
+  let dedupLock: SlackWebhookDedupLock | null = null;
+  if (dedupId) {
+    const dedupKey = channelDedupKey("slack", dedupId);
+    const dedupResult = await tryAcquireChannelDedupLock({
+      channel: "slack",
+      key: dedupKey,
+      ttlSeconds: CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS,
+      requestId: requestId ?? null,
+      dedupId,
+      lockKind: "event-id",
+    });
+    if (dedupResult.kind === "duplicate") {
+      logInfo("channels.slack_webhook_dedup_skip", {
+        requestId,
+        dedupId,
+        ...eventInfo,
+      });
+      return Response.json({ ok: true });
+    }
+    if (dedupResult.kind === "acquired") {
+      dedupLock = dedupResult.lock;
+    }
+    // degraded: dedupLock stays null and we proceed without a lock.
+    // The helper already logged channels.dedup_lock_acquire_failed_degraded.
   }
 
   // Skip message edit/deletion subtypes. Slack fires `message_changed`

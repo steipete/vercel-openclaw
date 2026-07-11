@@ -23,7 +23,11 @@ export type HostStopMonitorDeps = {
   readSuspension: () => Promise<HostSuspensionState | null>;
   getMeta: () => Promise<SingleMeta>;
   reconcile: () => Promise<SingleMeta>;
-  resumeReset: () => Promise<SingleMeta>;
+  resumeReset: (expected: {
+    operationId: string;
+    sandboxId: string;
+    lifecycleAttemptId: string | null;
+  }) => Promise<SingleMeta>;
   heartbeat: (operationId: string) => Promise<void>;
 };
 
@@ -31,9 +35,12 @@ const defaultDeps: HostStopMonitorDeps = {
   readSuspension: readHostSuspensionState,
   getMeta: getInitializedMeta,
   reconcile: reconcileSnapshottingStatus,
-  resumeReset: () => resetSandbox({
+  resumeReset: (expected) => resetSandbox({
     origin: "http://127.0.0.1",
     reason: "sandbox.reset.monitor",
+    expectedOperationId: expected.operationId,
+    expectedSandboxId: expected.sandboxId,
+    expectedLifecycleAttemptId: expected.lifecycleAttemptId,
   }),
   heartbeat: heartbeatHostStopMonitor,
 };
@@ -62,7 +69,11 @@ export async function processHostStopMonitorStep(
   let meta = await deps.getMeta();
   if (state.intent === "reset" && state.phase === "stopping") {
     try {
-      meta = await deps.resumeReset();
+      meta = await deps.resumeReset({
+        operationId: state.operationId,
+        sandboxId: state.sandboxId,
+        lifecycleAttemptId: state.lifecycleAttemptId,
+      });
     } catch (error) {
       // Reset itself records terminal delete failures and reopens admission.
       // Lock contention or transient cleanup errors keep this durable monitor
@@ -79,6 +90,7 @@ export async function processHostStopMonitorStep(
     || state.phase === "preparing"
     || state.phase === "prepared"
     || state.phase === "stop-requesting"
+    || state.phase === "rollback-pending"
   ) {
     meta = await deps.reconcile();
   }

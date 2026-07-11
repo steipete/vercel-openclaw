@@ -256,6 +256,24 @@ export type RestorePreparedReason =
   | "prepare-failed"
   | "prepared";
 
+export type PendingPersistentAutoSave = {
+  sandboxId: string;
+  lifecycleAttemptId: string | null;
+  operationId: string | null;
+  dynamicConfigHash: string;
+  assetSha256: string;
+  createdAt: number;
+};
+
+export type ActivePersistentStop = {
+  stopAttemptId: string;
+  sandboxId: string;
+  lifecycleAttemptId: string | null;
+  operationId: string | null;
+  reason: string;
+  startedAt: number;
+};
+
 // ---------------------------------------------------------------------------
 // Restore oracle types
 // ---------------------------------------------------------------------------
@@ -439,6 +457,10 @@ export type SingleMeta = {
   persistedStateSavedAt: number | null;
   /** Source of the current persisted-state restore target. */
   persistedStateSource: "persistent-auto-save" | "manual-snapshot" | null;
+  /** Exact in-flight stop generation allowed to promote pending hashes. */
+  pendingPersistentAutoSave: PendingPersistentAutoSave | null;
+  /** Exact durable stop attempt allowed to reconcile snapshotting metadata. */
+  activePersistentStop: ActivePersistentStop | null;
   /** SDK-reported current snapshot ID when available; informational only. */
   currentSnapshotId?: string | null;
 
@@ -451,6 +473,15 @@ export type SingleMeta = {
   openclawVersion: string | null;
   /** Exact bundle identity admitted and digest-verified during sandbox setup. */
   bundleIdentity: VerifiedBundleIdentity | null;
+  /** Unverified persistent sandbox created by one lifecycle attempt. */
+  bundleCandidate: {
+    lookupId: string;
+    sandboxId: string | null;
+    ownershipToken: string;
+    replacesOwnershipToken: string | null;
+    lifecycleAttemptId: string;
+    createdAt: number;
+  } | null;
   status: SingleStatus;
   gatewayToken: string;
   createdAt: number;
@@ -517,12 +548,15 @@ export function createDefaultMeta(
     persistedStateAssetSha256: null,
     persistedStateSavedAt: null,
     persistedStateSource: null,
+    pendingPersistentAutoSave: null,
+    activePersistentStop: null,
     currentSnapshotId: null,
     restorePreparedStatus: "unknown",
     restorePreparedReason: null,
     restorePreparedAt: null,
     openclawVersion: null,
     bundleIdentity: null,
+    bundleCandidate: null,
     status: "uninitialized",
     gatewayToken,
     createdAt: now,
@@ -675,6 +709,50 @@ export function ensureMetaShape(
     persistedStateAssetSha256,
     persistedStateSavedAt,
     persistedStateSource,
+    pendingPersistentAutoSave: (() => {
+      const pending = (raw as Record<string, unknown>).pendingPersistentAutoSave;
+      if (!pending || typeof pending !== "object" || Array.isArray(pending)) return null;
+      const value = pending as Record<string, unknown>;
+      return typeof value.sandboxId === "string"
+        && (typeof value.lifecycleAttemptId === "string" || value.lifecycleAttemptId === null)
+        && (typeof value.operationId === "string" || value.operationId === null)
+        && typeof value.dynamicConfigHash === "string"
+        && typeof value.assetSha256 === "string"
+        && typeof value.createdAt === "number"
+        && Number.isSafeInteger(value.createdAt)
+        && value.createdAt > 0
+        ? {
+            sandboxId: value.sandboxId,
+            lifecycleAttemptId: value.lifecycleAttemptId as string | null,
+            operationId: value.operationId as string | null,
+            dynamicConfigHash: value.dynamicConfigHash,
+            assetSha256: value.assetSha256,
+            createdAt: value.createdAt,
+          }
+        : null;
+    })(),
+    activePersistentStop: (() => {
+      const active = (raw as Record<string, unknown>).activePersistentStop;
+      if (!active || typeof active !== "object" || Array.isArray(active)) return null;
+      const value = active as Record<string, unknown>;
+      return typeof value.stopAttemptId === "string"
+        && typeof value.sandboxId === "string"
+        && (typeof value.lifecycleAttemptId === "string" || value.lifecycleAttemptId === null)
+        && (typeof value.operationId === "string" || value.operationId === null)
+        && typeof value.reason === "string"
+        && typeof value.startedAt === "number"
+        && Number.isSafeInteger(value.startedAt)
+        && value.startedAt > 0
+        ? {
+            stopAttemptId: value.stopAttemptId,
+            sandboxId: value.sandboxId,
+            lifecycleAttemptId: value.lifecycleAttemptId as string | null,
+            operationId: value.operationId as string | null,
+            reason: value.reason,
+            startedAt: value.startedAt,
+          }
+        : null;
+    })(),
     currentSnapshotId:
       typeof (raw as Record<string, unknown>).currentSnapshotId === "string"
         ? (raw as Record<string, unknown>).currentSnapshotId as string
@@ -697,6 +775,35 @@ export function ensureMetaShape(
           (raw as Record<string, unknown>).bundleIdentity as VerifiedBundleIdentity,
         )
       : null,
+    bundleCandidate: (() => {
+      const candidate = (raw as Record<string, unknown>).bundleCandidate;
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        return null;
+      }
+      const value = candidate as Record<string, unknown>;
+      const owner = value.ownershipToken;
+      const replacedOwner = value.replacesOwnershipToken;
+      return typeof value.lookupId === "string"
+        && (typeof value.sandboxId === "string" || value.sandboxId === null)
+        && typeof owner === "string"
+        && (
+          typeof replacedOwner === "string"
+          || replacedOwner === null
+        )
+        && typeof value.lifecycleAttemptId === "string"
+        && typeof value.createdAt === "number"
+        && Number.isSafeInteger(value.createdAt)
+        && value.createdAt > 0
+        ? {
+            lookupId: value.lookupId,
+            sandboxId: value.sandboxId as string | null,
+            ownershipToken: owner,
+            replacesOwnershipToken: replacedOwner,
+            lifecycleAttemptId: value.lifecycleAttemptId,
+            createdAt: value.createdAt,
+          }
+        : null;
+    })(),
     status: isSingleStatus(raw.status) ? raw.status : "uninitialized",
     gatewayToken: typeof raw.gatewayToken === "string" ? raw.gatewayToken : "",
     createdAt,

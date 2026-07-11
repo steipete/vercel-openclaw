@@ -8,7 +8,7 @@ import { fetchAdminJsonCore, type ReadJsonDeps } from "@/components/admin-reques
 
 /** How this snapshot was created (stored on each history row). */
 const REASON_LABELS: Record<string, string> = {
-  /** "Take snapshot" on this page */
+  /** Legacy explicit snapshot record */
   manual: "Manual",
   auto: "Auto",
   bootstrap: "Bootstrap",
@@ -50,11 +50,9 @@ export function SnapshotsPanel({
   const [loading, setLoading] = useState(true);
   const [readError, setReadError] = useState<string | null>(null);
   const { confirm, dialogProps } = useConfirm();
-  const { confirm: confirmSnapshot, dialogProps: snapshotDialogProps } = useConfirm();
   const { confirm: confirmReset, dialogProps: resetDialogProps } = useConfirm();
 
   const lifecycleStatus = status.status as SingleStatus;
-  const isRunning = lifecycleStatus === "running";
   const isLifecycleTransition = new Set<SingleStatus>([
     "creating",
     "restoring",
@@ -89,32 +87,6 @@ export function SnapshotsPanel({
     if (!active) return;
     void fetchSnapshots();
   }, [active, fetchSnapshots]);
-
-  const handleSnapshot = async () => {
-    const ok = await confirmSnapshot({
-      title: "Take snapshot?",
-      description:
-        "This will stop the running sandbox to create a snapshot. It will automatically restart afterward.",
-      confirmLabel: "Take Snapshot",
-      variant: "danger",
-    });
-    if (!ok) return;
-
-    const success = await runAction("/api/admin/snapshots", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ reason: "manual" }),
-      label: "Create snapshot",
-    });
-    await fetchSnapshots();
-
-    if (success) {
-      await runAction("/api/admin/ensure", {
-        method: "POST",
-        label: "Restarting sandbox",
-      });
-    }
-  };
 
   const handleRestore = async (snapshotId: string) => {
     const ok = await confirm({
@@ -181,14 +153,6 @@ export function SnapshotsPanel({
             Current is the active restore point. The tag shows how it was created.
           </p>
         </div>
-        <button
-          type="button"
-          className="button primary"
-          disabled={busy || !isRunning}
-          onClick={() => void handleSnapshot()}
-        >
-          Take snapshot
-        </button>
       </div>
 
       <dl className="metrics-grid snapshots-summary">
@@ -293,7 +257,6 @@ export function SnapshotsPanel({
         </section>
       ) : null}
       <ConfirmDialog {...dialogProps} />
-      <ConfirmDialog {...snapshotDialogProps} />
       <ConfirmDialog {...resetDialogProps} />
     </article>
   );

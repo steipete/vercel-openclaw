@@ -45,6 +45,7 @@ import {
   reconcileSnapshottingStatus,
 } from "@/server/sandbox/lifecycle";
 import { generateDiscordKeyPair } from "@/test-utils/webhook-builders";
+import { _resetBundleIdentityForTesting } from "@/server/openclaw/bundle-identity";
 
 // Re-export types so existing consumers can keep importing from harness
 export type { SandboxEvent, SandboxEventKind } from "@/test-utils/fake-sandbox-controller";
@@ -123,6 +124,15 @@ const ENV_OVERRIDES: Record<string, string | undefined> = {
   // `_setAiGatewayCredentialOverrideForTesting`.
   AI_GATEWAY_API_KEY: undefined,
   VERCEL_OIDC_TOKEN: undefined,
+};
+
+const BUNDLE_ENV_OVERRIDES: Record<string, undefined> = {
+  OPENCLAW_PACKAGE_SPEC: undefined,
+  OPENCLAW_BUNDLE_URL: undefined,
+  OPENCLAW_BUNDLE_UI_URL: undefined,
+  OPENCLAW_BUNDLE_MANIFEST_URL: undefined,
+  OPENCLAW_BUNDLE_SOURCE_SHA: undefined,
+  OPENCLAW_BUNDLE_SHA256: undefined,
 };
 
 // ---------------------------------------------------------------------------
@@ -253,6 +263,8 @@ export function createScenarioHarness(options?: {
    * - `'none'` — does not touch auth env vars at all
    */
   authMode?: AuthMode | "none";
+  /** Keep an explicitly configured verified-bundle fixture for this scenario. */
+  preserveBundleEnv?: boolean;
 }): ScenarioHarness {
   // Build auth-specific env overrides
   const authOverrides: Record<string, string | undefined> =
@@ -262,7 +274,14 @@ export function createScenarioHarness(options?: {
         ? {}
         : ADMIN_SECRET_ENV;
 
-  const mergedOverrides = { ...ENV_OVERRIDES, ...authOverrides };
+  const bundleOverrides = options?.preserveBundleEnv
+    ? {}
+    : BUNDLE_ENV_OVERRIDES;
+  const mergedOverrides = {
+    ...ENV_OVERRIDES,
+    ...bundleOverrides,
+    ...authOverrides,
+  };
 
   // Save original env values
   const originals: Record<string, string | undefined> = {};
@@ -278,6 +297,7 @@ export function createScenarioHarness(options?: {
   // Reset module singletons so tests get a fresh memory store
   _resetStoreForTesting();
   _resetReconcileStaleRunningDebounceForTesting();
+  _resetBundleIdentityForTesting();
 
   // Install fake sandbox controller
   const controller = new FakeSandboxController({
@@ -334,6 +354,7 @@ export function createScenarioHarness(options?: {
       // Reset store singleton
       _resetStoreForTesting();
       _resetReconcileStaleRunningDebounceForTesting();
+      _resetBundleIdentityForTesting();
 
       // Clear after callbacks
       resetAfterCallbacks();

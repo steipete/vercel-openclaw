@@ -1,20 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { APIError as VercelSandboxApiError } from "@vercel/sandbox";
+
 import { pollUntil } from "@/server/async/poll";
 import { ApiError } from "@/shared/http";
 import type {
-  CronRestoreOutcome,
   OperationContext,
   RestorePhaseMetrics,
   RestorePreparedReason,
   SingleMeta,
   StoredCronRecord,
 } from "@/shared/types";
-import { MAX_RESTORE_HISTORY } from "@/shared/types";
 import {
   withOperationContext,
 } from "@/server/observability/operation-context";
-import { logStateSnapshot } from "@/server/observability/state-snapshot";
 import {
   getAiGatewayBearerTokenOptional,
   resolveAiGatewayCredentialOptional,
@@ -28,6 +27,7 @@ import {
   OPENCLAW_BUNDLE_IDENTITY_PATH,
 } from "@/server/openclaw/bootstrap";
 import {
+  admitConfiguredOpenClawBundle,
   hydrateVerifiedBundleIdentity,
   verifiedBundleIdentitiesEqual,
 } from "@/server/openclaw/bundle-identity";
@@ -37,7 +37,6 @@ import {
   computeGatewayConfigHash,
   GATEWAY_CONFIG_HASH_VERSION,
   OPENCLAW_BIN,
-  OPENCLAW_CONFIG_PATH,
   OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
   OPENCLAW_GATEWAY_RESTART_SCRIPT_PATH,
   OPENCLAW_GATEWAY_TOKEN_PATH,
@@ -53,7 +52,6 @@ import {
   buildRestoreAssetManifest,
   buildRestoreRuntimeEnv,
   buildStaticRestoreFiles,
-  buildWorkerSandboxRestoreFiles,
   type RestoreAssetManifest,
 } from "@/server/openclaw/restore-assets";
 import { buildRestoreDecision } from "@/server/sandbox/restore-attestation";
@@ -72,8 +70,31 @@ import {
   isSnapshotNotFoundError,
 } from "@/server/sandbox/snapshot-delete";
 import {
+  GatewayAdminRpcError,
+  isGatewaySuspensionCapabilityUnavailable,
+} from "@/server/openclaw/admin-rpc";
+import {
+  clearInactiveHostSuspension,
+  clearHostSuspensionAfterDelete,
+  ensureHostStopMonitor,
+  HostSuspensionBusyError,
+  HostSuspensionStateCorruptError,
+  HOST_STOP_REQUEST_MAX_MS,
+  markHostSuspensionStopped,
+  markHostSuspensionStopRequesting,
+  markHostSuspensionStopping,
+  prepareHostSuspension,
+  readHostSuspensionState,
+  renewHostSuspension,
+  rollbackHostSuspension,
+  thawHostSuspensionIfNeeded,
+  type HostSuspensionState,
+} from "@/server/sandbox/host-suspension";
+import {
   estimateSandboxTimeoutRemainingMs,
+  getSandboxPlatformTimeoutMs,
   getSandboxSleepAfterMs,
+  getSandboxTimeoutExtensionMs,
   getSandboxTouchThrottleMs,
 } from "@/server/sandbox/timeout";
 import {
@@ -93,15 +114,20 @@ import {
   isHotSpareEnabled,
   preCreateHotSpare,
   preCreateHotSpareFromSnapshot,
-  evaluateHotSparePromotion,
   promoteHotSpare,
   applyPreCreateToMeta,
   applyPromoteToMeta,
   clearHotSpareState,
 } from "@/server/sandbox/hot-spare";
+import {
+  armSandboxDeadline,
+  clearSandboxDeadline,
+  readSandboxDeadlineRemainingMs,
+} from "@/server/sandbox/deadline-coordinator";
 
 const OPENCLAW_PORT = 3000;
 const SANDBOX_PORTS = [OPENCLAW_PORT, OPENCLAW_TELEGRAM_WEBHOOK_PORT];
+const BUNDLE_CANDIDATE_OWNERSHIP_TAG = "openclaw-bundle-candidate";
 export function CRON_NEXT_WAKE_KEY(): string {
   return cronNextWakeKey();
 }
@@ -112,6 +138,30 @@ export function CRON_JOBS_KEY(): string {
 const CRON_JOBS_PATH = `${OPENCLAW_STATE_DIR}/cron/jobs.json`;
 const CRON_JOBS_STATE_PATH = `${OPENCLAW_STATE_DIR}/cron/jobs-state.json`;
 const CRON_JOBS_MAX_BYTES = 256 * 1024; // 256 KB size cap for store value
+
+function sandboxApiStatus(error: unknown): number | null {
+  if (error instanceof VercelSandboxApiError) {
+    return error.response.status;
+  }
+  if (isRecord(error) && isRecord(error.response)) {
+    const status = error.response.status;
+    if (typeof status === "number") return status;
+  }
+  if (isRecord(error) && typeof error.status === "number") {
+    return error.status;
+  }
+  return null;
+}
+
+function isSandboxGoneError(error: unknown): boolean {
+  if (error instanceof GatewayAdminRpcError) return false;
+  const status = sandboxApiStatus(error);
+  if (status === 404 || status === 410) return true;
+  if (!(error instanceof Error)) return false;
+  // Test doubles and older controller adapters may only preserve the status
+  // prefix. Do not classify arbitrary command output containing these digits.
+  return /^(?:HTTP\s+)?(?:404|410)(?:\b|:)/i.test(error.message.trim());
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -166,6 +216,18 @@ function mergeCronRuntimeState(rawJobsJson: string, rawStateJson: string | null)
   }
 
   return changed ? JSON.stringify(jobsPayload) : rawJobsJson;
+}
+
+function computeMetaGatewayConfigHash(meta: SingleMeta): string {
+  const slack = meta.channels.slack;
+  return computeGatewayConfigHash({
+    telegramBotToken: meta.channels.telegram?.botToken,
+    telegramWebhookSecret: meta.channels.telegram?.webhookSecret,
+    slackCredentials: slack
+      ? { botToken: slack.botToken, signingSecret: slack.signingSecret }
+      : undefined,
+    bundleCapabilities: meta.bundleIdentity?.capabilities,
+  });
 }
 
 /** Build a structured cron record from raw jobs JSON. Returns null if invalid. */
@@ -224,7 +286,13 @@ const START_LOCK_TTL_SECONDS = 90;
 const TOKEN_REFRESH_LOCK_TTL_SECONDS = 60;
 const LOCK_RENEW_INTERVAL_MS = 25_000;
 const STALE_OPERATION_MS = 5 * 60 * 1000;
+const HOST_STOP_RUNNING_GRACE_MS = 15_000;
+const HOST_SUSPENSION_RENEW_WINDOW_MS = 30_000;
 const READY_WAIT_TIMEOUT_MS = 5 * 60 * 1000;
+const PREPARE_RESTORE_SYNC_BUDGET_MS = 270_000;
+// Durable reconciliation owns slow platform stops. Function callers wait only
+// long enough for the common case, preserving budget for setup and stamping.
+const PERSISTENT_STOP_CONFIRM_TIMEOUT_MS = 30_000;
 const READY_WAIT_POLL_MS = 1_000;
 
 function buildConfigSyncRestoreMetricsPatch(): RestorePhaseMetrics {
@@ -499,6 +567,10 @@ type AutoRenewedLockOptions = {
   label: string;
 };
 
+type AutoRenewedLockLease = {
+  assertOwned(): Promise<void>;
+};
+
 class LifecycleLockUnavailableError extends Error {
   constructor() {
     super("Sandbox lifecycle lock unavailable.");
@@ -506,10 +578,425 @@ class LifecycleLockUnavailableError extends Error {
   }
 }
 
+class LifecycleLockOwnershipLostError extends Error {
+  constructor() {
+    super("Sandbox lifecycle lock ownership was lost.");
+    this.name = "LifecycleLockOwnershipLostError";
+  }
+}
+
+class LifecycleAttemptFailedError extends Error {
+  constructor(
+    readonly attemptId: string,
+    readonly failure: unknown,
+  ) {
+    super(failure instanceof Error ? failure.message : String(failure));
+    this.name = "LifecycleAttemptFailedError";
+  }
+}
+
+export class SandboxBundleMigrationRequiredError extends ApiError {
+  constructor() {
+    super(
+      409,
+      "OPENCLAW_BUNDLE_MIGRATION_REQUIRED",
+      "Refusing to replace an existing persistent sandbox without an atomic data migration. Keep the current runtime or explicitly reset after migrating its data.",
+    );
+    this.name = "SandboxBundleMigrationRequiredError";
+  }
+}
+
+export class SandboxBundleQuiesceFailedError extends ApiError {
+  constructor(detail: string) {
+    super(
+      502,
+      "OPENCLAW_BUNDLE_QUIESCE_FAILED",
+      `The existing persistent sandbox could not be quiesced before bundle migration: ${detail}`,
+    );
+    this.name = "SandboxBundleQuiesceFailedError";
+  }
+}
+
+const BUNDLE_MIGRATION_SUSPENSION_REASON = "sandbox.bundle_migration_required";
+const BUNDLE_MIGRATION_REQUIRED_LAST_ERROR =
+  "OPENCLAW_BUNDLE_MIGRATION_REQUIRED: "
+  + "The persistent sandbox requires an explicit bundle data migration.";
+
+type PersistentAutoSaveInput = {
+  sandboxId: string;
+  lifecycleAttemptId: string | null;
+  dynamicConfigHash: string;
+  assetSha256: string;
+};
+
+type CooperativePersistentStopOptions = {
+  meta: SingleMeta;
+  sandbox: SandboxHandle;
+  reason: string;
+  lease?: AutoRenewedLockLease;
+  deadlineAtMs?: number;
+  pendingAutoSave?: PersistentAutoSaveInput;
+  afterPrepare?: () => Promise<void>;
+};
+
+const MIN_PLATFORM_STOP_REQUEST_BUDGET_MS = 5_000;
+
+function assertPlatformStopBudget(deadlineAtMs: number | undefined): void {
+  if (
+    deadlineAtMs !== undefined
+    && deadlineAtMs - Date.now() < MIN_PLATFORM_STOP_REQUEST_BUDGET_MS
+  ) {
+    throw new ApiError(
+      503,
+      "SANDBOX_STOP_BUDGET_EXHAUSTED",
+      "Not enough function budget remains to begin a durable sandbox stop.",
+    );
+  }
+}
+
+async function requestPlatformStopWithinDeadline(input: {
+  sandbox: SandboxHandle;
+  deadlineAtMs?: number;
+}): Promise<void> {
+  const request = input.sandbox.stop({ blocking: false });
+  if (input.deadlineAtMs === undefined) {
+    await request;
+    return;
+  }
+
+  const remainingMs = Math.max(1, input.deadlineAtMs - Date.now());
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      request,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ApiError(
+          504,
+          "SANDBOX_STOP_REQUEST_TIMEOUT",
+          "The platform stop request exceeded the remaining function budget.",
+        )), remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function prepareDedicatedHostSuspension(input: {
+  sandbox: SandboxHandle;
+  lifecycleAttemptId: string | null;
+  reason: string;
+  intent?: "stop" | "reset";
+}): Promise<HostSuspensionState | null> {
+  const existing = await readHostSuspensionState();
+  if (
+    existing?.ingressFenced
+    && existing.sandboxId === input.sandbox.sandboxId
+  ) {
+    if (existing.lifecycleAttemptId !== input.lifecycleAttemptId) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_CONFLICT",
+        "A fenced lifecycle operation belongs to a different sandbox generation.",
+      );
+    }
+    const completedStop = existing.phase === "stopped"
+      || existing.phase === "thawing"
+      || existing.phase === "rollback-pending";
+    if (completedStop) {
+      if (!await thawHostSuspensionIfNeeded({
+        sandbox: input.sandbox,
+        lifecycleAttemptId: input.lifecycleAttemptId,
+      })) {
+        throw new ApiError(
+          503,
+          "HOST_SUSPENSION_THAW_FAILED",
+          "The prior Gateway suspension could not be resumed before a new stop.",
+        );
+      }
+    } else if (
+      existing.reason !== input.reason
+      || existing.intent !== (input.intent ?? "stop")
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_CONFLICT",
+        "A different fenced lifecycle operation is still in progress.",
+      );
+    }
+  }
+
+  try {
+    return await prepareHostSuspension(input);
+  } catch (error) {
+    if (!isGatewaySuspensionCapabilityUnavailable(error)) throw error;
+    await clearInactiveHostSuspension({ sandboxId: input.sandbox.sandboxId });
+    return null;
+  }
+}
+
+async function requestCooperativePersistentStop(
+  options: CooperativePersistentStopOptions,
+): Promise<SingleMeta> {
+  const { sandbox } = options;
+  const beforeStop = options.meta;
+  const stopAttemptId = randomUUID();
+  let suspension: HostSuspensionState | null = null;
+  let parkedForStop = false;
+  let platformStopRequestStarted = false;
+  try {
+    assertPlatformStopBudget(options.deadlineAtMs);
+    await options.lease?.assertOwned();
+    suspension = await prepareDedicatedHostSuspension({
+      sandbox,
+      lifecycleAttemptId: beforeStop.lifecycleAttemptId ?? null,
+      reason: options.reason,
+    });
+    await options.afterPrepare?.();
+    await options.lease?.assertOwned();
+    assertPlatformStopBudget(options.deadlineAtMs);
+    if (suspension) {
+      suspension = await renewHostSuspension({ state: suspension, sandbox });
+      suspension = await markHostSuspensionStopRequesting(suspension);
+    }
+
+    const snapshottingMeta = await mutateMeta((meta) => {
+      if (
+        (meta.lifecycleAttemptId ?? null) !== (beforeStop.lifecycleAttemptId ?? null)
+        || meta.sandboxId !== beforeStop.sandboxId
+      ) return;
+      if (options.pendingAutoSave && meta.restorePreparedStatus !== "preparing") return;
+      // Persist only the exact config generation that was synchronized. A
+      // concurrent channel mutation must retry preparation, never attest old
+      // sandbox bytes under a newer metadata hash.
+      if (
+        options.pendingAutoSave
+        && computeMetaGatewayConfigHash(meta)
+          !== options.pendingAutoSave.dynamicConfigHash
+      ) return;
+      meta.sandboxId = sandbox.sandboxId;
+      meta.status = "snapshotting";
+      meta.portUrls = null;
+      meta.lastAccessedAt = Date.now();
+      meta.lastError = null;
+      if (meta.lastRestoreMetrics) {
+        meta.lastRestoreMetrics = {
+          ...meta.lastRestoreMetrics,
+          telegramListenerReady: false,
+        };
+      }
+      meta.pendingPersistentAutoSave = options.pendingAutoSave
+        ? {
+            sandboxId: sandbox.sandboxId,
+            lifecycleAttemptId: options.pendingAutoSave.lifecycleAttemptId,
+            operationId: suspension?.operationId ?? null,
+            dynamicConfigHash: options.pendingAutoSave.dynamicConfigHash,
+            assetSha256: options.pendingAutoSave.assetSha256,
+            createdAt: Date.now(),
+          }
+        : null;
+      meta.activePersistentStop = {
+        stopAttemptId,
+        sandboxId: sandbox.sandboxId,
+        lifecycleAttemptId: beforeStop.lifecycleAttemptId ?? null,
+        operationId: suspension?.operationId ?? null,
+        reason: options.reason,
+        startedAt: Date.now(),
+      };
+    });
+    const parkedPending = snapshottingMeta.pendingPersistentAutoSave;
+    const pendingMatches = options.pendingAutoSave
+      ? parkedPending?.sandboxId === sandbox.sandboxId
+        && parkedPending.lifecycleAttemptId
+          === options.pendingAutoSave.lifecycleAttemptId
+        && parkedPending.operationId === (suspension?.operationId ?? null)
+        && parkedPending.dynamicConfigHash
+          === options.pendingAutoSave.dynamicConfigHash
+        && parkedPending.assetSha256 === options.pendingAutoSave.assetSha256
+      : parkedPending === null;
+    if (
+      (snapshottingMeta.lifecycleAttemptId ?? null)
+        !== (beforeStop.lifecycleAttemptId ?? null)
+      || snapshottingMeta.sandboxId !== sandbox.sandboxId
+      || snapshottingMeta.status !== "snapshotting"
+      || snapshottingMeta.activePersistentStop?.stopAttemptId !== stopAttemptId
+      || !pendingMatches
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+    parkedForStop = true;
+
+    if (suspension) {
+      suspension = await ensureHostStopMonitor(suspension);
+    }
+
+    // The durable state and monitor precede the platform request. If this
+    // invocation disappears, the monitor can adopt and reconcile the stop.
+    await options.lease?.assertOwned();
+    platformStopRequestStarted = true;
+    await requestPlatformStopWithinDeadline({
+      sandbox,
+      deadlineAtMs: options.deadlineAtMs,
+    });
+    if (suspension) {
+      suspension = await markHostSuspensionStopping(suspension);
+    }
+    await clearSandboxDeadline(sandbox.sandboxId, {
+      lifecycleAttemptId: beforeStop.lifecycleAttemptId ?? null,
+    });
+    return snapshottingMeta;
+  } catch (error) {
+    if (platformStopRequestStarted) {
+      logWarn("sandbox.stop.request_outcome_ambiguous", {
+        sandboxId: sandbox.sandboxId,
+        reason: options.reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (suspension) await ensureHostStopMonitor(suspension);
+      return getInitializedMeta();
+    }
+
+    if (parkedForStop) {
+      await mutateMeta((meta) => {
+        if (
+          (meta.lifecycleAttemptId ?? null) !== (beforeStop.lifecycleAttemptId ?? null)
+          || meta.sandboxId !== sandbox.sandboxId
+          || meta.status !== "snapshotting"
+        ) return;
+        meta.sandboxId = beforeStop.sandboxId;
+        meta.status = beforeStop.status;
+        meta.portUrls = beforeStop.portUrls;
+        meta.lastAccessedAt = beforeStop.lastAccessedAt;
+        meta.pendingPersistentAutoSave = beforeStop.pendingPersistentAutoSave;
+        meta.activePersistentStop = beforeStop.activePersistentStop;
+      });
+    }
+    if (suspension) {
+      await rollbackHostSuspension({ state: suspension, sandbox, error });
+    }
+    throw error;
+  }
+}
+
+async function quiesceSandboxForBundleMigration(input: {
+  sandbox: SandboxHandle;
+  lifecycleAttemptId: string | null;
+  lease?: AutoRenewedLockLease;
+}): Promise<boolean> {
+  try {
+    const meta = await getInitializedMeta();
+    if (meta.lifecycleAttemptId !== input.lifecycleAttemptId) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+    await requestCooperativePersistentStop({
+      meta,
+      sandbox: input.sandbox,
+      reason: BUNDLE_MIGRATION_SUSPENSION_REASON,
+      lease: input.lease,
+    });
+    const stopped = await waitForConfirmedPersistentStop();
+    return stopped.status === "stopped"
+      || terminalBundleReadyFailure(stopped.lastError)?.code
+        === "OPENCLAW_BUNDLE_MIGRATION_REQUIRED";
+  } catch (error) {
+    if (error instanceof LifecycleLockOwnershipLostError) throw error;
+    if (error instanceof HostSuspensionBusyError) throw error;
+    if (
+      error instanceof ApiError
+      && error.code === "SANDBOX_STOP_TIMEOUT"
+      && (await getInitializedMeta()).status === "snapshotting"
+    ) {
+      return false;
+    }
+    throw new SandboxBundleQuiesceFailedError(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
 export class SandboxLifecycleLockContendedError extends ApiError {
   constructor() {
     super(409, "LIFECYCLE_LOCK_CONTENDED", "Sandbox lifecycle work is already in progress.");
     this.name = "SandboxLifecycleLockContendedError";
+  }
+}
+
+function configuredBundleMatchesStoredIdentity(
+  identity: SingleMeta["bundleIdentity"],
+): boolean {
+  const bundleMode = Boolean(process.env.OPENCLAW_BUNDLE_URL?.trim());
+  if (!bundleMode) return identity === null;
+  if (!isVerifiedBundleIdentity(identity)) return false;
+  const sourceSha = process.env.OPENCLAW_BUNDLE_SOURCE_SHA?.trim();
+  const canonicalSha256 = process.env.OPENCLAW_BUNDLE_SHA256?.trim();
+  const packageSpec = process.env.OPENCLAW_PACKAGE_SPEC?.trim();
+  return sourceSha === identity.forkSha
+    && canonicalSha256 === identity.canonicalSha256
+    && (!packageSpec || packageSpec === identity.packageSpec);
+}
+
+async function fenceRunningBundleMismatch(
+  expected: SingleMeta,
+): Promise<SingleMeta> {
+  if (process.env.OPENCLAW_BUNDLE_URL?.trim()) {
+    try {
+      const admission = await admitConfiguredOpenClawBundle();
+      if (!admission) {
+        throw new Error("No configured bundle admission was produced.");
+      }
+      if (
+        isVerifiedBundleIdentity(expected.bundleIdentity)
+        && verifiedBundleIdentitiesEqual(
+          expected.bundleIdentity,
+          admission.identity,
+        )
+      ) return getInitializedMeta();
+    } catch (error) {
+      throw new ApiError(
+        503,
+        "OPENCLAW_BUNDLE_ADMISSION_FAILED",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+  try {
+    return await withLifecycleLock(async (lease) => {
+      const current = await getInitializedMeta();
+      if (
+        current.status !== "running"
+        || !current.sandboxId
+        || current.sandboxId !== expected.sandboxId
+        || (current.lifecycleAttemptId ?? null)
+          !== (expected.lifecycleAttemptId ?? null)
+      ) return current;
+      const sandbox = await getSandboxController().get({
+        sandboxId: current.sandboxId,
+        resume: false,
+      });
+      if (sandbox.status !== "running") {
+        return mutateMeta((meta) => {
+          if (
+            meta.status !== "running"
+            || meta.sandboxId !== current.sandboxId
+            || (meta.lifecycleAttemptId ?? null)
+              !== (current.lifecycleAttemptId ?? null)
+          ) return;
+          meta.status = "error";
+          meta.portUrls = null;
+          meta.lastError = BUNDLE_MIGRATION_REQUIRED_LAST_ERROR;
+          meta.lastGatewayProbeReady = false;
+        });
+      }
+      await quiesceSandboxForBundleMigration({
+        sandbox,
+        lifecycleAttemptId: current.lifecycleAttemptId ?? null,
+        lease,
+      });
+      return getInitializedMeta();
+    });
+  } catch (error) {
+    if (error instanceof LifecycleLockUnavailableError) return getInitializedMeta();
+    throw error;
   }
 }
 
@@ -551,6 +1038,11 @@ export async function ensureSandboxRunning(options: {
   if (meta.status === "snapshotting") {
     meta = await reconcileSnapshottingStatus();
   }
+  // Bundle migration failures are operator-actionable terminal states. Keep
+  // them stable instead of letting a waiter erase the code and start again.
+  if (meta.status === "error" && terminalBundleReadyFailure(meta.lastError)) {
+    return { state: "waiting", meta };
+  }
   const opCtx = options.op ? withOperationContext(options.op, {
     sandboxId: meta.sandboxId,
     snapshotId: meta.snapshotId,
@@ -559,6 +1051,30 @@ export async function ensureSandboxRunning(options: {
   logInfo("sandbox.ensure_running", opCtx);
 
   if (meta.status === "running" && meta.sandboxId) {
+    if (!configuredBundleMatchesStoredIdentity(meta.bundleIdentity)) {
+      meta = await fenceRunningBundleMismatch(meta);
+      return { state: "waiting", meta };
+    }
+    const hostSuspension = await readHostSuspensionState();
+    if (hostSuspension?.ingressFenced) {
+      if (
+        hostSuspension.phase !== "stopped"
+        && hostSuspension.phase !== "thawing"
+        && hostSuspension.phase !== "rollback-pending"
+      ) {
+        return { state: "waiting", meta };
+      }
+      const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
+      const thawed = await thawHostSuspensionIfNeeded({
+        sandbox,
+        lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+      });
+      if (!thawed) {
+        return { state: "waiting", meta };
+      }
+      meta = await getInitializedMeta();
+    }
+
     // Check if the sandbox has likely timed out — if so, reconcile instead
     // of returning stale "running" state. The platform auto-stops sandboxes
     // after sleepAfterMs, but our metadata is never updated.
@@ -639,11 +1155,61 @@ export type ResetSandboxOptions = {
   origin: string;
   reason: string;
   op?: OperationContext;
+  expectedOperationId?: string;
+  expectedSandboxId?: string;
+  expectedLifecycleAttemptId?: string | null;
 };
 
 export type ResetSandboxDeps = {
   deleteSnapshot?: (snapshotId: string) => Promise<void>;
 };
+
+const BUNDLE_READY_FAILURES = {
+  OPENCLAW_BUNDLE_MIGRATION_REQUIRED: {
+    status: 409,
+    fallbackMessage: "The persistent sandbox requires an explicit bundle data migration.",
+  },
+  OPENCLAW_BUNDLE_QUIESCE_FAILED: {
+    status: 502,
+    fallbackMessage: "The persistent sandbox could not be quiesced for bundle migration.",
+  },
+  OPENCLAW_BUNDLE_CANDIDATE_CLEANUP_FAILED: {
+    status: 502,
+    fallbackMessage: "The unverified bundle sandbox could not be deleted safely.",
+  },
+} as const;
+
+function stableBundleReadyFailure(lastError: string | null): ApiError | null {
+  for (const [code, failure] of Object.entries(BUNDLE_READY_FAILURES)) {
+    if (lastError === code || lastError?.startsWith(`${code}:`)) {
+      const detail = lastError?.slice(code.length + 1).trim();
+      return new ApiError(
+        failure.status,
+        code,
+        detail || failure.fallbackMessage,
+      );
+    }
+  }
+  return null;
+}
+
+function terminalBundleReadyFailure(lastError: string | null): ApiError | null {
+  const failure = stableBundleReadyFailure(lastError);
+  return failure?.code === "OPENCLAW_BUNDLE_CANDIDATE_CLEANUP_FAILED"
+    ? null
+    : failure;
+}
+
+function sandboxReadyFailure(
+  lastError: string | null,
+  context: "reconciling" | "waiting",
+): ApiError {
+  return stableBundleReadyFailure(lastError) ?? new ApiError(
+    502,
+    "SANDBOX_READY_FAILED",
+    `Sandbox entered error state while ${context}: ${lastError ?? "unknown"}.`,
+  );
+}
 
 export async function waitForSandboxReady(
   options: WaitForSandboxReadyOptions,
@@ -652,6 +1218,10 @@ export async function waitForSandboxReady(
   const pollIntervalMs = options.pollIntervalMs ?? READY_WAIT_POLL_MS;
 
   const initialMeta = await getInitializedMeta();
+  if (initialMeta.status === "error") {
+    const terminalFailure = terminalBundleReadyFailure(initialMeta.lastError);
+    if (terminalFailure) throw terminalFailure;
+  }
   const wasRunningInitially =
     initialMeta.status === "running" && Boolean(initialMeta.sandboxId);
 
@@ -674,11 +1244,7 @@ export async function waitForSandboxReady(
     recoveredStaleRunning = health.repaired;
 
     if (health.meta.status === "error") {
-      throw new ApiError(
-        502,
-        "SANDBOX_READY_FAILED",
-        `Sandbox entered error state while reconciling: ${health.meta.lastError ?? "unknown"}.`,
-      );
+      throw sandboxReadyFailure(health.meta.lastError, "reconciling");
     }
 
     if (health.status === "ready") {
@@ -689,49 +1255,54 @@ export async function waitForSandboxReady(
     }
   }
 
-  return pollUntil<WaitForSandboxReadyResult, SingleMeta>({
-    label: "sandbox.ready",
-    timeoutMs,
-    initialDelayMs: pollIntervalMs,
-    state: initialMeta,
-    step: async () => {
-      const result = await ensureSandboxRunning({
-        origin: options.origin,
-        reason: options.reason,
-        op: options.op,
-      });
+  try {
+    return await pollUntil<WaitForSandboxReadyResult, SingleMeta>({
+      label: "sandbox.ready",
+      timeoutMs,
+      initialDelayMs: pollIntervalMs,
+      state: initialMeta,
+      step: async () => {
+        const result = await ensureSandboxRunning({
+          origin: options.origin,
+          reason: options.reason,
+          op: options.op,
+        });
 
-      if (result.meta.status === "error") {
-        throw new ApiError(
-          502,
-          "SANDBOX_READY_FAILED",
-          `Sandbox entered error state while waiting for readiness: ${result.meta.lastError ?? "unknown"}.`,
-        );
-      }
+        if (result.meta.status === "error") {
+          throw sandboxReadyFailure(result.meta.lastError, "waiting");
+        }
 
-      if ((await probeGatewayReady()).ready) {
+        if ((await probeGatewayReady()).ready) {
+          return {
+            done: true,
+            result: {
+              meta: await getInitializedMeta(),
+              readyAction: resolveAction(),
+            },
+          };
+        }
+
         return {
-          done: true,
-          result: {
-            meta: await getInitializedMeta(),
-            readyAction: resolveAction(),
-          },
+          done: false,
+          state: await getInitializedMeta(),
+          delayMs: pollIntervalMs,
         };
-      }
-
-      return {
-        done: false,
-        state: await getInitializedMeta(),
-        delayMs: pollIntervalMs,
-      };
-    },
-    timeoutError: ({ state }) =>
-      new ApiError(
-        504,
-        "SANDBOX_READY_TIMEOUT",
-        `Sandbox did not become ready within ${Math.ceil(timeoutMs / 1000)} seconds (last status: ${state?.status ?? "unknown"}).`,
-      ),
-  });
+      },
+      timeoutError: ({ state }) =>
+        new ApiError(
+          504,
+          "SANDBOX_READY_TIMEOUT",
+          `Sandbox did not become ready within ${Math.ceil(timeoutMs / 1000)} seconds (last status: ${state?.status ?? "unknown"}).`,
+        ),
+    });
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "SANDBOX_READY_TIMEOUT") {
+      const latest = await getInitializedMeta();
+      const stableFailure = stableBundleReadyFailure(latest.lastError);
+      if (latest.status === "error" && stableFailure) throw stableFailure;
+    }
+    throw error;
+  }
 }
 
 export async function ensureSandboxReady(options: {
@@ -750,6 +1321,10 @@ export async function resetSandbox(
   deps: ResetSandboxDeps = {},
 ): Promise<SingleMeta> {
   const deleteSnapshot = deps.deleteSnapshot ?? deleteVercelSnapshot;
+  let resetTarget: Pick<SingleMeta, "sandboxId" | "lifecycleAttemptId"> | null = null;
+  let sandboxDestroyed = false;
+  let destroyedSandboxId: string | null = null;
+  let destroyedOperationId: string | null = null;
   const ctx = (extra: Record<string, unknown> = {}) =>
     options.op
       ? withOperationContext(options.op, extra)
@@ -758,8 +1333,40 @@ export async function resetSandbox(
   logInfo("sandbox.reset_requested", ctx());
 
   try {
-    return await withLifecycleLock(async () => {
+    return await withLifecycleLock(async (lease) => {
+      await lease.assertOwned();
       const current = await getInitializedMeta();
+      if (options.expectedOperationId !== undefined) {
+        const suspension = await readHostSuspensionState();
+        const currentOwnsExpectedGeneration =
+          current.sandboxId === options.expectedSandboxId
+          && (current.lifecycleAttemptId ?? null)
+            === options.expectedLifecycleAttemptId;
+        const currentAlreadyCleared = current.sandboxId === null
+          && current.lifecycleAttemptId === null;
+        if (
+          suspension?.operationId !== options.expectedOperationId
+          || suspension.intent !== "reset"
+          || suspension.phase !== "stopping"
+          || suspension.lifecycleAttemptId
+            !== options.expectedLifecycleAttemptId
+          || (
+            options.expectedSandboxId !== undefined
+            && suspension.sandboxId !== options.expectedSandboxId
+          )
+          || (!currentOwnsExpectedGeneration && !currentAlreadyCleared)
+        ) {
+          throw new ApiError(
+            409,
+            "RESET_OPERATION_SUPERSEDED",
+            "The monitored reset operation no longer owns the sandbox generation.",
+          );
+        }
+      }
+      resetTarget = {
+        sandboxId: current.sandboxId,
+        lifecycleAttemptId: current.lifecycleAttemptId,
+      };
       const snapshotIds = collectTrackedSnapshotIds(current);
 
       logInfo("sandbox.reset.start", ctx({
@@ -768,13 +1375,32 @@ export async function resetSandbox(
         snapshotCount: snapshotIds.length,
       }));
 
-      await destroyCurrentSandboxWithoutSnapshot(current, ctx);
+      await destroyCurrentSandboxWithoutSnapshot(current, ctx, {
+        lease,
+        onSandboxResolved(sandboxId) {
+          if (resetTarget?.sandboxId !== null) {
+            resetTarget = {
+              sandboxId,
+              lifecycleAttemptId: current.lifecycleAttemptId,
+            };
+          }
+        },
+        onSandboxDestroyed(sandboxId, operationId) {
+          sandboxDestroyed = true;
+          destroyedSandboxId = sandboxId;
+          destroyedOperationId = operationId;
+        },
+      });
+      await lease.assertOwned();
       const failedSnapshotIds = await deleteTrackedSnapshotsForReset(
         snapshotIds,
         deleteSnapshot,
         ctx,
+        lease,
       );
+      await lease.assertOwned();
       await clearResetCronState(ctx);
+      await lease.assertOwned();
 
       if (failedSnapshotIds.length > 0) {
         const errorMessage =
@@ -784,7 +1410,13 @@ export async function resetSandbox(
         const failedSnapshotHistory = current.snapshotHistory.filter((record) =>
           failedIdSet.has(record.snapshotId),
         );
-        await mutateMeta((meta) => {
+        const failedMeta = await mutateMeta((meta) => {
+          if (
+            !resetTarget
+            || meta.sandboxId !== resetTarget.sandboxId
+            || (meta.lifecycleAttemptId ?? null)
+              !== (resetTarget.lifecycleAttemptId ?? null)
+          ) return;
           clearSandboxRuntimeStateForReset(meta);
           meta.status = "error";
           meta.lastError = errorMessage;
@@ -794,6 +1426,14 @@ export async function resetSandbox(
               : null;
           meta.snapshotHistory = failedSnapshotHistory;
         });
+        if (failedMeta.status !== "error" || failedMeta.sandboxId !== null) {
+          throw new LifecycleLockOwnershipLostError();
+        }
+        await lease.assertOwned();
+        await clearResetHostSuspensionAfterCommit(
+          destroyedSandboxId ?? resetTarget.sandboxId,
+          destroyedOperationId,
+        );
 
         logError("sandbox.reset.snapshot_delete_failed", ctx({
           failedSnapshotIds,
@@ -803,10 +1443,25 @@ export async function resetSandbox(
       }
 
       const resetMeta = await mutateMeta((meta) => {
+        if (
+          !resetTarget
+          || meta.sandboxId !== resetTarget.sandboxId
+          || (meta.lifecycleAttemptId ?? null)
+            !== (resetTarget.lifecycleAttemptId ?? null)
+        ) return;
         clearSandboxRuntimeStateForReset(meta);
         meta.status = "uninitialized";
         meta.lastError = null;
       });
+      if (resetMeta.status !== "uninitialized" || resetMeta.sandboxId !== null) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      await lease.assertOwned();
+      await clearResetHostSuspensionAfterCommit(
+        destroyedSandboxId ?? resetTarget.sandboxId,
+        destroyedOperationId,
+      );
+      await lease.assertOwned();
 
       logInfo("sandbox.reset.completed", ctx({
         status: resetMeta.status,
@@ -819,14 +1474,33 @@ export async function resetSandbox(
     const message = error instanceof Error ? error.message : String(error);
     if (error instanceof LifecycleLockUnavailableError) {
       logInfo("sandbox.reset.lifecycle_lock_contended", ctx({ error: message }));
-      throw error;
+      throw new SandboxLifecycleLockContendedError();
     }
 
     logError("sandbox.reset_failed", ctx({ error: message }));
+    if (sandboxDestroyed) {
+      await clearResetHostSuspensionAfterCommit(
+        destroyedSandboxId,
+        destroyedOperationId,
+      ).catch((cleanupError) => {
+        logWarn("sandbox.reset.host_suspension_cleanup_failed", ctx({
+          error: cleanupError instanceof Error
+            ? cleanupError.message
+            : String(cleanupError),
+        }));
+      });
+    }
     try {
       await mutateMeta((meta) => {
-        clearSandboxRuntimeStateForReset(meta);
-        meta.status = "error";
+        if (
+          !resetTarget
+          || meta.sandboxId !== resetTarget.sandboxId
+          || meta.lifecycleAttemptId !== resetTarget.lifecycleAttemptId
+        ) return;
+        if (sandboxDestroyed) {
+          clearSandboxRuntimeStateForReset(meta);
+          meta.status = "error";
+        }
         meta.lastError = `Sandbox reset failed: ${message}`;
       });
     } catch (metaError) {
@@ -943,13 +1617,27 @@ async function readCronNextWakeFromSandbox(
   }
 }
 
-export async function stopSandbox(): Promise<SingleMeta> {
+type StopSandboxInternalOptions = {
+  deadlineAtMs?: number;
+  pendingAutoSave?: PersistentAutoSaveInput;
+};
+
+async function stopSandboxWithOptions(
+  options: StopSandboxInternalOptions = {},
+): Promise<SingleMeta> {
   logInfo("sandbox.stop_requested");
   try {
-    return await withLifecycleLock(async () => {
+    return await withLifecycleLock(async (lease) => {
       const meta = await getInitializedMeta();
       if (meta.status === "stopped") {
+        await markHostSuspensionStopped();
         logInfo("sandbox.already_stopped", { sandboxId: meta.sandboxId });
+        return meta;
+      }
+      if (meta.status === "snapshotting") {
+        const operation = await readHostSuspensionState();
+        if (operation) await ensureHostStopMonitor(operation);
+        logInfo("sandbox.stop_already_in_progress", { sandboxId: meta.sandboxId });
         return meta;
       }
       if (!meta.sandboxId) {
@@ -959,110 +1647,86 @@ export async function stopSandbox(): Promise<SingleMeta> {
           "Sandbox is not running and cannot be stopped.",
         );
       }
+      if (
+        options.pendingAutoSave
+        && (
+          meta.sandboxId !== options.pendingAutoSave.sandboxId
+          || (meta.lifecycleAttemptId ?? null)
+            !== options.pendingAutoSave.lifecycleAttemptId
+        )
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
 
       logInfo("sandbox.stopping", { sandboxId: meta.sandboxId });
       try {
         const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
-        await cleanupBeforeSnapshot(sandbox, meta.firewall.mode);
-        const cronWakeRead = await readCronNextWakeFromSandbox(sandbox);
+        const stoppedMeta = await requestCooperativePersistentStop({
+          meta,
+          sandbox,
+          reason: "sandbox.stop",
+          lease,
+          deadlineAtMs: options.deadlineAtMs,
+          pendingAutoSave: options.pendingAutoSave,
+          afterPrepare: async () => {
+          await cleanupBeforeSnapshot(sandbox, meta.firewall.mode);
+          const cronWakeRead = await readCronNextWakeFromSandbox(sandbox);
 
-        logInfo("sandbox.status_transition", {
-          from: meta.status,
-          to: "snapshotting",
-          sandboxId: meta.sandboxId,
-          cronWakeRead,
-        });
+          logInfo("sandbox.status_transition", {
+            from: meta.status,
+            to: "snapshotting",
+            sandboxId: meta.sandboxId,
+            cronWakeRead,
+          });
 
-        if (cronWakeRead.status === "ok") {
-          await getStore().setValue(cronNextWakeKey(), cronWakeRead.nextWakeMs);
-          logInfo("sandbox.cron_wake_saved", { cronNextWakeMs: cronWakeRead.nextWakeMs });
-        } else if (cronWakeRead.status === "no-jobs") {
-          await getStore().deleteValue(cronNextWakeKey());
-        }
-
-        // Persist structured cron record as a safety net for resumes.
-        // The stop path is authoritative — if there are 0 jobs, the user
-        // intentionally deleted them.  Clear the store so a future resume
-        // does not resurrect old jobs.
-        const rawJobs = cronWakeRead.status !== "error" ? cronWakeRead.rawJobsJson : undefined;
-        if (rawJobs) {
-          const record = buildCronRecord(rawJobs, "stop");
-          if (record) {
-            await getStore().setValue(cronJobsKey(), record);
-            logInfo("sandbox.cron_jobs_persisted", {
-              source: "stop", jobCount: record.jobCount, sha256: record.sha256,
-            });
+          if (cronWakeRead.status === "ok") {
+            await getStore().setValue(cronNextWakeKey(), cronWakeRead.nextWakeMs);
+            logInfo("sandbox.cron_wake_saved", { cronNextWakeMs: cronWakeRead.nextWakeMs });
+          } else if (cronWakeRead.status === "no-jobs") {
+            await getStore().deleteValue(cronNextWakeKey());
           }
-        } else if (cronWakeRead.status === "no-jobs") {
-          await getStore().deleteValue(cronJobsKey());
-          logInfo("sandbox.cron_jobs_cleared", { reason: "no-jobs-on-stop" });
-        }
 
-        const statusBeforeStop = meta.status;
-        const portUrlsBeforeStop = meta.portUrls;
-        const snapshottingMeta = await mutateMeta((next) => {
-          // Keep sandboxId — persistent sandbox persists across stop/resume.
-          // Park before calling stop() so concurrent heartbeats/status polls do
-          // not observe "running" and accidentally resume the sandbox while the
-          // platform is accepting the stop request.
-          next.portUrls = null;
-          next.status = "snapshotting";
-          next.lastAccessedAt = Date.now();
-          next.lastError = null;
-          // lastRestoreMetrics describes a previously-ready runtime.  Once
-          // stopped, that assertion no longer holds — callers gating on
-          // telegramListenerReady must not trust the prior cycle's proof.
-          if (next.lastRestoreMetrics) {
-            next.lastRestoreMetrics = {
-              ...next.lastRestoreMetrics,
-              telegramListenerReady: false,
-            };
-          }
-        });
-
-        // v2 persistent sandboxes auto-save on stop — no manual snapshot() needed.
-        // blocking:false lets the stop request return as soon as the SDK has
-        // accepted it; the auto-save continues in the background and we
-        // reconcile the status via reconcileSnapshottingStatus().
-        try {
-          await sandbox.stop({ blocking: false });
-        } catch (stopErr) {
-          const message = stopErr instanceof Error ? stopErr.message : String(stopErr);
-          const isGone = message.includes("404") || message.includes("410");
-          if (!isGone) {
-            await mutateMeta((next) => {
-              if (next.sandboxId !== meta.sandboxId || next.status !== "snapshotting") {
-                return;
-              }
-              next.status = statusBeforeStop;
-              next.portUrls = portUrlsBeforeStop;
-              next.lastError = message;
-            });
-          }
-          throw stopErr;
-        }
-
-        const stoppedMeta = snapshottingMeta;
-
-        // Hot-spare: best-effort pre-create a candidate sandbox after stop.
-        // Gated — no-op when OPENCLAW_HOT_SPARE_ENABLED is not "true".
-        if (isHotSpareEnabled()) {
-          try {
-            const result = await preCreateHotSpare(stoppedMeta, {
-              create: (opts) => getSandboxController().create(opts),
-              getSandboxVcpus,
-              getSandboxSleepAfterMs,
-              sandboxPorts: SANDBOX_PORTS,
-            });
-            if (result.status !== "skipped") {
-              await mutateMeta((m) => applyPreCreateToMeta(m, result));
+          // Persist structured cron record as a safety net for resumes.
+          // The stop path is authoritative — if there are 0 jobs, the user
+          // intentionally deleted them. Clear the store so a future resume
+          // does not resurrect old jobs.
+          const rawJobs = cronWakeRead.status !== "error" ? cronWakeRead.rawJobsJson : undefined;
+          if (rawJobs) {
+            const record = buildCronRecord(rawJobs, "stop");
+            if (record) {
+              await getStore().setValue(cronJobsKey(), record);
+              logInfo("sandbox.cron_jobs_persisted", {
+                source: "stop", jobCount: record.jobCount, sha256: record.sha256,
+              });
             }
-          } catch (err) {
-            logWarn("hot_spare.post_stop_pre_create_failed", {
-              error: err instanceof Error ? err.message : String(err),
-            });
+          } else if (cronWakeRead.status === "no-jobs") {
+            await getStore().deleteValue(cronJobsKey());
+            logInfo("sandbox.cron_jobs_cleared", { reason: "no-jobs-on-stop" });
           }
-        }
+          },
+        });
+
+          // Hot-spare: best-effort pre-create a candidate sandbox after stop.
+          if (
+            isHotSpareEnabled()
+            && !process.env.OPENCLAW_BUNDLE_URL?.trim()
+          ) {
+            try {
+              const result = await preCreateHotSpare(stoppedMeta, {
+                create: (opts) => getSandboxController().create(opts),
+                getSandboxVcpus,
+                getSandboxSleepAfterMs: getSandboxPlatformTimeoutMs,
+                sandboxPorts: SANDBOX_PORTS,
+              });
+              if (result.status !== "skipped") {
+                await mutateMeta((m) => applyPreCreateToMeta(m, result));
+              }
+            } catch (err) {
+              logWarn("hot_spare.post_stop_pre_create_failed", {
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
 
         return stoppedMeta;
       } catch (err) {
@@ -1071,19 +1735,48 @@ export async function stopSandbox(): Promise<SingleMeta> {
         // With v2 persistent sandboxes, a gone sandbox means it was deleted.
         // Mark as uninitialized so the next ensure creates a fresh one.
         const message = err instanceof Error ? err.message : String(err);
-        const isGone = message.includes("404") || message.includes("410");
-        if (isGone) {
+        if (isSandboxGoneError(err)) {
+          const latest = await getInitializedMeta();
+          if (
+            !latest.sandboxId
+            || (latest.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+          ) throw err;
+          const goneSandboxId = latest.sandboxId;
           logWarn("sandbox.stop.sandbox_already_gone", {
-            sandboxId: meta.sandboxId,
+            sandboxId: goneSandboxId,
             error: message,
           });
-          return mutateMeta((next) => {
+          const goneMeta = await mutateMeta((next) => {
+            if (
+              next.sandboxId !== goneSandboxId
+              || (next.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+            ) return;
+            failPendingPersistentAutoSave(next);
+            next.activePersistentStop = null;
             next.sandboxId = null;
             next.portUrls = null;
             next.status = "uninitialized";
             next.lastAccessedAt = Date.now();
             next.lastError = null;
           });
+          if (goneMeta.sandboxId !== null || goneMeta.status !== "uninitialized") {
+            return goneMeta;
+          }
+          const goneSuspension = await readHostSuspensionState();
+          if (
+            goneSuspension?.sandboxId === goneSandboxId
+            && goneSuspension.lifecycleAttemptId
+              === (meta.lifecycleAttemptId ?? null)
+          ) {
+            await clearHostSuspensionAfterDelete({
+              sandboxId: goneSandboxId,
+              operationId: goneSuspension.operationId,
+            });
+          }
+          await clearSandboxDeadline(goneSandboxId, {
+            lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+          });
+          return goneMeta;
         }
         throw err;
       }
@@ -1096,6 +1789,10 @@ export async function stopSandbox(): Promise<SingleMeta> {
   }
 }
 
+export async function stopSandbox(): Promise<SingleMeta> {
+  return stopSandboxWithOptions();
+}
+
 export async function snapshotSandbox(): Promise<SingleMeta> {
   logInfo("sandbox.snapshot_requested");
   return stopSandbox();
@@ -1104,13 +1801,22 @@ export async function snapshotSandbox(): Promise<SingleMeta> {
 export async function markSandboxUnavailable(
   reason: string,
   expectedSandboxId?: string,
+  expectedLifecycleAttemptId?: string | null,
 ): Promise<SingleMeta> {
   return mutateMeta((meta) => {
-    if (expectedSandboxId !== undefined && meta.sandboxId !== expectedSandboxId) {
+    if (
+      (expectedSandboxId !== undefined && meta.sandboxId !== expectedSandboxId)
+      || (
+        expectedLifecycleAttemptId !== undefined
+        && (meta.lifecycleAttemptId ?? null) !== expectedLifecycleAttemptId
+      )
+    ) {
       logWarn("sandbox.mark_unavailable_skipped_stale", {
         reason,
         expectedSandboxId,
+        expectedLifecycleAttemptId,
         actualSandboxId: meta.sandboxId,
+        actualLifecycleAttemptId: meta.lifecycleAttemptId ?? null,
       });
       return;
     }
@@ -1606,6 +2312,86 @@ export type PrepareRestoreResult = {
   decision: RestoreDecision;
 };
 
+function completePendingPersistentAutoSave(
+  meta: SingleMeta,
+  expected: {
+    sandboxId: string;
+    lifecycleAttemptId: string | null;
+    operationId: string | null;
+  },
+  savedAt: number,
+): boolean {
+  const pending = meta.pendingPersistentAutoSave;
+  if (
+    meta.restorePreparedStatus !== "preparing"
+    || pending?.sandboxId !== expected.sandboxId
+    || pending.lifecycleAttemptId !== expected.lifecycleAttemptId
+    || pending.operationId !== expected.operationId
+  ) return false;
+
+  meta.persistedStateDynamicConfigHash = pending.dynamicConfigHash;
+  meta.persistedStateAssetSha256 = pending.assetSha256;
+  meta.persistedStateSavedAt = savedAt;
+  meta.persistedStateSource = "persistent-auto-save";
+  meta.pendingPersistentAutoSave = null;
+  meta.restorePreparedStatus = "ready";
+  meta.restorePreparedReason = "prepared";
+  meta.restorePreparedAt = savedAt;
+  meta.restoreOracle.status = "ready";
+  meta.restoreOracle.pendingReason = null;
+  meta.restoreOracle.lastCompletedAt = savedAt;
+  meta.restoreOracle.lastBlockedReason = null;
+  meta.restoreOracle.lastError = null;
+  meta.restoreOracle.consecutiveFailures = 0;
+  meta.restoreOracle.lastResult = "prepared";
+  return true;
+}
+
+function failPendingPersistentAutoSave(meta: SingleMeta): void {
+  if (!meta.pendingPersistentAutoSave) return;
+  meta.pendingPersistentAutoSave = null;
+  meta.persistedStateDynamicConfigHash = null;
+  meta.persistedStateAssetSha256 = null;
+  meta.persistedStateSavedAt = null;
+  meta.persistedStateSource = null;
+  meta.restorePreparedStatus = "failed";
+  meta.restorePreparedReason = "prepare-failed";
+  meta.restorePreparedAt = null;
+}
+
+async function waitForConfirmedPersistentStop(options?: {
+  deadlineAtMs?: number;
+}): Promise<SingleMeta> {
+  const immediate = await reconcileSnapshottingStatus();
+  if (immediate.status !== "snapshotting") return immediate;
+
+  const remainingBudgetMs = options?.deadlineAtMs === undefined
+    ? PERSISTENT_STOP_CONFIRM_TIMEOUT_MS
+    : Math.min(
+        PERSISTENT_STOP_CONFIRM_TIMEOUT_MS,
+        options.deadlineAtMs - Date.now(),
+      );
+  const timeoutMs = Math.max(1, remainingBudgetMs);
+
+  return pollUntil<SingleMeta, SingleMeta>({
+    label: "sandbox.persistent-stop",
+    timeoutMs,
+    initialDelayMs: READY_WAIT_POLL_MS,
+    state: immediate,
+    step: async () => {
+      const current = await reconcileSnapshottingStatus();
+      return current.status === "snapshotting"
+        ? { done: false, state: current, delayMs: READY_WAIT_POLL_MS }
+        : { done: true, result: current };
+    },
+    timeoutError: ({ state }) => new ApiError(
+      504,
+      "SANDBOX_STOP_TIMEOUT",
+      `Sandbox persistent stop was not confirmed (last status: ${state?.status ?? "unknown"}).`,
+    ),
+  });
+}
+
 /**
  * Prepare the next restore target.  When `destructive` is true, the sandbox
  * is stopped so Sandbox v2 auto-saves state matching current config and
@@ -1618,9 +2404,14 @@ export async function prepareRestoreTarget(input: {
   destructive?: boolean;
   op?: OperationContext;
 }): Promise<PrepareRestoreResult> {
+  const syncDeadlineAtMs = Date.now() + PREPARE_RESTORE_SYNC_BUDGET_MS;
   const actions: PrepareRestoreAction[] = [];
   const meta = await getInitializedMeta();
   const isDestructive = input.destructive ?? false;
+  const ownsPrepareTarget = (candidate: SingleMeta): boolean =>
+    candidate.sandboxId === meta.sandboxId
+    && (candidate.lifecycleAttemptId ?? null)
+      === (meta.lifecycleAttemptId ?? null);
 
   logInfo("sandbox.restore_target.prepare_start", {
     destructive: isDestructive,
@@ -1701,15 +2492,26 @@ export async function prepareRestoreTarget(input: {
   }
 
   // Destructive: ensure running, reconcile, snapshot, stamp.
-  await mutateMeta((next) => {
+  const preparingMeta = await mutateMeta((next) => {
+    if (!ownsPrepareTarget(next)) return;
     next.restorePreparedStatus = "preparing";
     next.restorePreparedReason = null;
+    next.persistedStateDynamicConfigHash = null;
+    next.persistedStateAssetSha256 = null;
+    next.persistedStateSavedAt = null;
+    next.persistedStateSource = null;
+    next.pendingPersistentAutoSave = null;
+    next.restorePreparedAt = null;
   });
+  if (!ownsPrepareTarget(preparingMeta)) {
+    throw new LifecycleLockOwnershipLostError();
+  }
 
   // Step 1: Ensure the sandbox is running.
   if (meta.status !== "running" || !meta.sandboxId) {
     actions.push({ id: "ensure-running", status: "failed", message: `sandbox status: ${meta.status}` });
     await mutateMeta((next) => {
+      if (!ownsPrepareTarget(next)) return;
       next.restorePreparedStatus = "failed";
       next.restorePreparedReason = "prepare-failed";
     });
@@ -1743,6 +2545,7 @@ export async function prepareRestoreTarget(input: {
   });
   if (!reconcileResult.verified) {
     await mutateMeta((next) => {
+      if (!ownsPrepareTarget(next)) return;
       next.restorePreparedStatus = "failed";
       next.restorePreparedReason = "prepare-failed";
     });
@@ -1763,17 +2566,23 @@ export async function prepareRestoreTarget(input: {
     };
   }
 
-  // Step 3: Sync static assets.
+  // Step 3: Sync static assets from the same metadata generation that will be
+  // hashed and attested below.
+  const assetMeta = await getInitializedMeta();
+  if (!ownsPrepareTarget(assetMeta)) {
+    throw new LifecycleLockOwnershipLostError();
+  }
   try {
-    const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
-    const slackConfig = meta.channels.slack;
+    const sandbox = await getSandboxController().get({ sandboxId: assetMeta.sandboxId! });
+    const slackConfig = assetMeta.channels.slack;
     await syncRestoreAssetsIfNeeded(sandbox, {
       origin: input.origin,
-      telegramBotToken: meta.channels.telegram?.botToken,
-      telegramWebhookSecret: meta.channels.telegram?.webhookSecret,
+      telegramBotToken: assetMeta.channels.telegram?.botToken,
+      telegramWebhookSecret: assetMeta.channels.telegram?.webhookSecret,
       slackCredentials: slackConfig
         ? { botToken: slackConfig.botToken, signingSecret: slackConfig.signingSecret }
         : undefined,
+      bundleCapabilities: assetMeta.bundleIdentity?.capabilities,
     });
     actions.push({ id: "sync-static-assets", status: "completed", message: "runtime assets fresh" });
   } catch (err) {
@@ -1783,6 +2592,7 @@ export async function prepareRestoreTarget(input: {
       message: err instanceof Error ? err.message : String(err),
     });
     await mutateMeta((next) => {
+      if (!ownsPrepareTarget(next)) return;
       next.restorePreparedStatus = "failed";
       next.restorePreparedReason = "prepare-failed";
     });
@@ -1816,6 +2626,7 @@ export async function prepareRestoreTarget(input: {
   });
   if (!readiness.ready) {
     await mutateMeta((next) => {
+      if (!ownsPrepareTarget(next)) return;
       next.restorePreparedStatus = "failed";
       next.restorePreparedReason = "prepare-failed";
     });
@@ -1836,20 +2647,76 @@ export async function prepareRestoreTarget(input: {
     };
   }
 
+  const synchronizedMeta = await getInitializedMeta();
+  if (!ownsPrepareTarget(synchronizedMeta)) {
+    throw new LifecycleLockOwnershipLostError();
+  }
   // Step 5: Stop and let Vercel Sandbox v2 persist the named sandbox state.
   try {
-    await stopSandbox();
-    actions.push({ id: "snapshot", status: "completed", message: "persistent auto-save requested" });
+    const pendingDynamicConfigHash = computeMetaGatewayConfigHash(synchronizedMeta);
+    if (synchronizedMeta.runtimeDynamicConfigHash !== pendingDynamicConfigHash) {
+      throw new ApiError(
+        409,
+        "SANDBOX_PREPARE_CONFIG_CHANGED",
+        "Sandbox config changed during restore preparation; retry after runtime sync.",
+      );
+    }
+    const pendingAssetSha256 = buildRestoreAssetManifest().sha256;
+    await stopSandboxWithOptions({
+      deadlineAtMs: syncDeadlineAtMs,
+      pendingAutoSave: {
+        sandboxId: synchronizedMeta.sandboxId!,
+        lifecycleAttemptId: synchronizedMeta.lifecycleAttemptId ?? null,
+        dynamicConfigHash: pendingDynamicConfigHash,
+        assetSha256: pendingAssetSha256,
+      },
+    });
+    const stopped = await waitForConfirmedPersistentStop({
+      deadlineAtMs: syncDeadlineAtMs,
+    });
+    if (stopped.status !== "stopped") {
+      throw new Error(
+        `Persistent auto-save did not complete successfully (status: ${stopped.status}).`,
+      );
+    }
+    if (
+      stopped.restorePreparedStatus !== "ready"
+      || stopped.pendingPersistentAutoSave !== null
+    ) {
+      throw new Error("Persistent auto-save completed without an exact preparation attestation.");
+    }
+    actions.push({
+      id: "snapshot",
+      status: "completed",
+      message: "persistent auto-save confirmed by Sandbox SDK",
+    });
+    actions.push({
+      id: "stamp-meta",
+      status: "completed",
+      message: "persistent auto-save truth recorded",
+    });
   } catch (err) {
     actions.push({
       id: "snapshot",
       status: "failed",
       message: err instanceof Error ? err.message : String(err),
     });
-    await mutateMeta((next) => {
-      next.restorePreparedStatus = "failed";
-      next.restorePreparedReason = "prepare-failed";
-    });
+    const stopStillReconciling = err instanceof ApiError
+      && err.code === "SANDBOX_STOP_TIMEOUT"
+      && (await getInitializedMeta()).status === "snapshotting";
+    if (!stopStillReconciling) {
+      await mutateMeta((next) => {
+        if (!ownsPrepareTarget(next)) return;
+        next.persistedStateDynamicConfigHash = null;
+        next.persistedStateAssetSha256 = null;
+        next.persistedStateSavedAt = null;
+        next.persistedStateSource = null;
+        next.pendingPersistentAutoSave = null;
+        next.restorePreparedStatus = "failed";
+        next.restorePreparedReason = "prepare-failed";
+        next.restorePreparedAt = null;
+      });
+    }
     const failMeta = await getInitializedMeta();
     return {
       ok: false,
@@ -1866,30 +2733,6 @@ export async function prepareRestoreTarget(input: {
       decision: buildRestoreDecision({ meta: failMeta, source: "prepare", destructive: true }),
     };
   }
-
-  const desiredDynamicConfigHash = computeGatewayConfigHash({
-    telegramBotToken: meta.channels.telegram?.botToken,
-    telegramWebhookSecret: meta.channels.telegram?.webhookSecret,
-    slackCredentials: meta.channels.slack
-      ? {
-          botToken: meta.channels.slack.botToken,
-          signingSecret: meta.channels.slack.signingSecret,
-        }
-      : undefined,
-    bundleCapabilities: meta.bundleIdentity?.capabilities,
-  });
-  const desiredAssetSha256 = buildRestoreAssetManifest().sha256;
-  const preparedAt = Date.now();
-  await mutateMeta((next) => {
-    next.persistedStateDynamicConfigHash = desiredDynamicConfigHash;
-    next.persistedStateAssetSha256 = desiredAssetSha256;
-    next.persistedStateSavedAt = preparedAt;
-    next.persistedStateSource = "persistent-auto-save";
-    next.restorePreparedStatus = "ready";
-    next.restorePreparedReason = "prepared";
-    next.restorePreparedAt = preparedAt;
-  });
-  actions.push({ id: "stamp-meta", status: "completed", message: "persistent auto-save truth recorded" });
 
   const finalMeta = await getInitializedMeta();
   const finalDecision = buildRestoreDecision({ meta: finalMeta, source: "prepare", destructive: true });
@@ -1954,6 +2797,13 @@ export async function prepareHotSpareFromPreparedRestore(options?: {
 }): Promise<PrepareHotSpareResult> {
   void options; // reserved for future observability threading
 
+  if (process.env.OPENCLAW_BUNDLE_URL?.trim()) {
+    logWarn("sandbox.hot_spare.prepare.skipped", {
+      reason: "bundle-persistent-name-not-preserved",
+    });
+    return { ok: false, reason: "skipped", candidateSandboxId: null };
+  }
+
   const meta = await getInitializedMeta();
 
   if (!meta.snapshotId) {
@@ -1972,7 +2822,7 @@ export async function prepareHotSpareFromPreparedRestore(options?: {
   const result = await preCreateHotSpareFromSnapshot(meta, {
     create: (createOptions) => getSandboxController().create(createOptions),
     getSandboxVcpus,
-    getSandboxSleepAfterMs,
+    getSandboxSleepAfterMs: getSandboxPlatformTimeoutMs,
     sandboxPorts: SANDBOX_PORTS,
     restoreEnv,
   });
@@ -2001,6 +2851,15 @@ export async function prepareHotSpareFromPreparedRestore(options?: {
 export async function touchRunningSandbox(): Promise<SingleMeta> {
   const meta = await getInitializedMeta();
   if (!meta.sandboxId || meta.status !== "running") {
+    return meta;
+  }
+  const hostSuspension = await readHostSuspensionState();
+  if (hostSuspension?.ingressFenced) {
+    logInfo("sandbox.timeout_top_up_skipped", {
+      sandboxId: meta.sandboxId,
+      reason: "host-suspension-fenced",
+      phase: hostSuspension.phase,
+    });
     return meta;
   }
   const sandboxId = meta.sandboxId;
@@ -2033,11 +2892,15 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
     );
   }
 
-  const targetSleepAfterMs = getSandboxSleepAfterMs();
+  const targetSleepAfterMs = getSandboxPlatformTimeoutMs();
 
   try {
-    const remainingMs = Math.max(0, sandbox.timeout);
-    const extendByMs = Math.max(0, targetSleepAfterMs - remainingMs);
+    const remainingMs = sandbox.timeoutRemaining;
+    const extendByMs = getSandboxTimeoutExtensionMs({
+      currentTotalMs: sandbox.timeout,
+      currentRemainingMs: remainingMs,
+      targetRemainingMs: targetSleepAfterMs,
+    });
 
     if (extendByMs > 0) {
       await sandbox.extendTimeout(extendByMs);
@@ -2137,9 +3000,13 @@ export async function touchRunningSandbox(): Promise<SingleMeta> {
     // Non-critical — don't let cron-wake bookkeeping break the heartbeat.
   }
 
-  return mutateMeta((next) => {
-    next.lastAccessedAt = now;
+  await armSandboxDeadline(meta, undefined, {
+    activityAtMs: Date.now(),
+    nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
   });
+  // The deadline stop may have won while this request waited for admission.
+  // Return current lifecycle truth so callers never proxy stale running meta.
+  return getInitializedMeta();
 }
 
 export async function getRunningSandboxTimeoutRemainingMs(): Promise<number | null> {
@@ -2147,12 +3014,19 @@ export async function getRunningSandboxTimeoutRemainingMs(): Promise<number | nu
   if (!meta.sandboxId || meta.status !== "running") {
     return null;
   }
-
+  const coordinatedRemainingMs = await readSandboxDeadlineRemainingMs(meta);
+  if (coordinatedRemainingMs !== null) return coordinatedRemainingMs;
   try {
-    const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
-    return Math.max(0, sandbox.timeout);
+    const sandbox = await getSandboxController().get({
+      sandboxId: meta.sandboxId,
+      resume: false,
+    });
+    return sandbox.timeoutRemaining;
   } catch {
-    return null;
+    return estimateSandboxTimeoutRemainingMs(
+      meta.lastAccessedAt,
+      getSandboxSleepAfterMs(),
+    );
   }
 }
 
@@ -2172,51 +3046,115 @@ export async function getRunningSandboxTimeoutRemainingMs(): Promise<number | nu
  * coordinating via Redis.
  */
 const RECONCILE_STALE_RUNNING_DEBOUNCE_MS = 5_000;
-let reconcileStaleRunningInFlight: Promise<SingleMeta> | null = null;
+const reconcileStaleRunningInFlight = new Map<string, Promise<SingleMeta>>();
 let lastReconcileStaleRunningResult:
-  | { reconciledAtMs: number; meta: SingleMeta }
+  | { generationKey: string; reconciledAtMs: number; meta: SingleMeta }
   | null = null;
+
+function sandboxGenerationKey(
+  meta: Pick<SingleMeta, "sandboxId" | "lifecycleAttemptId">,
+): string {
+  return `${meta.sandboxId ?? "none"}:${meta.lifecycleAttemptId ?? "none"}`;
+}
 
 /**
  * Test-only helper to clear the debounce state between tests. The
  * module-scoped cache would otherwise leak across test cases.
  */
 export function _resetReconcileStaleRunningDebounceForTesting(): void {
-  reconcileStaleRunningInFlight = null;
+  reconcileStaleRunningInFlight.clear();
   lastReconcileStaleRunningResult = null;
 }
 
-async function runReconcileStaleRunningStatus(): Promise<SingleMeta> {
-  const meta = await getInitializedMeta();
+async function runReconcileStaleRunningStatus(meta: SingleMeta): Promise<SingleMeta> {
   if (!meta.sandboxId || meta.status !== "running") {
     return meta;
   }
+  const sandboxId = meta.sandboxId;
+  const lifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+  const matchingFenceExists = async (): Promise<boolean> => {
+    try {
+      const suspension = await readHostSuspensionState();
+      return Boolean(
+        suspension?.ingressFenced
+        && suspension.sandboxId === sandboxId
+        && suspension.lifecycleAttemptId === lifecycleAttemptId
+      );
+    } catch (error) {
+      if (!(error instanceof HostSuspensionStateCorruptError)) throw error;
+      return true;
+    }
+  };
+  if (await matchingFenceExists()) {
+      logInfo("sandbox.stale_running_reconcile_deferred", {
+        sandboxId,
+        metaStatus: meta.status,
+      });
+      return getInitializedMeta();
+  }
+  const mutateIfCurrent = (mutator: (next: SingleMeta) => void) =>
+    mutateMeta((next) => {
+      if (
+        next.status !== "running"
+        || next.sandboxId !== sandboxId
+        || (next.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+      ) return;
+      mutator(next);
+    });
 
   try {
-    const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
+    const sandbox = await getSandboxController().get({
+      sandboxId,
+      resume: false,
+    });
     const sdkStatus = sandbox.status;
     if (sdkStatus === "running") {
-      return meta;
+      return getInitializedMeta();
     }
+    if (
+      sdkStatus !== "stopped"
+      && sdkStatus !== "failed"
+      && sdkStatus !== "aborted"
+    ) {
+      logInfo("sandbox.stale_running_reconcile_deferred", {
+        sandboxId,
+        sdkStatus,
+        metaStatus: meta.status,
+      });
+      return getInitializedMeta();
+    }
+    if (await matchingFenceExists()) return getInitializedMeta();
     logInfo("sandbox.stale_running_reconciled", {
       sandboxId: meta.sandboxId,
       sdkStatus,
       metaStatus: meta.status,
     });
-    return mutateMeta((next) => {
-      next.status = "stopped";
-      next.lastError = null;
+    return mutateIfCurrent((next) => {
+      const terminalFailure = sdkStatus === "failed" || sdkStatus === "aborted";
+      next.status = terminalFailure ? "error" : "stopped";
+      next.lastError = terminalFailure ? `sandbox ${sdkStatus}` : null;
       next.lastGatewayProbeReady = false;
     });
-  } catch {
-    // get() throws when sandbox no longer exists — it's definitely stopped
+  } catch (error) {
+    if (!isSandboxGoneError(error)) {
+      logWarn("sandbox.stale_running_reconcile_lookup_failed", {
+        sandboxId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return getInitializedMeta();
+    }
+    if (await matchingFenceExists()) return getInitializedMeta();
     logInfo("sandbox.stale_running_reconciled", {
       sandboxId: meta.sandboxId,
       sdkStatus: "not-found",
       metaStatus: meta.status,
     });
-    return mutateMeta((next) => {
-      next.status = "stopped";
+    return mutateIfCurrent((next) => {
+      next.sandboxId = null;
+      next.portUrls = null;
+      next.pendingPersistentAutoSave = null;
+      next.activePersistentStop = null;
+      next.status = "uninitialized";
       next.lastError = null;
       next.lastGatewayProbeReady = false;
     });
@@ -2233,9 +3171,14 @@ async function runReconcileStaleRunningStatus(): Promise<SingleMeta> {
  * reuse the cached result.
  */
 export async function reconcileStaleRunningStatus(): Promise<SingleMeta> {
+  const current = await getInitializedMeta();
+  if (!current.sandboxId || current.status !== "running") return current;
+  const generationKey = sandboxGenerationKey(current);
   const now = Date.now();
   if (
     lastReconcileStaleRunningResult &&
+    lastReconcileStaleRunningResult.generationKey === generationKey
+    &&
     now - lastReconcileStaleRunningResult.reconciledAtMs <=
       RECONCILE_STALE_RUNNING_DEBOUNCE_MS
   ) {
@@ -2247,24 +3190,41 @@ export async function reconcileStaleRunningStatus(): Promise<SingleMeta> {
     return structuredClone(lastReconcileStaleRunningResult.meta);
   }
 
-  if (reconcileStaleRunningInFlight) {
+  const inFlight = reconcileStaleRunningInFlight.get(generationKey);
+  if (inFlight) {
     logInfo("sandbox.reconcile_stale_running_status_joined_in_flight", {});
-    return structuredClone(await reconcileStaleRunningInFlight);
+    return structuredClone(await inFlight);
   }
 
-  reconcileStaleRunningInFlight = runReconcileStaleRunningStatus()
+  const promise = (async () => {
+    try {
+      return await withLifecycleLock(async (lease) => {
+        await lease.assertOwned();
+        return runReconcileStaleRunningStatus(current);
+      });
+    } catch (error) {
+      if (!(error instanceof LifecycleLockUnavailableError)) throw error;
+      logInfo("sandbox.stale_running_reconcile_deferred", {
+        sandboxId: current.sandboxId,
+        reason: "lifecycle-lock-contended",
+      });
+      return getInitializedMeta();
+    }
+  })()
     .then((meta) => {
       lastReconcileStaleRunningResult = {
+        generationKey,
         reconciledAtMs: Date.now(),
         meta: structuredClone(meta),
       };
       return meta;
     })
     .finally(() => {
-      reconcileStaleRunningInFlight = null;
+      reconcileStaleRunningInFlight.delete(generationKey);
     });
+  reconcileStaleRunningInFlight.set(generationKey, promise);
 
-  return structuredClone(await reconcileStaleRunningInFlight);
+  return structuredClone(await promise);
 }
 
 /**
@@ -2275,74 +3235,472 @@ export async function reconcileStaleRunningStatus(): Promise<SingleMeta> {
  * transitions meta to `"stopped"` (happy path), `"error"` (snapshot failed),
  * or leaves it untouched if the snapshot is still in flight.
  *
- * Guardrail: if meta has been parked in `snapshotting` past the stale
- * operation window, force-transition to `"stopped"` so the user isn't
- * blocked forever — the SDK treats a stopped persistent sandbox as
- * resumable regardless of whether the most recent snapshot finished.
+ * The SDK status is authoritative. A stale transitional state remains fenced;
+ * it is never projected as stopped while the platform still reports running,
+ * stopping, pending, or snapshotting.
  */
 export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
   const meta = await getInitializedMeta();
-  if (meta.status !== "snapshotting" || !meta.sandboxId) {
+  let hostSuspension: HostSuspensionState | null;
+  try {
+    hostSuspension = await readHostSuspensionState();
+  } catch (error) {
+    if (!(error instanceof HostSuspensionStateCorruptError)) throw error;
+    // Status and explicit reset are the recovery surfaces for a corrupt
+    // record. Preserve lifecycle metadata so callers can expose the synthetic
+    // fail-closed fence instead of losing diagnostics to a 500 response.
     return meta;
   }
+  if (meta.status !== "snapshotting" || !meta.sandboxId) {
+    if (
+      meta.status !== "running"
+      || !meta.sandboxId
+      || !hostSuspension?.ingressFenced
+      || hostSuspension.sandboxId !== meta.sandboxId
+      || hostSuspension.lifecycleAttemptId !== (meta.lifecycleAttemptId ?? null)
+    ) {
+      return meta;
+    }
+    const sandboxId = meta.sandboxId;
+    const runningLifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+    if (hostSuspension.phase === "rollback-pending") {
+      let sandbox: SandboxHandle;
+      try {
+        sandbox = await getSandboxController().get({ sandboxId, resume: false });
+      } catch (error) {
+        if (!isSandboxGoneError(error)) return meta;
+        return markSandboxUnavailable(
+          "Sandbox disappeared while Gateway suspension rollback was pending.",
+          sandboxId,
+          runningLifecycleAttemptId,
+        );
+      }
+      if (sandbox.status !== "running") return meta;
+      const thawed = await thawHostSuspensionIfNeeded({
+        sandbox,
+        lifecycleAttemptId: runningLifecycleAttemptId,
+      });
+      if (!thawed) return meta;
+      return mutateMeta((next) => {
+        if (
+          next.sandboxId !== sandboxId
+          || next.status !== "running"
+          || (next.lifecycleAttemptId ?? null) !== runningLifecycleAttemptId
+        ) return;
+        next.lastError = null;
+        next.lastGatewayProbeReady = false;
+      });
+    }
+    const preStopPhase = hostSuspension.phase === "fencing"
+      || hostSuspension.phase === "preparing"
+      || hostSuspension.phase === "prepared";
+    const preStopDeadlineElapsed = preStopPhase
+      && Date.now() - hostSuspension.updatedAtMs >= HOST_STOP_REQUEST_MAX_MS;
+    const stopRequestDeadlineElapsed = hostSuspension.phase === "stop-requesting"
+      && hostSuspension.stopRequestDeadlineAtMs !== null
+      && Date.now() >= hostSuspension.stopRequestDeadlineAtMs;
+    if (!preStopDeadlineElapsed && !stopRequestDeadlineElapsed) return meta;
 
-  try {
-    const sandbox = await getSandboxController().get({
-      sandboxId: meta.sandboxId,
-      resume: false,
-    });
-    const sdkStatus = sandbox.status;
-    if (sdkStatus === "stopped") {
-      logInfo("sandbox.snapshotting_reconciled", {
-        sandboxId: meta.sandboxId,
-        sdkStatus,
-        outcome: "stopped",
+    let sandbox: SandboxHandle;
+    try {
+      sandbox = await getSandboxController().get({
+        sandboxId,
+        resume: false,
       });
-      return mutateMeta((next) => {
+    } catch (error) {
+      if (!isSandboxGoneError(error)) {
+        logWarn("sandbox.host_suspension_orphan_lookup_failed", {
+          sandboxId,
+          operationId: hostSuspension.operationId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return meta;
+      }
+      const deletedMeta = await mutateMeta((next) => {
+        if (
+          next.sandboxId !== sandboxId
+          || next.status !== "running"
+          || (next.lifecycleAttemptId ?? null) !== runningLifecycleAttemptId
+        ) return;
+        failPendingPersistentAutoSave(next);
+        next.sandboxId = null;
+        next.portUrls = null;
+        next.status = "uninitialized";
+        next.lastError = null;
+      });
+      if (deletedMeta.sandboxId !== null || deletedMeta.status !== "uninitialized") {
+        return deletedMeta;
+      }
+      await clearHostSuspensionAfterDelete({
+        sandboxId,
+        operationId: hostSuspension.operationId,
+      });
+      await clearSandboxDeadline(sandboxId, {
+        lifecycleAttemptId: runningLifecycleAttemptId,
+      });
+      return deletedMeta;
+    }
+
+    if (sandbox.status === "stopped") {
+      const stoppedMeta = await mutateMeta((next) => {
+        if (
+          next.sandboxId !== sandboxId
+          || next.status !== "running"
+          || (next.lifecycleAttemptId ?? null) !== runningLifecycleAttemptId
+        ) return;
         next.status = "stopped";
         next.lastError = null;
         next.lastGatewayProbeReady = false;
       });
+      if (
+        stoppedMeta.status !== "stopped"
+        || stoppedMeta.sandboxId !== sandboxId
+        || (stoppedMeta.lifecycleAttemptId ?? null) !== runningLifecycleAttemptId
+      ) return stoppedMeta;
+      await markHostSuspensionStopped(hostSuspension.operationId);
+      await clearSandboxDeadline(sandboxId, {
+        lifecycleAttemptId: runningLifecycleAttemptId,
+      });
+      return stoppedMeta;
     }
-    if (sdkStatus === "failed" || sdkStatus === "aborted") {
-      logWarn("sandbox.snapshotting_reconciled", {
-        sandboxId: meta.sandboxId,
-        sdkStatus,
-        outcome: "failed",
+    if (sandbox.status !== "running") return meta;
+
+    try {
+      await rollbackHostSuspension({
+        state: hostSuspension,
+        sandbox,
+        error: new Error("Host suspension was abandoned before platform stop."),
       });
-      return mutateMeta((next) => {
-        next.status = "error";
-        next.lastError = `snapshot ${sdkStatus}`;
-        next.lastGatewayProbeReady = false;
+    } catch (error) {
+      logWarn("sandbox.host_suspension_orphan_rollback_failed", {
+        sandboxId,
+        operationId: hostSuspension.operationId,
+        error: error instanceof Error ? error.message : String(error),
       });
+      return meta;
     }
-    // Still snapshotting / stopping / pending — check stale guardrail.
-    if (isOperationStale(meta)) {
-      logWarn("sandbox.snapshotting_reconciled", {
-        sandboxId: meta.sandboxId,
-        sdkStatus,
-        outcome: "stale-force-stopped",
-      });
-      return mutateMeta((next) => {
-        next.status = "stopped";
-        next.lastError = null;
-        next.lastGatewayProbeReady = false;
-      });
-    }
-    return meta;
-  } catch {
-    // get() throws when the sandbox is gone — treat as fully stopped.
-    logInfo("sandbox.snapshotting_reconciled", {
-      sandboxId: meta.sandboxId,
-      sdkStatus: "not-found",
-      outcome: "stopped",
-    });
     return mutateMeta((next) => {
-      next.status = "stopped";
-      next.lastError = null;
+      if (
+        next.sandboxId !== sandboxId
+        || next.status !== "running"
+        || (next.lifecycleAttemptId ?? null) !== runningLifecycleAttemptId
+      ) return;
+      next.lastError = "Abandoned host suspension rolled back; Gateway admission resumed.";
       next.lastGatewayProbeReady = false;
     });
   }
+
+  const capturedSandboxId = meta.sandboxId;
+  const capturedLifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+  const capturedStop = meta.activePersistentStop;
+  const capturedOperationId = capturedStop
+    ? capturedStop.operationId ?? undefined
+    : hostSuspension?.sandboxId === capturedSandboxId
+      && hostSuspension.lifecycleAttemptId === capturedLifecycleAttemptId
+      ? hostSuspension.operationId
+      : undefined;
+  const ownsCapturedStop = (next: SingleMeta): boolean =>
+    next.sandboxId === capturedSandboxId
+    && next.status === "snapshotting"
+    && (next.lifecycleAttemptId ?? null) === capturedLifecycleAttemptId
+    && (
+      capturedStop === null
+        ? next.activePersistentStop === null
+        : next.activePersistentStop?.stopAttemptId === capturedStop.stopAttemptId
+    );
+  const readCapturedHostOperation = async (): Promise<{
+    owned: boolean;
+    state: HostSuspensionState | null;
+  }> => {
+    try {
+      const latest = await readHostSuspensionState();
+      const owned = capturedOperationId === undefined
+        ? latest === null
+        : latest?.sandboxId === capturedSandboxId
+          && latest.operationId === capturedOperationId
+          && latest.lifecycleAttemptId === capturedLifecycleAttemptId;
+      return { owned, state: latest };
+    } catch (error) {
+      if (!(error instanceof HostSuspensionStateCorruptError)) throw error;
+      return { owned: false, state: null };
+    }
+  };
+  let sandbox: SandboxHandle;
+  try {
+    sandbox = await getSandboxController().get({
+      sandboxId: capturedSandboxId,
+      resume: false,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isSandboxGoneError(error)) {
+      logWarn("sandbox.snapshotting_reconcile_lookup_failed", {
+        sandboxId: capturedSandboxId,
+        error: message,
+      });
+      return meta;
+    }
+
+    logInfo("sandbox.snapshotting_reconciled", {
+      sandboxId: capturedSandboxId,
+      sdkStatus: "not-found",
+      outcome: "deleted",
+    });
+    if (!(await readCapturedHostOperation()).owned) {
+      return getInitializedMeta();
+    }
+    const deletedMeta = await mutateMeta((next) => {
+      if (!ownsCapturedStop(next)) return;
+      failPendingPersistentAutoSave(next);
+      next.status = "uninitialized";
+      next.sandboxId = null;
+      next.portUrls = null;
+      next.bundleIdentity = null;
+      next.bundleCandidate = null;
+      next.persistedStateDynamicConfigHash = null;
+      next.persistedStateAssetSha256 = null;
+      next.persistedStateSavedAt = null;
+      next.persistedStateSource = null;
+      next.restorePreparedStatus = "failed";
+      next.restorePreparedReason = "prepare-failed";
+      next.activePersistentStop = null;
+      next.lifecycleAttemptId = null;
+      next.lastError = "Persistent sandbox was deleted before stop completed.";
+      next.lastGatewayProbeReady = false;
+    });
+    if (deletedMeta.status !== "uninitialized" || deletedMeta.sandboxId !== null) {
+      return deletedMeta;
+    }
+    if (capturedOperationId) {
+      await clearHostSuspensionAfterDelete({
+        sandboxId: capturedSandboxId,
+        operationId: capturedOperationId,
+      });
+    }
+    await clearSandboxDeadline(capturedSandboxId, {
+      lifecycleAttemptId: capturedLifecycleAttemptId,
+    });
+    return deletedMeta;
+  }
+
+  const sdkStatus = sandbox.status;
+  if (sdkStatus === "stopped") {
+    const capturedHostOperation = await readCapturedHostOperation();
+    if (!capturedHostOperation.owned) return getInitializedMeta();
+    const bundleMigrationRequired = (
+      capturedStop?.reason
+      ?? capturedHostOperation.state?.reason
+    ) === BUNDLE_MIGRATION_SUSPENSION_REASON;
+    logInfo("sandbox.snapshotting_reconciled", {
+      sandboxId: capturedSandboxId,
+      sdkStatus,
+      outcome: "stopped",
+    });
+    const stoppedMeta = await mutateMeta((next) => {
+      if (!ownsCapturedStop(next)) return;
+      next.status = bundleMigrationRequired ? "error" : "stopped";
+      next.lastError = bundleMigrationRequired
+        ? BUNDLE_MIGRATION_REQUIRED_LAST_ERROR
+        : null;
+      next.lastGatewayProbeReady = false;
+      if (bundleMigrationRequired) {
+        failPendingPersistentAutoSave(next);
+      } else {
+        const completedAutoSave = completePendingPersistentAutoSave(next, {
+          sandboxId: capturedSandboxId,
+          lifecycleAttemptId: capturedLifecycleAttemptId,
+          operationId: capturedOperationId ?? null,
+        }, Date.now());
+        if (!completedAutoSave) failPendingPersistentAutoSave(next);
+      }
+      next.activePersistentStop = null;
+    });
+    if (
+      stoppedMeta.status === "snapshotting"
+      || stoppedMeta.sandboxId !== capturedSandboxId
+      || (stoppedMeta.lifecycleAttemptId ?? null) !== capturedLifecycleAttemptId
+    ) return stoppedMeta;
+    if (capturedOperationId) await markHostSuspensionStopped(capturedOperationId);
+    await clearSandboxDeadline(capturedSandboxId, {
+      lifecycleAttemptId: capturedLifecycleAttemptId,
+    });
+    return stoppedMeta;
+  }
+  if (sdkStatus === "failed" || sdkStatus === "aborted") {
+    if (!(await readCapturedHostOperation()).owned) {
+      return getInitializedMeta();
+    }
+    logWarn("sandbox.snapshotting_reconciled", {
+      sandboxId: capturedSandboxId,
+      sdkStatus,
+      outcome: "failed",
+    });
+    const failedMeta = await mutateMeta((next) => {
+      if (!ownsCapturedStop(next)) return;
+      failPendingPersistentAutoSave(next);
+      next.status = "error";
+      next.lastError = `snapshot ${sdkStatus}`;
+      next.lastGatewayProbeReady = false;
+      next.activePersistentStop = null;
+    });
+    if (
+      failedMeta.status !== "error"
+      || failedMeta.sandboxId !== capturedSandboxId
+      || (failedMeta.lifecycleAttemptId ?? null) !== capturedLifecycleAttemptId
+    ) return failedMeta;
+    if (capturedOperationId) await markHostSuspensionStopped(capturedOperationId);
+    await clearSandboxDeadline(capturedSandboxId, {
+      lifecycleAttemptId: capturedLifecycleAttemptId,
+    });
+    return failedMeta;
+  }
+
+  const currentHostOperation = await readCapturedHostOperation();
+  if (!currentHostOperation.owned) return getInitializedMeta();
+  const monitoredHostSuspension = capturedOperationId && currentHostOperation.state
+    ? await ensureHostStopMonitor(currentHostOperation.state)
+    : null;
+
+  const stopRequestDeadlineElapsed = sdkStatus === "running"
+    && monitoredHostSuspension?.ingressFenced === true
+    && monitoredHostSuspension.phase === "stop-requesting"
+    && monitoredHostSuspension.stopRequestDeadlineAtMs !== null
+    && Date.now() >= monitoredHostSuspension.stopRequestDeadlineAtMs;
+
+  if (
+      monitoredHostSuspension?.ingressFenced
+      && (
+        monitoredHostSuspension.phase === "stop-requesting"
+        || monitoredHostSuspension.phase === "stopping"
+      )
+      && !stopRequestDeadlineElapsed
+      && monitoredHostSuspension.leaseExpiresAtMs !== null
+      && monitoredHostSuspension.leaseExpiresAtMs - Date.now() <= HOST_SUSPENSION_RENEW_WINDOW_MS
+  ) {
+    try {
+      const renewed = await renewHostSuspension({
+        state: monitoredHostSuspension,
+        sandbox,
+      });
+      if (monitoredHostSuspension.phase === "stop-requesting") {
+        await markHostSuspensionStopRequesting(renewed);
+      } else {
+        await markHostSuspensionStopping(renewed);
+      }
+      logInfo("sandbox.host_suspension.lease_renewed_during_stop", {
+        sandboxId: meta.sandboxId,
+        operationId: renewed.operationId,
+        leaseExpiresAtMs: renewed.leaseExpiresAtMs,
+        sdkStatus,
+      });
+    } catch (error) {
+      logWarn("sandbox.host_suspension.lease_renew_failed_during_stop", {
+        sandboxId: meta.sandboxId,
+        operationId: monitoredHostSuspension.operationId,
+        sdkStatus,
+        busy: error instanceof HostSuspensionBusyError,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Keep snapshotting metadata and the host fence. A transient control
+      // failure is not evidence that the platform stopped.
+      return meta;
+    }
+  }
+
+  if (sdkStatus === "running") {
+    if (
+      monitoredHostSuspension?.ingressFenced
+      && monitoredHostSuspension.phase === "stop-requesting"
+      && !stopRequestDeadlineElapsed
+    ) {
+      // The SDK request has not returned yet. It may already be committing
+      // server-side, so never roll admission back based on a lagging running
+      // observation; the durable monitor keeps the lease renewed.
+      return meta;
+    }
+
+    const stopTransitionAgeMs = monitoredHostSuspension?.phase === "stopping"
+      ? Date.now() - monitoredHostSuspension.updatedAtMs
+      : monitoredHostSuspension
+        ? Number.POSITIVE_INFINITY
+        : Date.now() - meta.updatedAt;
+
+    if (
+      (
+        !monitoredHostSuspension
+        || (
+          monitoredHostSuspension.ingressFenced
+          && monitoredHostSuspension.phase === "stopping"
+        )
+      )
+      && stopTransitionAgeMs < HOST_STOP_RUNNING_GRACE_MS
+    ) {
+      return meta;
+    }
+
+    if (monitoredHostSuspension?.ingressFenced) {
+      const latestMeta = await getInitializedMeta();
+      const latestSuspension = await readHostSuspensionState();
+      if (
+        !ownsCapturedStop(latestMeta)
+        || latestSuspension?.operationId !== monitoredHostSuspension.operationId
+      ) return latestMeta;
+      try {
+        const stopFailure = monitoredHostSuspension.phase === "stop-requesting"
+          ? new Error(
+              `Sandbox stop request did not commit within ${HOST_STOP_REQUEST_MAX_MS}ms.`,
+            )
+          : new Error("Sandbox remained running after non-blocking stop acceptance.");
+        await rollbackHostSuspension({
+          state: monitoredHostSuspension,
+          sandbox,
+          error: stopFailure,
+        });
+      } catch (error) {
+        logWarn("sandbox.snapshotting_running_rollback_failed", {
+          sandboxId: capturedSandboxId,
+          operationId: monitoredHostSuspension.operationId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return meta;
+      }
+    }
+
+    logWarn("sandbox.snapshotting_reconciled", {
+      sandboxId: capturedSandboxId,
+      sdkStatus,
+      outcome: "stop-not-applied-rolled-back",
+    });
+    const runningMeta = await mutateMeta((next) => {
+      if (!ownsCapturedStop(next)) return;
+      failPendingPersistentAutoSave(next);
+      next.status = "running";
+      next.portUrls = resolvePortUrls(sandbox);
+      next.lastError = "Sandbox stop was not applied; Gateway admission resumed.";
+      next.lastGatewayProbeReady = false;
+      next.activePersistentStop = null;
+    });
+    if (
+      runningMeta.status === "running"
+      && runningMeta.sandboxId === capturedSandboxId
+      && (runningMeta.lifecycleAttemptId ?? null) === capturedLifecycleAttemptId
+    ) {
+      await armSandboxDeadline(runningMeta, undefined, {
+        activityAtMs: Date.now(),
+        nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
+      });
+    }
+    return runningMeta;
+  }
+
+  if (isOperationStale(meta)) {
+    logWarn("sandbox.snapshotting_reconciled", {
+      sandboxId: meta.sandboxId,
+      sdkStatus,
+      outcome: "stale-still-transitional",
+    });
+  }
+  return meta;
 }
 
 // ---------------------------------------------------------------------------
@@ -2750,37 +4108,88 @@ export type ProbeResult = {
 };
 
 export async function probeGatewayReady(
-  options?: { timeoutMs?: number },
+  options?: { timeoutMs?: number; resume?: boolean; thaw?: boolean },
 ): Promise<ProbeResult> {
   const meta = await getInitializedMeta();
   if (!meta.sandboxId || !["running", "setup", "booting"].includes(meta.status)) {
     return { ready: false };
   }
+  const sandboxId = meta.sandboxId;
+  const lifecycleAttemptId = meta.lifecycleAttemptId ?? null;
 
   try {
-    const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
+    const sandbox = await getSandboxController().get({
+      sandboxId,
+      resume: options?.resume ?? true,
+    });
+    if (options?.resume === false && sandbox.status !== "running") {
+      return {
+        ready: false,
+        error: `Sandbox is ${sandbox.status}; read-only readiness did not resume it.`,
+      };
+    }
     const routeUrl = meta.portUrls?.[String(OPENCLAW_PORT)] ?? sandbox.domain(OPENCLAW_PORT);
+    const headers = {
+      Accept: "text/html",
+      Authorization: `Bearer ${meta.gatewayToken}`,
+      "x-openclaw-scopes": OPENCLAW_OPERATOR_SCOPES,
+    };
     const response = await fetch(routeUrl, {
       method: "GET",
-      headers: {
-        Accept: "text/html",
-        Authorization: `Bearer ${meta.gatewayToken}`,
-        "x-openclaw-scopes": OPENCLAW_OPERATOR_SCOPES,
-      },
+      headers,
       signal: AbortSignal.timeout(options?.timeoutMs ?? 5_000),
     });
     const body = await response.text();
     const markerFound = body.includes("openclaw-app");
-    const ready = response.ok && markerFound;
+    let ready = response.ok && markerFound;
 
-    if (ready && meta.status !== "running") {
+    if (ready && options?.thaw !== false) {
+      ready = await thawHostSuspensionIfNeeded({
+        sandbox,
+        lifecycleAttemptId,
+      });
+      if (!ready) {
+        return {
+          ready: false,
+          statusCode: response.status,
+          markerFound,
+          error: "Gateway is reachable but the durable host suspension has not thawed.",
+        };
+      }
+    }
+
+    let statusCode = response.status;
+    if (ready) {
+      const readinessUrl = new URL("/readyz", routeUrl).toString();
+      const readiness = await fetch(readinessUrl, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(options?.timeoutMs ?? 5_000),
+      });
+      statusCode = readiness.status;
+      ready = readiness.ok;
+      if (!ready) {
+        return {
+          ready: false,
+          statusCode,
+          markerFound,
+          error: "Gateway liveness is reachable but work admission is not ready.",
+        };
+      }
+    }
+
+    if (ready && options?.thaw !== false && meta.status !== "running") {
       await mutateMeta((next) => {
+        if (
+          next.sandboxId !== sandboxId
+          || (next.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+        ) return;
         next.status = "running";
         next.lastError = null;
       });
     }
 
-    return { ready, statusCode: response.status, markerFound };
+    return { ready, statusCode, markerFound };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logWarn("sandbox.probe_failed", { error: message });
@@ -2865,6 +4274,7 @@ export async function reconcileSandboxHealth(options: {
 
   // Metadata says running — verify with a real probe.
   const sandboxId = meta.sandboxId;
+  const lifecycleAttemptId = meta.lifecycleAttemptId ?? null;
   const probe = await probeGatewayReady();
 
   logInfo("sandbox.health_reconcile.probe_result", {
@@ -2879,8 +4289,20 @@ export async function reconcileSandboxHealth(options: {
   if (probe.ready) {
     // Refresh lastAccessedAt so the UI doesn't derive "asleep" from stale timestamps
     const freshMeta = await mutateMeta((m) => {
+      if (
+        m.status !== "running"
+        || m.sandboxId !== sandboxId
+        || (m.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+      ) return;
       m.lastAccessedAt = Date.now();
     });
+    if (
+      freshMeta.status !== "running"
+      || freshMeta.sandboxId !== sandboxId
+      || (freshMeta.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+    ) {
+      return { status: "recovering", meta: freshMeta, repaired: false };
+    }
     // Force-refresh the OIDC token on the network policy. After a timeout
     // the platform may have auto-resumed the sandbox with a stale token,
     // causing AI Gateway 401s even though the gateway process is alive.
@@ -2905,6 +4327,7 @@ export async function reconcileSandboxHealth(options: {
   await markSandboxUnavailable(
     `Health reconciliation: gateway unreachable (${options.reason})`,
     sandboxId,
+    lifecycleAttemptId,
   );
   const ensureResult = await ensureSandboxRunning(options);
   const recoveryCtx = options.op
@@ -2953,6 +4376,11 @@ async function scheduleLifecycleWork(options: {
     return;
   }
 
+  if (latest.status === "error" && terminalBundleReadyFailure(latest.lastError)) {
+    await store.releaseLock(startLockKey(), startToken);
+    return;
+  }
+
   if (isBusyStatus(latest.status) && !isOperationStale(latest)) {
     await store.releaseLock(startLockKey(), startToken);
     return;
@@ -2989,6 +4417,12 @@ async function scheduleLifecycleWork(options: {
         try {
           await createAndBootstrapSandbox(options.origin, { op: options.op });
         } catch (error) {
+          if (error instanceof LifecycleLockOwnershipLostError) {
+            logWarn("sandbox.lifecycle_lock_ownership_lost", options.op
+              ? withOperationContext(options.op, { lock: "lifecycle" })
+              : { reason: options.reason });
+            return;
+          }
           if (error instanceof LifecycleLockUnavailableError) {
             const lockCtx = options.op
               ? withOperationContext(options.op, { lock: "lifecycle", contention: true })
@@ -3003,15 +4437,30 @@ async function scheduleLifecycleWork(options: {
             return;
           }
 
-          const errMsg = error instanceof Error ? error.message : String(error);
+          const lifecycleAttemptId = error instanceof LifecycleAttemptFailedError
+            ? error.attemptId
+            : null;
+          const failure = error instanceof LifecycleAttemptFailedError
+            ? error.failure
+            : error;
+          const errMsg =
+            failure instanceof ApiError
+              ? `${failure.code}: ${failure.message}`
+              : failure instanceof Error
+                ? failure.message
+                : String(failure);
           // Capture full API error details when available (e.g. @vercel/sandbox APIError)
-          const apiErrorJson = (error as { json?: unknown }).json;
-          const apiErrorText = (error as { text?: unknown }).text;
+          const apiErrorJson = (failure as { json?: unknown }).json;
+          const apiErrorText = (failure as { text?: unknown }).text;
           const errCtx = options.op
             ? withOperationContext(options.op, { error: errMsg, ...(apiErrorJson ? { apiErrorJson } : {}), ...(apiErrorText ? { apiErrorText } : {}) })
             : { reason: options.reason, error: errMsg, ...(apiErrorJson ? { apiErrorJson } : {}), ...(apiErrorText ? { apiErrorText } : {}) };
           logError("sandbox.lifecycle_failed", errCtx);
           await mutateMeta((meta) => {
+            if (
+              lifecycleAttemptId !== null
+              && meta.lifecycleAttemptId !== lifecycleAttemptId
+            ) return;
             meta.status = "error";
             meta.lastError = errMsg;
           });
@@ -3035,12 +4484,16 @@ async function createAndBootstrapSandbox(
   origin: string,
   options?: { op?: OperationContext },
 ): Promise<SingleMeta> {
-  return withLifecycleLock(() => createAndBootstrapSandboxWithinLifecycleLock(origin, options));
+  return withLifecycleLock((lease) =>
+    createAndBootstrapSandboxWithinLifecycleLock(origin, {
+      ...options,
+      lease,
+    }));
 }
 
 async function createAndBootstrapSandboxWithinLifecycleLock(
   origin: string,
-  options?: { op?: OperationContext },
+  options?: { op?: OperationContext; lease?: AutoRenewedLockLease },
 ): Promise<SingleMeta> {
   const current = await getInitializedMeta();
   if (current.status === "running" && current.sandboxId) {
@@ -3069,6 +4522,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     return getInitializedMeta();
   }
 
+  await options?.lease?.assertOwned();
   await clearSetupProgress(instanceId);
   const initialProgress = await beginSetupProgress({
     attemptId,
@@ -3079,16 +4533,93 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
   progress.setPreview(
     isRestoreAttempt ? "Restoring persistent sandbox" : "Allocating sandbox",
   );
+  const bundleMode = Boolean(process.env.OPENCLAW_BUNDLE_URL?.trim());
+  const persistedRuntimeModeMismatch = !bundleMode && current.bundleIdentity !== null;
+  let storedBundleIdentityAdmitted: Awaited<
+    ReturnType<typeof hydrateVerifiedBundleIdentity>
+  > = null;
+  let sandbox: SandboxHandle | undefined;
+  let activeBundleCandidate = current.bundleCandidate;
+  let sandboxIsBundleCandidate = false;
+  let sandboxNeedsCandidateReplacement = false;
+  let bundleCandidateCommitted = false;
+
+  const candidateMatchesHandle = (
+    candidate: SingleMeta["bundleCandidate"],
+    lookupId: string,
+    handle: SandboxHandle,
+  ): boolean =>
+    candidate?.lookupId === lookupId
+    && (candidate.sandboxId === null || candidate.sandboxId === handle.sandboxId)
+    && handle.tags?.[BUNDLE_CANDIDATE_OWNERSHIP_TAG]
+      === candidate.ownershipToken;
+
+  const candidateReplacesHandle = (
+    candidate: SingleMeta["bundleCandidate"],
+    lookupId: string,
+    handle: SandboxHandle,
+  ): boolean =>
+    candidate?.lookupId === lookupId
+    && candidate.replacesOwnershipToken !== null
+    && handle.tags?.[BUNDLE_CANDIDATE_OWNERSHIP_TAG]
+      === candidate.replacesOwnershipToken;
+
+  const candidateAuthorizesCleanup = (
+    candidate: SingleMeta["bundleCandidate"],
+    lookupId: string,
+    handle: SandboxHandle,
+  ): boolean =>
+    candidateMatchesHandle(candidate, lookupId, handle)
+    || candidateReplacesHandle(candidate, lookupId, handle);
+
+  const sameBundleCandidate = (
+    left: SingleMeta["bundleCandidate"],
+    right: SingleMeta["bundleCandidate"],
+  ): boolean =>
+    left?.lookupId === right?.lookupId
+    && left?.sandboxId === right?.sandboxId
+    && left?.ownershipToken === right?.ownershipToken
+    && left?.replacesOwnershipToken === right?.replacesOwnershipToken
+    && left?.lifecycleAttemptId === right?.lifecycleAttemptId;
+
+  const assertCandidateDeleteOwnership = async (
+    lookupId: string,
+    handle: SandboxHandle,
+  ): Promise<void> => {
+    await options?.lease?.assertOwned();
+    const latest = await getInitializedMeta();
+    if (
+      latest.lifecycleAttemptId !== attemptId
+      || !sameBundleCandidate(latest.bundleCandidate, activeBundleCandidate)
+      || !candidateAuthorizesCleanup(latest.bundleCandidate, lookupId, handle)
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+  };
+
+  const assertCandidateIntentOwnership = async (): Promise<void> => {
+    await options?.lease?.assertOwned();
+    const latest = await getInitializedMeta();
+    if (
+      latest.lifecycleAttemptId !== attemptId
+      || !sameBundleCandidate(latest.bundleCandidate, activeBundleCandidate)
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+  };
 
   try {
     logInfo("sandbox.status_transition", ctx({
       from: current.status,
       to: isRestoreAttempt ? "restoring" : "creating",
     }));
-    await mutateMeta((meta) => {
+    await options?.lease?.assertOwned();
+    const startedMeta = await mutateMeta((meta) => {
+      if (meta.lifecycleAttemptId !== current.lifecycleAttemptId) return;
       meta.status = isRestoreAttempt ? "restoring" : "creating";
       meta.lastError = null;
       meta.lifecycleAttemptId = attemptId;
+      meta.activePersistentStop = null;
 
       if (!isRestoreAttempt) {
         // Creating a brand-new sandbox invalidates any previously prepared restore target.
@@ -3105,9 +4636,18 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         meta.restorePreparedAt = null;
       }
     });
+    if (startedMeta.lifecycleAttemptId !== attemptId) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+    if (bundleMode) {
+      storedBundleIdentityAdmitted = await hydrateVerifiedBundleIdentity(
+        current.bundleIdentity,
+      );
+    }
 
     const vcpus = getSandboxVcpus();
-    const sleepAfterMs = getSandboxSleepAfterMs();
+    const desiredIdleMs = getSandboxSleepAfterMs();
+    const sleepAfterMs = getSandboxPlatformTimeoutMs();
     // Sandbox names must be lowercase alphanumeric + hyphens.
     const sandboxName = `oc-${current.id.replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`;
     logInfo("sandbox.create.params", ctx({
@@ -3116,37 +4656,176 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       persistent: true,
       vcpus,
       sleepAfterMs,
+      desiredIdleMs,
     }));
 
     // Hot-spare fast path: try to promote a pre-created candidate sandbox.
     // If promotion succeeds, skip the normal get/create flow entirely.
     // Gated — no-op when OPENCLAW_HOT_SPARE_ENABLED is not "true".
-    let sandbox: SandboxHandle | undefined;
-    let sandboxWasCreated = false;
     const unhealthyResumeStatuses = new Set<string>([
       "failed",
       "error",
       "aborted",
       "stopped",
     ]);
+    const metaOwnsBundleCandidate = (
+      meta: SingleMeta,
+      handle: SandboxHandle,
+    ): boolean =>
+      sameBundleCandidate(meta.bundleCandidate, activeBundleCandidate)
+      && activeBundleCandidate !== null
+      && candidateMatchesHandle(
+        meta.bundleCandidate,
+        activeBundleCandidate.lookupId,
+        handle,
+      );
+
+    const assertAcquiredSandboxOwnership = async (
+      handle: SandboxHandle,
+    ): Promise<void> => {
+      await options?.lease?.assertOwned();
+      const latest = await getInitializedMeta();
+      if (
+        latest.lifecycleAttemptId !== attemptId
+        || (
+          bundleMode
+          && sandboxIsBundleCandidate
+          && !metaOwnsBundleCandidate(latest, handle)
+        )
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+    };
+
+    const assertSandboxGenerationOwnership = async (
+      handle: SandboxHandle,
+      requireBundleCandidate: boolean,
+    ): Promise<void> => {
+      await options?.lease?.assertOwned();
+      const latest = await getInitializedMeta();
+      const candidateOwned = !requireBundleCandidate
+        || metaOwnsBundleCandidate(latest, handle);
+      if (
+        latest.lifecycleAttemptId !== attemptId
+        || latest.sandboxId !== handle.sandboxId
+        || !candidateOwned
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+    };
+
+    const persistBundleCandidateHandle = async (
+      lookupId: string,
+      handle: SandboxHandle,
+    ): Promise<void> => {
+      const candidateOwner = activeBundleCandidate?.ownershipToken;
+      if (
+        !candidateOwner
+        || handle.tags?.[BUNDLE_CANDIDATE_OWNERSHIP_TAG] !== candidateOwner
+      ) {
+        throw new Error("Created sandbox did not preserve its bundle ownership tag.");
+      }
+      const next = await mutateMeta((meta) => {
+        if (meta.lifecycleAttemptId !== attemptId) return;
+        meta.bundleCandidate = {
+          lookupId,
+          sandboxId: handle.sandboxId,
+          ownershipToken: candidateOwner,
+          replacesOwnershipToken: null,
+          lifecycleAttemptId: attemptId,
+          createdAt: meta.bundleCandidate?.createdAt ?? Date.now(),
+        };
+      });
+      if (
+        next.bundleCandidate?.lifecycleAttemptId !== attemptId
+        || !candidateMatchesHandle(next.bundleCandidate, lookupId, handle)
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      activeBundleCandidate = next.bundleCandidate;
+    };
+
     const createPersistentSandbox = async (
       conflictMode: "resume" | "replace",
-    ): Promise<{ handle: SandboxHandle; created: boolean }> => {
-      const create = async () =>
-        getSandboxController().create({
+      rotateOwnership = false,
+    ): Promise<{
+      handle: SandboxHandle;
+      bundleCandidate: boolean;
+      created: boolean;
+      replaceBeforeBootstrap: boolean;
+    }> => {
+      const persistBundleCandidateIntent = async (
+        replaceCurrentOwnership: boolean,
+      ): Promise<void> => {
+        const intent = await mutateMeta((meta) => {
+          if (meta.lifecycleAttemptId !== attemptId) return;
+          const replacedOwner = replaceCurrentOwnership
+            && meta.bundleCandidate?.lookupId === sandboxName
+            ? meta.bundleCandidate.ownershipToken
+            : null;
+          meta.bundleCandidate = {
+            lookupId: sandboxName,
+            sandboxId: null,
+            ownershipToken: randomUUID(),
+            replacesOwnershipToken: replacedOwner,
+            lifecycleAttemptId: attemptId,
+            createdAt: Date.now(),
+          };
+        });
+        if (intent.bundleCandidate?.lifecycleAttemptId !== attemptId) {
+          throw new LifecycleLockOwnershipLostError();
+        }
+        activeBundleCandidate = intent.bundleCandidate;
+      };
+
+      if (
+        bundleMode
+        && (
+          activeBundleCandidate?.lookupId !== sandboxName
+          || rotateOwnership
+        )
+      ) {
+        await persistBundleCandidateIntent(rotateOwnership);
+      }
+
+      const create = async (): Promise<SandboxHandle> => {
+        const candidateOwner = activeBundleCandidate?.ownershipToken;
+        if (bundleMode && !candidateOwner) {
+          throw new Error("Bundle candidate ownership intent is missing.");
+        }
+        const runtimeEnv = await buildRuntimeEnv();
+        if (bundleMode) {
+          await assertCandidateIntentOwnership();
+        } else {
+          await options?.lease?.assertOwned();
+        }
+        const handle = await getSandboxController().create({
           name: sandboxName,
           persistent: true,
           ports: SANDBOX_PORTS,
           timeout: sleepAfterMs,
           resources: { vcpus },
-          ...(await buildRuntimeEnv()),
+          ...runtimeEnv,
+          ...(candidateOwner
+            ? { tags: { [BUNDLE_CANDIDATE_OWNERSHIP_TAG]: candidateOwner } }
+            : {}),
         });
+        if (bundleMode) {
+          await persistBundleCandidateHandle(sandboxName, handle);
+        }
+        return handle;
+      };
 
       try {
-        return { handle: await create(), created: true };
+        return {
+          handle: await create(),
+          bundleCandidate: bundleMode,
+          created: true,
+          replaceBeforeBootstrap: false,
+        };
       } catch (createErr) {
         const apiJson = (createErr as { json?: unknown }).json;
-        const status = (createErr as { status?: unknown }).status;
+        const status = sandboxApiStatus(createErr);
         if (status !== 409) {
           logError("sandbox.create.failed", ctx({
             sandboxName,
@@ -3175,9 +4854,20 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           try {
             const recovered = await getSandboxController().get({
               sandboxId: sandboxName,
-              resume: true,
+              resume: false,
             });
-            if (unhealthyResumeStatuses.has(recovered.status)) {
+            const interruptedBundleCandidate = bundleMode
+              && candidateAuthorizesCleanup(
+                activeBundleCandidate,
+                sandboxName,
+                recovered,
+              );
+            if (
+              !bundleMode
+              &&
+              !interruptedBundleCandidate
+              && unhealthyResumeStatuses.has(recovered.status)
+            ) {
               throw new Error(
                 `name_conflict_resume_unhealthy_handle:${recovered.status}:${recovered.sandboxId}`,
               );
@@ -3186,7 +4876,12 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
               "system",
               `Recovered: ${recovered.sandboxId} status=${recovered.status}`,
             );
-            return { handle: recovered, created: false };
+            return {
+              handle: recovered,
+              bundleCandidate: interruptedBundleCandidate,
+              created: false,
+              replaceBeforeBootstrap: interruptedBundleCandidate,
+            };
           } catch (getErr) {
             logError("sandbox.create.name_conflict_get_fallback_failed", ctx({
               sandboxName,
@@ -3200,27 +4895,80 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           }
         }
 
-        // Identity mismatch must never adopt the conflicting handle. Delete
-        // any still-bound name and retry one fresh create after the SDK calls
-        // complete, covering delayed persistent-name release without reusing
-        // partial bundle state.
+        // Replacement is authorized only by the durable candidate record.
+        // Keep that record until a fresh create returns and atomically swaps it.
+        let conflicting: SandboxHandle | null = null;
         try {
-          const conflicting = await getSandboxController().get({
+          conflicting = await getSandboxController().get({
             sandboxId: sandboxName,
-            resume: true,
+            resume: false,
           });
-          await conflicting.delete();
         } catch (getOrDeleteErr) {
-          logWarn("sandbox.create.name_conflict_replacement_cleanup_failed", ctx({
-            sandboxName,
-            error:
-              getOrDeleteErr instanceof Error
-                ? getOrDeleteErr.message
-                : String(getOrDeleteErr),
-          }));
+          if (isSandboxGoneError(getOrDeleteErr)) {
+            conflicting = null;
+          } else {
+            logWarn("sandbox.create.name_conflict_replacement_lookup_failed", ctx({
+              sandboxName,
+              error:
+                getOrDeleteErr instanceof Error
+                  ? getOrDeleteErr.message
+                  : String(getOrDeleteErr),
+            }));
+            throw createErr;
+          }
         }
+
+        if (conflicting) {
+          const conflictHandle = conflicting;
+          const ownsConflict = bundleMode
+            && candidateAuthorizesCleanup(
+              activeBundleCandidate,
+              sandboxName,
+              conflicting,
+            );
+          if (!ownsConflict) {
+            return {
+              handle: conflicting,
+              bundleCandidate: false,
+              created: false,
+              replaceBeforeBootstrap: false,
+            };
+          }
+          const deletesCurrentOwnership = candidateMatchesHandle(
+            activeBundleCandidate,
+            sandboxName,
+            conflicting,
+          );
+          try {
+            await assertCandidateDeleteOwnership(sandboxName, conflicting);
+            await conflicting.delete();
+          } catch (getOrDeleteErr) {
+            if (isSandboxGoneError(getOrDeleteErr)) {
+              conflicting = null;
+            } else {
+              logWarn("sandbox.create.name_conflict_replacement_cleanup_failed", ctx({
+                sandboxName,
+                error:
+                  getOrDeleteErr instanceof Error
+                    ? getOrDeleteErr.message
+                    : String(getOrDeleteErr),
+              }));
+              throw getOrDeleteErr;
+            }
+          }
+          await assertCandidateDeleteOwnership(sandboxName, conflictHandle);
+          if (deletesCurrentOwnership) {
+            await persistBundleCandidateIntent(true);
+          }
+        }
+
         try {
-          return { handle: await create(), created: true };
+          return {
+            handle: await create(),
+            bundleCandidate: bundleMode,
+            created: true,
+            replaceBeforeBootstrap: false,
+          };
         } catch (retryErr) {
           logError("sandbox.create.name_conflict_replacement_failed", ctx({
             sandboxName,
@@ -3234,17 +4982,55 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         }
       }
     };
-    if (isHotSpareEnabled()) {
+
+    // Recover a prior uncommitted candidate before consulting any other
+    // sandbox. Its lookup ID survives a lost create response or hot-spare
+    // promotion, while the optional actual ID prevents adopting a replacement.
+    if (bundleMode && activeBundleCandidate) {
+      try {
+        const recoveredCandidate = await getSandboxController().get({
+          sandboxId: activeBundleCandidate.lookupId,
+          resume: false,
+        });
+        sandbox = recoveredCandidate;
+        sandboxIsBundleCandidate = candidateAuthorizesCleanup(
+          activeBundleCandidate,
+          activeBundleCandidate.lookupId,
+          recoveredCandidate,
+        );
+        sandboxNeedsCandidateReplacement = sandboxIsBundleCandidate;
+      } catch (error) {
+        if (!isSandboxGoneError(error)) throw error;
+        // A named create can be visible after a transient 404. Keep its
+        // durable intent until the replacement POST retargets or commits it.
+        logInfo("sandbox.create.bundle_candidate_temporarily_missing", ctx({
+          lookupId: activeBundleCandidate.lookupId,
+        }));
+      }
+    }
+
+    if (!sandbox && bundleMode && isHotSpareEnabled()) {
+      logWarn("sandbox.create.hot_spare_bundle_disabled", ctx({
+        reason: "persistent-name-and-bundle-identity-not-preserved",
+      }));
+    }
+    if (!sandbox && !bundleMode && isHotSpareEnabled()) {
       try {
         const promoteResult = await promoteHotSpare(current, {
           get: (opts) => getSandboxController().get(opts),
         });
         if (promoteResult.status === "promoted" && promoteResult.promotedSandboxId) {
-          sandbox = await getSandboxController().get({ sandboxId: promoteResult.promotedSandboxId });
-          await mutateMeta((m) => applyPromoteToMeta(m, promoteResult));
-          progress.appendLine("system", `Hot-spare promoted: ${sandbox.sandboxId}`);
+          const promotedLookupId = promoteResult.promotedSandboxId;
+          const promoted = await getSandboxController().get({
+            sandboxId: promotedLookupId,
+          });
+          await mutateMeta((meta) => applyPromoteToMeta(meta, promoteResult));
+          sandbox = promoted;
+          sandboxIsBundleCandidate = false;
+          sandboxNeedsCandidateReplacement = false;
+          progress.appendLine("system", `Hot-spare promoted: ${promoted.sandboxId}`);
           logInfo("sandbox.create.hot_spare_promoted", ctx({
-            promotedSandboxId: sandbox.sandboxId,
+            promotedSandboxId: promoted.sandboxId,
           }));
         } else if (promoteResult.status === "failed") {
           // Promotion failed — clear stale hot-spare state and fall through.
@@ -3266,7 +5052,18 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     if (!sandbox) {
     try {
       progress.appendLine("system", `Resuming persistent sandbox: ${sandboxName}`);
-      const resumedHandle = await getSandboxController().get({ sandboxId: sandboxName, resume: true });
+      const resumedHandle = await getSandboxController().get({
+        sandboxId: sandboxName,
+        resume: !bundleMode && !persistedRuntimeModeMismatch,
+      });
+      const resumedBundleCandidate = bundleMode
+        && candidateAuthorizesCleanup(
+          activeBundleCandidate,
+          sandboxName,
+          resumedHandle,
+        );
+      sandboxIsBundleCandidate = resumedBundleCandidate;
+      sandboxNeedsCandidateReplacement = resumedBundleCandidate;
       // Reject unhealthy statuses that @vercel/sandbox will happily return
       // from get(). The SDK wraps any existing sandbox — including ones that
       // failed to boot, were aborted, or remain stopped after an explicit
@@ -3278,7 +5075,12 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       // persistent name; ignore failures (the name is already bound to a
       // dead handle and create-by-name will 409 and get()-fallback if the
       // delete didn't take).
-      if (unhealthyResumeStatuses.has(resumedHandle.status)) {
+      if (
+        !bundleMode
+        &&
+        !resumedBundleCandidate
+        && unhealthyResumeStatuses.has(resumedHandle.status)
+      ) {
         logWarn("sandbox.create.resume_unhealthy_handle", ctx({
           sandboxId: resumedHandle.sandboxId,
           sandboxStatus: resumedHandle.status,
@@ -3302,7 +5104,19 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       }
       sandbox = resumedHandle;
       progress.appendLine("system", `Resumed: ${sandbox.sandboxId} status=${sandbox.status}`);
-    } catch {
+    } catch (resumeError) {
+      if (
+        resumeError instanceof SandboxBundleMigrationRequiredError
+        || resumeError instanceof ApiError
+      ) {
+        throw resumeError;
+      }
+      // Only a definitive platform absence authorizes a named create. A
+      // transient lookup failure could hide existing user state; stamping an
+      // intent then would falsely make that state deletable on the next retry.
+      if (bundleMode && !isSandboxGoneError(resumeError)) {
+        throw resumeError;
+      }
       if (isRestoreAttempt) {
         progress.setPhase("creating-sandbox", "Creating sandbox");
         progress.setPreview("Allocating sandbox");
@@ -3324,21 +5138,169 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       progress.appendLine("system", `No existing sandbox — creating: ${sandboxName}`);
       const createResult = await createPersistentSandbox("resume");
       sandbox = createResult.handle;
-      sandboxWasCreated = createResult.created;
+      sandboxIsBundleCandidate = createResult.bundleCandidate;
+      sandboxNeedsCandidateReplacement = createResult.replaceBeforeBootstrap;
       if (createResult.created) {
         progress.appendLine("system", `Created: ${sandbox.sandboxId}`);
       }
     }
     } // end if (!sandbox)
 
+    if (
+      bundleMode
+      && sandboxNeedsCandidateReplacement
+      && sandbox
+    ) {
+      // The previous attempt never committed a verified receipt to host
+      // metadata. Delete its candidate instead of misclassifying it as
+      // user state that needs an explicit migration.
+      const interruptedSandboxId = sandbox.sandboxId;
+      const interruptedLookupId = activeBundleCandidate?.lookupId;
+      if (!interruptedLookupId) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      try {
+        await assertCandidateDeleteOwnership(interruptedLookupId, sandbox);
+        await sandbox.delete();
+      } catch (error) {
+        if (!isSandboxGoneError(error)) {
+          throw new ApiError(
+            502,
+            "OPENCLAW_BUNDLE_CANDIDATE_CLEANUP_FAILED",
+            `Failed to delete interrupted bundle candidate ${interruptedSandboxId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      await assertCandidateDeleteOwnership(interruptedLookupId, sandbox);
+      sandbox = undefined;
+      sandboxIsBundleCandidate = false;
+      sandboxNeedsCandidateReplacement = false;
+      const replacement = await createPersistentSandbox("replace", true);
+      sandbox = replacement.handle;
+      sandboxIsBundleCandidate = replacement.bundleCandidate;
+      sandboxNeedsCandidateReplacement = replacement.replaceBeforeBootstrap;
+      progress.appendLine("system", `Replaced interrupted candidate: ${sandbox.sandboxId}`);
+    }
+
+    if (!sandbox) {
+      throw new Error("Sandbox acquisition completed without a handle.");
+    }
+    if (
+      !sandboxIsBundleCandidate
+      && (bundleMode || persistedRuntimeModeMismatch)
+    ) {
+      const persistedSandbox = sandbox;
+      if (!bundleMode || !storedBundleIdentityAdmitted) {
+        const migrationOwner = await mutateMeta((meta) => {
+          if (meta.lifecycleAttemptId !== attemptId) return;
+          meta.sandboxId = persistedSandbox.sandboxId;
+          meta.portUrls = null;
+        });
+        if (
+          migrationOwner.lifecycleAttemptId !== attemptId
+          || migrationOwner.sandboxId !== persistedSandbox.sandboxId
+        ) throw new LifecycleLockOwnershipLostError();
+
+        if (persistedSandbox.status !== "running") {
+          const migrationMeta = await mutateMeta((meta) => {
+            if (
+              meta.lifecycleAttemptId !== attemptId
+              || meta.sandboxId !== persistedSandbox.sandboxId
+            ) return;
+            meta.status = "error";
+            meta.lastError = BUNDLE_MIGRATION_REQUIRED_LAST_ERROR;
+            meta.lastGatewayProbeReady = false;
+          });
+          if (
+            migrationMeta.status !== "error"
+            || !stableBundleReadyFailure(migrationMeta.lastError)
+          ) throw new LifecycleLockOwnershipLostError();
+          throw new SandboxBundleMigrationRequiredError();
+        }
+
+        const quiesced = await quiesceSandboxForBundleMigration({
+          sandbox: persistedSandbox,
+          lifecycleAttemptId: attemptId,
+          lease: options?.lease,
+        });
+        if (!quiesced) {
+          progress.appendLine(
+            "system",
+            "Bundle migration stop is still reconciling in the background",
+          );
+          return getInitializedMeta();
+        }
+        throw new SandboxBundleMigrationRequiredError();
+      }
+
+      if (persistedSandbox.status === "stopped") {
+        await options?.lease?.assertOwned();
+        const resumed = await getSandboxController().get({
+          sandboxId: persistedSandbox.sandboxId,
+          resume: true,
+        });
+        if (resumed.status !== "running") {
+          throw new ApiError(
+            503,
+            "SANDBOX_RESUME_NOT_RUNNING",
+            `Sandbox resume returned status ${resumed.status}.`,
+          );
+        }
+        sandbox = resumed;
+      } else if (persistedSandbox.status !== "running") {
+        const migrationMeta = await mutateMeta((meta) => {
+          if (meta.lifecycleAttemptId !== attemptId) return;
+          meta.status = "error";
+          meta.sandboxId = persistedSandbox.sandboxId;
+          meta.portUrls = null;
+          meta.lastError = BUNDLE_MIGRATION_REQUIRED_LAST_ERROR;
+          meta.lastGatewayProbeReady = false;
+        });
+        if (
+          migrationMeta.status !== "error"
+          || !stableBundleReadyFailure(migrationMeta.lastError)
+        ) throw new LifecycleLockOwnershipLostError();
+        throw new SandboxBundleMigrationRequiredError();
+      }
+    }
     const initialSandbox = sandbox;
+    // A persisted sandbox may have been created before the durable stop
+    // coordinator added its safety runway. Establish the current platform
+    // deadline before running restore/setup commands.
+    const timeoutRemainingMs = initialSandbox.timeoutRemaining;
+    const timeoutExtensionMs = getSandboxTimeoutExtensionMs({
+      currentTotalMs: initialSandbox.timeout,
+      currentRemainingMs: timeoutRemainingMs,
+      targetRemainingMs: sleepAfterMs,
+    });
+    if (timeoutExtensionMs > 0) {
+      await assertAcquiredSandboxOwnership(initialSandbox);
+      await initialSandbox.extendTimeout(timeoutExtensionMs);
+    }
+
     logInfo("sandbox.status_transition", ctx({ from: "creating", to: "setup", sandboxId: initialSandbox.sandboxId, sandboxStatus: initialSandbox.status, vcpus, sleepAfterMs }));
-    await mutateMeta((meta) => {
+    await assertAcquiredSandboxOwnership(initialSandbox);
+    const setupMeta = await mutateMeta((meta) => {
+      if (
+        meta.lifecycleAttemptId !== attemptId
+        || (
+          bundleMode
+          && sandboxIsBundleCandidate
+          && !metaOwnsBundleCandidate(meta, initialSandbox)
+        )
+      ) return;
       meta.status = "setup";
       meta.sandboxId = initialSandbox.sandboxId;
       meta.portUrls = resolvePortUrls(initialSandbox);
       meta.lastAccessedAt = Date.now();
     });
+    if (
+      setupMeta.lifecycleAttemptId !== attemptId
+      || setupMeta.sandboxId !== initialSandbox.sandboxId
+      || setupMeta.status !== "setup"
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
 
     let isResumed: boolean;
     if (process.env.OPENCLAW_BUNDLE_URL?.trim()) {
@@ -3367,42 +5329,53 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         verifiedBundleIdentitiesEqual(markerIdentity, currentIdentity),
       );
 
-      // A bundle file can be left behind by a failed bootstrap. The identity
-      // receipt is written last, after digest checks and external plugin
-      // installation, so only that receipt can authorize persistent reuse.
-      if (!isResumed && !sandboxWasCreated) {
+      // The receipt is written last, after digest checks and external plugin
+      // installation. Existing state without the exact durable identity must
+      // be migrated or explicitly reset, never deleted as a bootstrap detail.
+      if (!isResumed && !sandboxIsBundleCandidate) {
+        const mismatchedSandbox = sandbox;
         logWarn("sandbox.create.bundle_identity_mismatch", ctx({
-          sandboxId: sandbox.sandboxId,
+          sandboxId: mismatchedSandbox.sandboxId,
           markerPresent,
           persistedIdentityPresent: latest.bundleIdentity !== null,
         }));
         progress.appendLine(
           "system",
-          "Bundle identity missing or stale — replacing persistent sandbox",
+          "Bundle identity missing or stale — explicit migration or reset required",
         );
-        await sandbox.delete();
-        const replacementSandbox = (
-          await createPersistentSandbox("replace")
-        ).handle;
-        sandbox = replacementSandbox;
-        sandboxWasCreated = true;
-        await mutateMeta((meta) => {
-          meta.status = "setup";
-          meta.sandboxId = replacementSandbox.sandboxId;
-          meta.portUrls = resolvePortUrls(replacementSandbox);
-          meta.bundleIdentity = null;
-          meta.snapshotId = null;
-          meta.snapshotConfigHash = null;
-          meta.snapshotDynamicConfigHash = null;
-          meta.snapshotAssetSha256 = null;
-          meta.persistedStateDynamicConfigHash = null;
-          meta.persistedStateAssetSha256 = null;
-          meta.persistedStateSavedAt = null;
-          meta.persistedStateSource = null;
-          meta.restorePreparedStatus = "dirty";
-          meta.restorePreparedReason = "snapshot-missing";
-          meta.restorePreparedAt = null;
+        await assertSandboxGenerationOwnership(mismatchedSandbox, false);
+        const quiesced = await quiesceSandboxForBundleMigration({
+          sandbox: mismatchedSandbox,
+          lifecycleAttemptId: attemptId,
+          lease: options?.lease,
         });
+        if (!quiesced) {
+          progress.appendLine(
+            "system",
+            "Bundle migration stop is still reconciling in the background",
+          );
+          return getInitializedMeta();
+        }
+        await assertSandboxGenerationOwnership(mismatchedSandbox, false);
+        const migrationMeta = await mutateMeta((meta) => {
+          if (meta.lifecycleAttemptId !== attemptId) return;
+          meta.status = "error";
+          meta.sandboxId = mismatchedSandbox.sandboxId;
+          meta.portUrls = null;
+          meta.lastAccessedAt = current.lastAccessedAt;
+          meta.lastError = BUNDLE_MIGRATION_REQUIRED_LAST_ERROR;
+          meta.lifecycleAttemptId = current.lifecycleAttemptId;
+          meta.bundleIdentity = current.bundleIdentity;
+          meta.bundleCandidate = activeBundleCandidate;
+        });
+        if (
+          migrationMeta.status !== "error"
+          || migrationMeta.sandboxId !== mismatchedSandbox.sandboxId
+          || !stableBundleReadyFailure(migrationMeta.lastError)
+        ) {
+          throw new LifecycleLockOwnershipLostError();
+        }
+        throw new SandboxBundleMigrationRequiredError();
       }
     } else {
       // NOTE: This command is the implicit resume trigger for stopped npm
@@ -3572,11 +5545,43 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         telegramSecretSyncMs,
       };
 
+      // Gateway admission must resume before host ingress sees this restored
+      // sandbox as running. A replacement sandbox clears the old process-local
+      // suspension; a resumed sandbox releases the persisted lease explicitly.
+      await assertSandboxGenerationOwnership(
+        initialSandbox,
+        bundleMode && sandboxIsBundleCandidate,
+      );
+      if (!await thawHostSuspensionIfNeeded({
+        sandbox,
+        lifecycleAttemptId: attemptId,
+      })) {
+        throw new Error("Restored sandbox Gateway admission could not be resumed.");
+      }
+      await assertSandboxGenerationOwnership(
+        initialSandbox,
+        bundleMode && sandboxIsBundleCandidate,
+      );
+
       // Record token metadata and restore metrics.
-      await mutateMeta((meta) => {
+      await assertSandboxGenerationOwnership(
+        initialSandbox,
+        bundleMode && sandboxIsBundleCandidate,
+      );
+      const resumedMeta = await mutateMeta((meta) => {
+        if (
+          meta.lifecycleAttemptId !== attemptId
+          || meta.sandboxId !== initialSandbox.sandboxId
+          || (
+            bundleMode
+            && sandboxIsBundleCandidate
+            && !metaOwnsBundleCandidate(meta, initialSandbox)
+          )
+        ) return;
         meta.status = "running";
-        meta.sandboxId = sandbox.sandboxId;
-        meta.portUrls = resolvePortUrls(sandbox);
+        meta.sandboxId = initialSandbox.sandboxId;
+        meta.portUrls = resolvePortUrls(initialSandbox);
+        meta.bundleCandidate = null;
         meta.lastAccessedAt = Date.now();
         meta.lastError = null;
         meta.lastRestoreMetrics = metrics;
@@ -3590,6 +5595,20 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           meta.lastTokenSource = credential.source;
           meta.lastTokenExpiresAt = credential.expiresAt ?? null;
         }
+      });
+      if (
+        resumedMeta.lifecycleAttemptId !== attemptId
+        || resumedMeta.sandboxId !== initialSandbox.sandboxId
+        || resumedMeta.status !== "running"
+        || (bundleMode && resumedMeta.bundleCandidate !== null)
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      // The verified sandbox receipt and host identity are committed by the
+      // running-state CAS. Later deadline/progress failures must not delete it.
+      bundleCandidateCommitted = !bundleMode || resumedMeta.bundleIdentity !== null;
+      await armSandboxDeadline(resumedMeta, undefined, {
+        nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
       });
       await progress.completeSetupProgress("Sandbox resumed");
 
@@ -3625,14 +5644,28 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       progress,
     });
 
+    await assertSandboxGenerationOwnership(
+      initialSandbox,
+      bundleMode && sandboxIsBundleCandidate,
+    );
     const pending = await mutateMeta((meta) => {
+      if (
+        meta.lifecycleAttemptId !== attemptId
+        || meta.sandboxId !== initialSandbox.sandboxId
+        || (
+          bundleMode
+          && sandboxIsBundleCandidate
+          && !metaOwnsBundleCandidate(meta, initialSandbox)
+        )
+      ) return;
       meta.status = "setup";
-      meta.sandboxId = sandbox.sandboxId;
-      meta.portUrls = resolvePortUrls(sandbox);
+      meta.sandboxId = initialSandbox.sandboxId;
+      meta.portUrls = resolvePortUrls(initialSandbox);
       meta.lastAccessedAt = Date.now();
       meta.startupScript = setupResult.startupScript;
       meta.openclawVersion = setupResult.openclawVersion;
       meta.bundleIdentity = setupResult.bundleIdentity;
+      meta.bundleCandidate = null;
       meta.lastError = null;
       // Record token metadata from the credential used during boot.
       if (credential) {
@@ -3641,6 +5674,44 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         meta.lastTokenExpiresAt = credential.expiresAt ?? null;
       }
     });
+    if (
+      pending.lifecycleAttemptId !== attemptId
+      || pending.sandboxId !== initialSandbox.sandboxId
+      || (bundleMode && (
+        pending.bundleCandidate !== null
+        || setupResult.bundleIdentity === null
+        || pending.bundleIdentity === null
+        || !verifiedBundleIdentitiesEqual(
+          pending.bundleIdentity,
+          setupResult.bundleIdentity,
+        )
+      ))
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+    bundleCandidateCommitted = !bundleMode || setupResult.bundleIdentity !== null;
+
+    const metaOwnsCommittedSandbox = (meta: SingleMeta): boolean =>
+      meta.lifecycleAttemptId === attemptId
+      && meta.sandboxId === initialSandbox.sandboxId
+      && (
+        !bundleMode
+        || (
+          meta.bundleCandidate === null
+          && pending.bundleIdentity !== null
+          && meta.bundleIdentity !== null
+          && verifiedBundleIdentitiesEqual(
+            meta.bundleIdentity,
+            pending.bundleIdentity,
+          )
+        )
+      );
+    const assertCommittedSandboxOwnership = async (): Promise<void> => {
+      await options?.lease?.assertOwned();
+      if (!metaOwnsCommittedSandbox(await getInitializedMeta())) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+    };
 
     // Apply firewall policy and record structured outcome before marking running.
     const firewallPolicy = toNetworkPolicy(
@@ -3656,8 +5727,10 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     let firewallError: string | null = null;
     const firewallStartedAt = Date.now();
     try {
+      await assertCommittedSandboxOwnership();
       progress.setPhase("applying-firewall", `Applying ${pending.firewall.mode} firewall policy`);
       await applyFirewallPolicyToSandbox(sandbox, pending, apiKey);
+      await assertCommittedSandboxOwnership();
       firewallApplied = true;
     } catch (err) {
       firewallError = err instanceof Error ? err.message : String(err);
@@ -3671,7 +5744,9 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     const firewallDurationMs = firewallCompletedAt - firewallStartedAt;
 
     // Record firewall sync outcome in metadata.
-    await mutateMeta((meta) => {
+    await assertCommittedSandboxOwnership();
+    const firewallMeta = await mutateMeta((meta) => {
+      if (!metaOwnsCommittedSandbox(meta)) return;
       const outcome: import("@/shared/types").FirewallSyncOutcome = {
         timestamp: firewallCompletedAt,
         durationMs: firewallDurationMs,
@@ -3688,6 +5763,9 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         meta.firewall.lastSyncFailedAt = firewallCompletedAt;
       }
     });
+    if (!metaOwnsCommittedSandbox(firewallMeta)) {
+      throw new LifecycleLockOwnershipLostError();
+    }
 
     // In enforcing mode, firewall sync failure is a hard blocker — the
     // sandbox must not become available without its network policy applied.
@@ -3698,24 +5776,49 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       }));
 
       try {
+        await assertCommittedSandboxOwnership();
         await sandbox.stop({ blocking: true });
+        await assertCommittedSandboxOwnership();
       } catch (stopError) {
+        if (stopError instanceof LifecycleLockOwnershipLostError) {
+          throw stopError;
+        }
         logWarn("sandbox.create.firewall_sync_cleanup_failed", ctx({
           sandboxId: sandbox.sandboxId,
           error: stopError instanceof Error ? stopError.message : String(stopError),
         }));
       }
 
-      await mutateMeta((meta) => {
+      const failedMeta = await mutateMeta((meta) => {
+        if (!metaOwnsCommittedSandbox(meta)) return;
         meta.status = "error";
         meta.lastError = `Firewall sync failed during create: ${firewallError}`;
         meta.sandboxId = null;
         meta.portUrls = null;
       });
+      if (
+        failedMeta.lifecycleAttemptId !== attemptId
+        || failedMeta.status !== "error"
+        || failedMeta.sandboxId !== null
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
       await progress.failSetupProgress(`Firewall sync failed during create: ${firewallError}`);
 
       return getInitializedMeta();
     }
+
+    // A restore can fall back to a fresh replacement sandbox. Clear the old
+    // process-local suspension only after the replacement Gateway is ready,
+    // before publishing the replacement as running to ingress.
+    await assertCommittedSandboxOwnership();
+    if (!await thawHostSuspensionIfNeeded({
+      sandbox,
+      lifecycleAttemptId: attemptId,
+    })) {
+      throw new Error("Replacement sandbox Gateway admission could not be resumed.");
+    }
+    await assertCommittedSandboxOwnership();
 
     logInfo("sandbox.status_transition", ctx({
       from: "setup",
@@ -3723,9 +5826,19 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       sandboxId: sandbox.sandboxId,
     }));
 
-    await mutateMeta((meta) => {
+    const runningMeta = await mutateMeta((meta) => {
+      if (!metaOwnsCommittedSandbox(meta)) return;
       meta.status = "running";
       meta.lastError = null;
+    });
+    if (
+      !metaOwnsCommittedSandbox(runningMeta)
+      || runningMeta.status !== "running"
+    ) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+    await armSandboxDeadline(runningMeta, undefined, {
+      nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
     });
     await progress.completeSetupProgress("Sandbox ready");
 
@@ -3736,9 +5849,88 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     }));
     return getInitializedMeta();
   } catch (error) {
-    const errMsg = error instanceof Error ? error.message : String(error);
-    await progress.failSetupProgress(errMsg);
-    throw error;
+    if (error instanceof LifecycleLockOwnershipLostError) {
+      throw error;
+    }
+    let terminalError: unknown = error;
+    if (
+      bundleMode
+      && sandboxIsBundleCandidate
+      && !bundleCandidateCommitted
+      && sandbox
+    ) {
+      let cleanupError: unknown = null;
+      const candidateLookupId = activeBundleCandidate?.lookupId;
+      if (!candidateLookupId) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      try {
+        await assertCandidateDeleteOwnership(candidateLookupId, sandbox);
+        await sandbox.delete();
+      } catch (candidateDeleteError) {
+        if (candidateDeleteError instanceof LifecycleLockOwnershipLostError) {
+          throw candidateDeleteError;
+        }
+        if (!isSandboxGoneError(candidateDeleteError)) {
+          cleanupError = candidateDeleteError;
+        }
+      }
+      await assertCandidateDeleteOwnership(candidateLookupId, sandbox);
+      const cleanupMessage = cleanupError instanceof Error
+        ? cleanupError.message
+        : cleanupError === null
+          ? null
+          : String(cleanupError);
+      const cleanedMeta = await mutateMeta((meta) => {
+        if (
+          meta.lifecycleAttemptId !== attemptId
+          || !sameBundleCandidate(meta.bundleCandidate, activeBundleCandidate)
+        ) return;
+        meta.status = "error";
+        meta.portUrls = null;
+        if (cleanupMessage === null) {
+          meta.sandboxId = null;
+          meta.bundleIdentity = null;
+          meta.bundleCandidate = null;
+          meta.lifecycleAttemptId = null;
+        }
+        meta.lastError = cleanupMessage === null
+          ? error instanceof Error ? error.message : String(error)
+          : `OPENCLAW_BUNDLE_CANDIDATE_CLEANUP_FAILED: ${cleanupMessage}`;
+      });
+      if (
+        cleanupMessage === null
+        && (
+          cleanedMeta.sandboxId !== null
+          || cleanedMeta.bundleCandidate !== null
+        )
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      if (cleanupMessage !== null) {
+        terminalError = new ApiError(
+          502,
+          "OPENCLAW_BUNDLE_CANDIDATE_CLEANUP_FAILED",
+          `Failed to delete unverified bundle candidate ${sandbox.sandboxId}: ${cleanupMessage}`,
+        );
+      }
+    }
+
+    const errMsg = terminalError instanceof ApiError
+      ? `${terminalError.code}: ${terminalError.message}`
+      : terminalError instanceof Error
+        ? terminalError.message
+        : String(terminalError);
+    try {
+      await progress.failSetupProgress(errMsg);
+    } catch (progressError) {
+      logWarn("sandbox.lifecycle_progress_failure_write_failed", {
+        error: progressError instanceof Error
+          ? progressError.message
+          : String(progressError),
+      });
+    }
+    throw new LifecycleAttemptFailedError(attemptId, terminalError);
   }
 }
 
@@ -3855,44 +6047,174 @@ function collectTrackedSnapshotIds(
 async function destroyCurrentSandboxWithoutSnapshot(
   meta: SingleMeta,
   ctx: (extra?: Record<string, unknown>) => Record<string, unknown>,
+  options: {
+    lease: AutoRenewedLockLease;
+    onSandboxResolved: (sandboxId: string) => void;
+    onSandboxDestroyed: (sandboxId: string, operationId: string | null) => void;
+  },
 ): Promise<void> {
-  if (!meta.sandboxId) {
-    logInfo("sandbox.reset.destroy_skipped", ctx({ reason: "no_running_sandbox" }));
-    return;
+  let initialSuspension: HostSuspensionState | null = null;
+  try {
+    initialSuspension = await readHostSuspensionState();
+  } catch (error) {
+    if (!(error instanceof HostSuspensionStateCorruptError)) throw error;
   }
+  const lookupSandboxId = meta.sandboxId
+    ?? initialSuspension?.sandboxId
+    ?? `oc-${meta.id.replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`;
 
   try {
-    const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
-    // Best-effort stop before delete. In @vercel/sandbox v2, delete() against a
-    // running sandbox can succeed but leaves in-flight work (gateway writes,
-    // cron persistence, log flush) truncated. Stopping first gives OpenClaw a
-    // chance to drain cleanly. Any errors here are logged but do not block the
-    // destroy — reset must always be able to make forward progress even if the
-    // sandbox is already unhealthy.
-    try {
-      await sandbox.stop();
-      logInfo("sandbox.reset.stopped_before_delete", ctx({
-        sandboxId: meta.sandboxId,
-        sandboxStatus: sandbox.status,
-      }));
-    } catch (stopErr) {
-      logWarn("sandbox.reset.stop_before_delete_failed", ctx({
-        sandboxId: meta.sandboxId,
-        error: stopErr instanceof Error ? stopErr.message : String(stopErr),
-      }));
+    await options.lease.assertOwned();
+    const sandbox = await getSandboxController().get({
+      sandboxId: lookupSandboxId,
+      resume: false,
+    });
+    if (meta.sandboxId && sandbox.sandboxId !== meta.sandboxId) {
+      const canonicalMeta = await mutateMeta((next) => {
+        if (
+          next.sandboxId !== meta.sandboxId
+          || (next.lifecycleAttemptId ?? null) !== (meta.lifecycleAttemptId ?? null)
+        ) return;
+        next.sandboxId = sandbox.sandboxId;
+        next.portUrls = null;
+      });
+      if (
+        canonicalMeta.sandboxId !== sandbox.sandboxId
+        || (canonicalMeta.lifecycleAttemptId ?? null)
+          !== (meta.lifecycleAttemptId ?? null)
+      ) throw new LifecycleLockOwnershipLostError();
+      meta.sandboxId = sandbox.sandboxId;
     }
-    await sandbox.delete();
-    logInfo("sandbox.reset.destroyed", ctx({ sandboxId: meta.sandboxId }));
+    options.onSandboxResolved(sandbox.sandboxId);
+    await options.lease.assertOwned();
+    let suspension: HostSuspensionState | null = null;
+    let cleanupOperationId: string | null = null;
+    let sandboxDestroyed = false;
+    try {
+      if (initialSuspension?.sandboxId === sandbox.sandboxId) {
+        cleanupOperationId = initialSuspension.operationId;
+      }
+      // Only a ready running Gateway can own admitted user work. Setup/error/
+      // already-stopped sandboxes have no Gateway suspension surface to call.
+      if (sandbox.status === "running") {
+        try {
+          suspension = await prepareDedicatedHostSuspension({
+            sandbox,
+            lifecycleAttemptId:
+              meta.lifecycleAttemptId
+              ?? initialSuspension?.lifecycleAttemptId
+              ?? null,
+            intent: "reset",
+            reason: "sandbox.reset",
+          });
+          cleanupOperationId = suspension?.operationId ?? cleanupOperationId;
+        } catch (error) {
+          if (isGatewaySuspensionCapabilityUnavailable(error)) {
+            await clearInactiveHostSuspension({ sandboxId: sandbox.sandboxId });
+            logWarn("sandbox.host_suspension.capability_unavailable", ctx({
+              sandboxId: meta.sandboxId,
+              code: error.code,
+              action: "legacy-platform-delete",
+            }));
+          } else if (!(error instanceof HostSuspensionStateCorruptError)) {
+            throw error;
+          } else {
+            // Destructive reset is the sole recovery owner for corrupt durable
+            // suspension state. Delete the sandbox before clearing the record so
+            // no potentially suspended Gateway can survive a fail-open repair.
+            await options.lease.assertOwned();
+            await sandbox.delete();
+            sandboxDestroyed = true;
+            options.onSandboxDestroyed(sandbox.sandboxId, cleanupOperationId);
+            await clearHostSuspensionAfterDelete({
+              sandboxId: sandbox.sandboxId,
+              recoverCorruptState: true,
+            });
+            await clearSandboxDeadline(sandbox.sandboxId, {
+              lifecycleAttemptId:
+                meta.lifecycleAttemptId
+                ?? initialSuspension?.lifecycleAttemptId
+                ?? null,
+            });
+            logWarn("sandbox.reset.corrupt_suspension_recovered", ctx({
+              sandboxId: meta.sandboxId,
+            }));
+            return;
+          }
+        }
+        if (suspension) {
+          await options.lease.assertOwned();
+          suspension = await renewHostSuspension({
+            state: suspension,
+            sandbox,
+          });
+          if (suspension.phase !== "stopping") {
+            suspension = await markHostSuspensionStopping(suspension);
+          }
+        }
+      }
+
+      // Delete directly after OpenClaw proves idle and closes admission. A
+      // preliminary persistent stop would add another asynchronous snapshot
+      // race even though reset intentionally discards the restore target.
+      await options.lease.assertOwned();
+      await sandbox.delete();
+      sandboxDestroyed = true;
+      options.onSandboxDestroyed(sandbox.sandboxId, cleanupOperationId);
+      await clearSandboxDeadline(sandbox.sandboxId, {
+        lifecycleAttemptId:
+          meta.lifecycleAttemptId
+          ?? initialSuspension?.lifecycleAttemptId
+          ?? null,
+      });
+      logInfo("sandbox.reset.destroyed", ctx({ sandboxId: sandbox.sandboxId }));
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isSandboxGoneError(error)) {
+        sandboxDestroyed = true;
+        options.onSandboxDestroyed(sandbox.sandboxId, cleanupOperationId);
+        await clearSandboxDeadline(sandbox.sandboxId, {
+          lifecycleAttemptId:
+            meta.lifecycleAttemptId
+            ?? initialSuspension?.lifecycleAttemptId
+            ?? null,
+        });
+        logWarn("sandbox.reset.sandbox_already_gone", ctx({
+          sandboxId: meta.sandboxId,
+          error: message,
+        }));
+        return;
+      }
+      if (suspension && !sandboxDestroyed) {
+        await rollbackHostSuspension({
+          state: suspension,
+          sandbox,
+          error,
+        });
+      }
+      throw error;
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const isGone = message.includes("404") || message.includes("410");
-    if (isGone) {
+    if (isSandboxGoneError(error)) {
+      const operationId = initialSuspension?.sandboxId === lookupSandboxId
+        ? initialSuspension.operationId
+        : null;
+      options.onSandboxDestroyed(lookupSandboxId, operationId);
+      await clearSandboxDeadline(lookupSandboxId, {
+        lifecycleAttemptId:
+          meta.lifecycleAttemptId
+          ?? initialSuspension?.lifecycleAttemptId
+          ?? null,
+      });
       logWarn("sandbox.reset.sandbox_already_gone", ctx({
-        sandboxId: meta.sandboxId,
+        sandboxId: lookupSandboxId,
         error: message,
       }));
       return;
     }
+    if (error instanceof ApiError) throw error;
 
     throw new Error(
       `Failed to destroy sandbox ${meta.sandboxId} during reset: ${message}`,
@@ -3900,18 +6222,33 @@ async function destroyCurrentSandboxWithoutSnapshot(
   }
 }
 
+async function clearResetHostSuspensionAfterCommit(
+  sandboxId: string | null,
+  operationId: string | null = null,
+): Promise<void> {
+  if (!sandboxId || !operationId) return;
+  await clearHostSuspensionAfterDelete({
+    sandboxId,
+    operationId,
+  });
+}
+
 async function deleteTrackedSnapshotsForReset(
   snapshotIds: string[],
   deleteSnapshot: (snapshotId: string) => Promise<void>,
   ctx: (extra?: Record<string, unknown>) => Record<string, unknown>,
+  lease: AutoRenewedLockLease,
 ): Promise<string[]> {
   const failedSnapshotIds: string[] = [];
 
   for (const snapshotId of snapshotIds) {
     try {
+      await lease.assertOwned();
       await deleteSnapshot(snapshotId);
+      await lease.assertOwned();
       logInfo("sandbox.reset.snapshot_deleted", ctx({ snapshotId }));
     } catch (error) {
+      if (error instanceof LifecycleLockOwnershipLostError) throw error;
       if (isSnapshotNotFoundError(error)) {
         logInfo("sandbox.reset.snapshot_missing", ctx({ snapshotId }));
         continue;
@@ -3951,6 +6288,8 @@ function clearSandboxRuntimeStateForReset(meta: SingleMeta): void {
   meta.persistedStateAssetSha256 = null;
   meta.persistedStateSavedAt = null;
   meta.persistedStateSource = null;
+  meta.pendingPersistentAutoSave = null;
+  meta.activePersistentStop = null;
   meta.currentSnapshotId = null;
   meta.restorePreparedStatus = "unknown";
   meta.restorePreparedReason = null;
@@ -3962,6 +6301,7 @@ function clearSandboxRuntimeStateForReset(meta: SingleMeta): void {
   meta.startupScript = null;
   meta.openclawVersion = null;
   meta.bundleIdentity = null;
+  meta.bundleCandidate = null;
   meta.lastError = null;
   meta.lifecycleAttemptId = null;
 
@@ -3990,7 +6330,9 @@ function clearSandboxRuntimeStateForReset(meta: SingleMeta): void {
 // Locking helpers
 // ---------------------------------------------------------------------------
 
-async function withLifecycleLock<T>(fn: () => Promise<T>): Promise<T> {
+async function withLifecycleLock<T>(
+  fn: (lease: AutoRenewedLockLease) => Promise<T>,
+): Promise<T> {
   const store = getStore();
   const token = await store.acquireLock(lifecycleLockKey(), LIFECYCLE_LOCK_TTL_SECONDS);
   if (!token) {
@@ -4010,10 +6352,11 @@ async function withLifecycleLock<T>(fn: () => Promise<T>): Promise<T> {
 
 async function withAutoRenewedLock<T>(
   options: AutoRenewedLockOptions,
-  fn: () => Promise<T>,
+  fn: (lease: AutoRenewedLockLease) => Promise<T>,
 ): Promise<T> {
   const store = getStore();
   let stopRenewal = false;
+  let ownershipLost = false;
   const intervalMs = Math.max(
     1_000,
     Math.min(LOCK_RENEW_INTERVAL_MS, Math.floor((options.ttlSeconds * 1000) / 2)),
@@ -4029,6 +6372,7 @@ async function withAutoRenewedLock<T>(
       .then((renewed) => {
         if (!renewed) {
           stopRenewal = true;
+          ownershipLost = true;
           logWarn("sandbox.lock_renewal_lost", {
             key: options.key,
             label: options.label,
@@ -4036,6 +6380,8 @@ async function withAutoRenewedLock<T>(
         }
       })
       .catch((error) => {
+        ownershipLost = true;
+        stopRenewal = true;
         logWarn("sandbox.lock_renewal_failed", {
           key: options.key,
           label: options.label,
@@ -4047,8 +6393,31 @@ async function withAutoRenewedLock<T>(
   const maybeUnref = interval as unknown as { unref?: () => void };
   maybeUnref.unref?.();
 
+  const lease: AutoRenewedLockLease = {
+    async assertOwned() {
+      if (ownershipLost) throw new LifecycleLockOwnershipLostError();
+      let renewed = false;
+      try {
+        renewed = await store.renewLock(
+          options.key,
+          options.token,
+          options.ttlSeconds,
+        );
+      } catch {
+        ownershipLost = true;
+        stopRenewal = true;
+        throw new LifecycleLockOwnershipLostError();
+      }
+      if (!renewed) {
+        ownershipLost = true;
+        stopRenewal = true;
+        throw new LifecycleLockOwnershipLostError();
+      }
+    },
+  };
+
   try {
-    return await fn();
+    return await fn(lease);
   } finally {
     stopRenewal = true;
     clearInterval(interval);
@@ -4065,27 +6434,6 @@ async function withAutoRenewedLock<T>(
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
-
-/**
- * Remove the `x-vercel-protection-bypass` query parameter from a URL for
- * safe logging. Falls back to regex replacement if the URL is malformed.
- */
-function redactBypassParam(url: string): string {
-  try {
-    const parsed = new URL(url);
-    if (parsed.searchParams.has("x-vercel-protection-bypass")) {
-      parsed.searchParams.delete("x-vercel-protection-bypass");
-      return parsed.toString();
-    }
-  } catch {
-    return url.replace(
-      /([?&])x-vercel-protection-bypass=[^&]+(&|$)/,
-      (_match, prefix, suffix) =>
-        suffix ? prefix : "",
-    );
-  }
-  return url;
-}
 
 function resolvePortUrls(sandbox: SandboxHandle): Record<string, string> {
   const urls: Record<string, string> = {};

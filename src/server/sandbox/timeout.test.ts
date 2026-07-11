@@ -10,12 +10,15 @@ import test from "node:test";
 import {
   getSandboxSleepConfig,
   getSandboxSleepAfterMs,
+  getSandboxPlatformTimeoutMs,
+  getSandboxTimeoutExtensionMs,
   getSandboxHeartbeatIntervalMs,
   getSandboxTouchThrottleMs,
   _resetSandboxSleepConfigCacheForTesting,
   DEFAULT_SANDBOX_SLEEP_AFTER_MS,
   MIN_SANDBOX_SLEEP_AFTER_MS,
   MAX_PORTABLE_SANDBOX_SLEEP_AFTER_MS,
+  MAX_DESIRED_SANDBOX_IDLE_MS,
 } from "@/server/sandbox/timeout";
 
 function withEnv(value: string | undefined, fn: () => void): void {
@@ -62,11 +65,34 @@ test("timeout: value below minimum clamps to MIN_SANDBOX_SLEEP_AFTER_MS", () => 
   });
 });
 
-test("timeout: value above maximum clamps to MAX_PORTABLE_SANDBOX_SLEEP_AFTER_MS", () => {
+test("timeout: value above maximum reserves native safety runway", () => {
   withEnv("9999999999", () => {
     const config = getSandboxSleepConfig();
-    assert.equal(config.sleepAfterMs, MAX_PORTABLE_SANDBOX_SLEEP_AFTER_MS);
+    assert.equal(config.sleepAfterMs, MAX_DESIRED_SANDBOX_IDLE_MS);
+    assert.equal(
+      getSandboxPlatformTimeoutMs(),
+      MAX_PORTABLE_SANDBOX_SLEEP_AFTER_MS,
+    );
   });
+});
+
+test("timeout: extension is capped by total session headroom", () => {
+  assert.equal(
+    getSandboxTimeoutExtensionMs({
+      currentTotalMs: MAX_PORTABLE_SANDBOX_SLEEP_AFTER_MS - 60_000,
+      currentRemainingMs: 1,
+      targetRemainingMs: 10 * 60 * 1000,
+    }),
+    60_000,
+  );
+  assert.equal(
+    getSandboxTimeoutExtensionMs({
+      currentTotalMs: MAX_PORTABLE_SANDBOX_SLEEP_AFTER_MS,
+      currentRemainingMs: 1,
+      targetRemainingMs: 10 * 60 * 1000,
+    }),
+    0,
+  );
 });
 
 test("timeout: invalid string falls back to default", () => {

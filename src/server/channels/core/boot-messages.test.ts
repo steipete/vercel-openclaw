@@ -14,11 +14,14 @@ import type {
 } from "@/server/channels/core/types";
 import {
   _resetStoreForTesting,
+  getStore,
   mutateMeta,
 } from "@/server/store/store";
 import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
 import { FakeSandboxController } from "@/test-utils/fake-sandbox-controller";
 import { _resetLogBuffer } from "@/server/log";
+import { hostSuspensionOperationKey } from "@/server/store/keyspace";
+import type { HostSuspensionState } from "@/server/sandbox/host-suspension";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -123,6 +126,127 @@ test("boot-messages: no boot message when sandbox is already running", async () 
 
     assert.equal(result.bootMessageSent, false);
     assert.equal(log.length, 0);
+  });
+});
+
+test("boot-messages: fenced running metadata never bypasses admission", async () => {
+  await withEnv(TEST_ENV, async () => {
+    const fakeController = new FakeSandboxController();
+    _setSandboxControllerForTesting(fakeController);
+    const now = Date.now();
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-fenced";
+      meta.lifecycleAttemptId = "attempt-fenced";
+    });
+    await getStore().setValue<HostSuspensionState>(hostSuspensionOperationKey(), {
+      version: 1,
+      operationId: "operation-fenced",
+      requestId: "operation-fenced",
+      sandboxId: "sbx-fenced",
+      lifecycleAttemptId: "attempt-fenced",
+      intent: "stop",
+      reason: "test-stop",
+      phase: "prepared",
+      ingressFenced: true,
+      suspensionId: "suspension-fenced",
+      leaseExpiresAtMs: now + 120_000,
+      stopRequestDeadlineAtMs: null,
+      monitorHeartbeatAtMs: now,
+      startedAtMs: now,
+      updatedAtMs: now,
+      stoppedAtMs: null,
+      resumedAtMs: null,
+      lastError: null,
+      lastErrorCode: null,
+      lastErrorClass: null,
+    });
+    const { adapter, log } = createTrackingAdapter();
+
+    await assert.rejects(
+      runWithBootMessages({
+        channel: "slack",
+        adapter,
+        message: createMessage(),
+        origin: "https://app.test",
+        reason: "fenced-running-test",
+        timeoutMs: 20,
+        pollIntervalMs: 5,
+      }),
+      /did not become ready/,
+    );
+    assert.equal(log.some((entry) => entry.action === "send"), true);
+  });
+});
+
+test("boot-messages: probe success cannot admit a replacement generation", async () => {
+  await withEnv(TEST_ENV, async () => {
+    const fakeController = new FakeSandboxController();
+    _setSandboxControllerForTesting(fakeController);
+    const handle = await fakeController.create({ ports: [3000] });
+    await mutateMeta((meta) => {
+      meta.status = "setup";
+      meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "attempt-probed";
+    });
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 2) {
+        const now = Date.now();
+        await mutateMeta((meta) => {
+          meta.status = "running";
+          meta.sandboxId = "sbx-replacement";
+          meta.lifecycleAttemptId = "attempt-replacement";
+        });
+        await getStore().setValue<HostSuspensionState>(
+          hostSuspensionOperationKey(),
+          {
+            version: 1,
+            operationId: "operation-replacement",
+            requestId: "operation-replacement",
+            sandboxId: "sbx-replacement",
+            lifecycleAttemptId: "attempt-replacement",
+            intent: "stop",
+            reason: "replacement-race",
+            phase: "prepared",
+            ingressFenced: true,
+            suspensionId: "suspension-replacement",
+            leaseExpiresAtMs: now + 120_000,
+            stopRequestDeadlineAtMs: null,
+            monitorHeartbeatAtMs: now,
+            startedAtMs: now,
+            updatedAtMs: now,
+            stoppedAtMs: null,
+            resumedAtMs: null,
+            lastError: null,
+            lastErrorCode: null,
+            lastErrorClass: null,
+          },
+        );
+        return new Response("ready", { status: 200 });
+      }
+      return new Response("openclaw-app", { status: 200 });
+    }) as typeof fetch;
+
+    try {
+      const { adapter } = createTrackingAdapter();
+      await assert.rejects(
+        runWithBootMessages({
+          channel: "slack",
+          adapter,
+          message: createMessage(),
+          origin: "https://app.test",
+          reason: "probe-generation-race",
+          timeoutMs: 20,
+          pollIntervalMs: 5,
+        }),
+        /did not become ready/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

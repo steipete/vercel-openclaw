@@ -14,7 +14,6 @@ import {
   readSetupProgress,
   type SetupPhase,
 } from "@/server/sandbox/setup-progress";
-import { getInitializedMeta } from "@/server/store/store";
 
 const BOOT_MESSAGE_INITIAL =
   "🦞 Waking the sandbox. First reply after idle may be slow.";
@@ -126,6 +125,8 @@ export type RunWithBootMessagesOptions<
 export type BootMessagesResult = {
   meta: SingleMeta;
   bootMessageSent: boolean;
+  /** True only after the lifecycle controller grants this sandbox admission. */
+  admissionReady: boolean;
 };
 
 function assessTelegramRestoreReadiness(
@@ -183,9 +184,14 @@ export async function runWithBootMessages<
     deferCleanupToCaller = false,
   } = options;
 
-  const initialMeta = await getInitializedMeta();
+  const initialEnsure = await ensureSandboxRunning({ origin, reason });
+  const initialMeta = initialEnsure.meta;
 
-  if (initialMeta.status === "running" && initialMeta.sandboxId) {
+  if (
+    initialEnsure.state === "running"
+    && initialMeta.status === "running"
+    && initialMeta.sandboxId
+  ) {
     if (channel === "telegram") {
       const assessment = assessTelegramRestoreReadiness(initialMeta);
       const logData = {
@@ -237,11 +243,11 @@ export async function runWithBootMessages<
         });
       }
     }
-    return { meta: initialMeta, bootMessageSent: false };
+    return { meta: initialMeta, bootMessageSent: false, admissionReady: true };
   }
 
   if (!existingBootHandle && !adapter.sendBootMessage) {
-    return { meta: initialMeta, bootMessageSent: false };
+    return { meta: initialMeta, bootMessageSent: false, admissionReady: false };
   }
 
   let handle: BootMessageHandle;
@@ -255,7 +261,7 @@ export async function runWithBootMessages<
         channel,
         error: error instanceof Error ? error.message : String(error),
       });
-      return { meta: initialMeta, bootMessageSent: false };
+      return { meta: initialMeta, bootMessageSent: false, admissionReady: false };
     }
   }
 
@@ -289,8 +295,8 @@ export async function runWithBootMessages<
         });
       }
 
-      if (meta.status === "running" && meta.sandboxId) {
-        return { meta, bootMessageSent: true };
+      if (result.state === "running" && meta.status === "running" && meta.sandboxId) {
+        return { meta, bootMessageSent: true, admissionReady: true };
       }
 
       if (meta.status === "error") {
@@ -311,6 +317,16 @@ export async function runWithBootMessages<
       ) {
         const probe = await probeGatewayReady();
         if (probe.ready) {
+          // The probe and metadata read are not atomic. Re-enter lifecycle
+          // admission so a generation replacement cannot inherit readiness.
+          const admitted = await ensureSandboxRunning({ origin, reason });
+          if (
+            admitted.state !== "running"
+            || admitted.meta.status !== "running"
+            || !admitted.meta.sandboxId
+          ) {
+            continue;
+          }
           void handle
             .update(
               channelStatusMessageFor(channel, "running") ??
@@ -324,8 +340,9 @@ export async function runWithBootMessages<
               });
             });
           return {
-            meta: await getInitializedMeta(),
+            meta: admitted.meta,
             bootMessageSent: true,
+            admissionReady: true,
           };
         }
       }

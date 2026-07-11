@@ -29,6 +29,7 @@ export type CreateParams = {
   resources?: { vcpus: number };
   source?: { type: "snapshot"; snapshotId: string };
   env?: Record<string, string>;
+  tags?: Record<string, string>;
   networkPolicy?: NetworkPolicy;
 };
 
@@ -57,7 +58,12 @@ export type SandboxStatus =
 
 export interface SandboxHandle {
   sandboxId: string;
+  /** Immutable ownership metadata attached when the sandbox was created. */
+  readonly tags?: Record<string, string>;
+  /** Total timeout of the current Sandbox session. */
   readonly timeout: number;
+  /** Milliseconds until the current session reaches native expiry. */
+  readonly timeoutRemaining: number;
   readonly status: SandboxStatus;
   runCommand(
     commandOrOptions: string | RunCommandOptions,
@@ -94,8 +100,14 @@ export interface SandboxController {
 function wrapSandbox(sandbox: Sandbox): SandboxHandle {
   return {
     sandboxId: sandbox.name,
+    tags: sandbox.tags,
     get timeout() {
-      return sandbox.timeout ?? 0;
+      return sandbox.currentSession().timeout;
+    },
+    get timeoutRemaining() {
+      const session = sandbox.currentSession();
+      const startedAt = session.startedAt ?? session.createdAt;
+      return Math.max(0, startedAt.getTime() + session.timeout - Date.now());
     },
     get status() {
       return sandbox.status;

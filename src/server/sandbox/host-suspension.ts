@@ -9,7 +9,7 @@ import {
   hostSuspensionOperationKey,
   hostSuspensionOperationLockKey,
 } from "@/server/store/keyspace";
-import { getStore } from "@/server/store/store";
+import { getInitializedMeta, getStore } from "@/server/store/store";
 import { ApiError } from "@/shared/http";
 import { logInfo, logWarn } from "@/server/log";
 
@@ -21,6 +21,7 @@ export type HostSuspensionPhase =
   | "stopping"
   | "stopped"
   | "thawing"
+  | "rollback-pending"
   | "running"
   | "failed";
 
@@ -31,6 +32,7 @@ export type HostSuspensionState = {
   operationId: string;
   requestId: string;
   sandboxId: string;
+  lifecycleAttemptId: string | null;
   intent: HostSuspensionIntent;
   reason: string;
   phase: HostSuspensionPhase;
@@ -92,6 +94,10 @@ export type HostSuspensionDeps = {
   read: () => Promise<HostSuspensionState | null>;
   write: (state: HostSuspensionState) => Promise<void>;
   clear: () => Promise<void>;
+  getCurrentGeneration: () => Promise<{
+    sandboxId: string | null;
+    lifecycleAttemptId: string | null;
+  }>;
   acquireStateLock: () => Promise<string | null>;
   releaseStateLock: (token: string) => Promise<void>;
   callRpc: <T>(input: {
@@ -109,6 +115,13 @@ const defaultDeps: HostSuspensionDeps = {
   read: () => getStore().getValue<HostSuspensionState>(hostSuspensionOperationKey()),
   write: (state) => getStore().setValue(hostSuspensionOperationKey(), state),
   clear: () => getStore().deleteValue(hostSuspensionOperationKey()),
+  getCurrentGeneration: async () => {
+    const meta = await getInitializedMeta();
+    return {
+      sandboxId: meta.sandboxId,
+      lifecycleAttemptId: meta.lifecycleAttemptId ?? null,
+    };
+  },
   acquireStateLock: () => getStore().acquireLock(
     hostSuspensionOperationLockKey(),
     30,
@@ -205,6 +218,7 @@ function isPhase(value: unknown): value is HostSuspensionPhase {
     "stopping",
     "stopped",
     "thawing",
+    "rollback-pending",
     "running",
     "failed",
   ].includes(String(value));
@@ -217,6 +231,7 @@ const HOST_SUSPENSION_STATE_KEYS = [
   "lastErrorClass",
   "lastErrorCode",
   "leaseExpiresAtMs",
+  "lifecycleAttemptId",
   "monitorHeartbeatAtMs",
   "operationId",
   "phase",
@@ -261,6 +276,13 @@ function isHostSuspensionState(value: unknown): value is HostSuspensionState {
     && state.requestId.length > 0
     && typeof state.sandboxId === "string"
     && state.sandboxId.length > 0
+    && (
+      state.lifecycleAttemptId === null
+      || (
+        typeof state.lifecycleAttemptId === "string"
+        && state.lifecycleAttemptId.length > 0
+      )
+    )
     && (state.intent === "stop" || state.intent === "reset")
     && typeof state.reason === "string"
     && state.reason.length > 0
@@ -344,6 +366,7 @@ async function writePhase(
 
 function createOperation(input: {
   sandboxId: string;
+  lifecycleAttemptId: string | null;
   intent: HostSuspensionIntent;
   reason: string;
 }, deps: HostSuspensionDeps): HostSuspensionState {
@@ -354,6 +377,7 @@ function createOperation(input: {
     operationId,
     requestId: operationId,
     sandboxId: input.sandboxId,
+    lifecycleAttemptId: input.lifecycleAttemptId,
     intent: input.intent,
     reason: input.reason,
     phase: "fencing",
@@ -379,6 +403,7 @@ const HOST_STOP_MONITOR_PHASES = new Set<HostSuspensionPhase>([
   "prepared",
   "stop-requesting",
   "stopping",
+  "rollback-pending",
 ]);
 
 /**
@@ -544,6 +569,7 @@ async function requestPreparation(input: {
 /** Fence app-owned ingress, then atomically ask OpenClaw to refuse new work. */
 export async function prepareHostSuspension(input: {
   sandbox: SandboxHandle;
+  lifecycleAttemptId: string | null;
   intent?: HostSuspensionIntent;
   reason: string;
 }, deps: HostSuspensionDeps = defaultDeps): Promise<HostSuspensionState> {
@@ -557,11 +583,19 @@ export async function prepareHostSuspension(input: {
           "A fenced lifecycle operation belongs to a different sandbox.",
         );
       }
+      if (existing.lifecycleAttemptId !== input.lifecycleAttemptId) {
+        throw new ApiError(
+          409,
+          "HOST_SUSPENSION_CONFLICT",
+          "A fenced lifecycle operation belongs to a different lifecycle generation.",
+        );
+      }
       return existing;
     }
 
     const created = createOperation({
       sandboxId: input.sandbox.sandboxId,
+      lifecycleAttemptId: input.lifecycleAttemptId,
       intent: input.intent ?? "stop",
       reason: input.reason,
     }, deps);
@@ -576,15 +610,17 @@ export async function prepareHostSuspension(input: {
     return state;
   }
 
+  let preparationMayHaveStarted = false;
   try {
     state = await ensureHostStopMonitor(state, deps);
+    preparationMayHaveStarted = true;
     return await requestPreparation({
       state,
       sandbox: input.sandbox,
     }, deps);
   } catch (error) {
     if (error instanceof HostSuspensionBusyError) throw error;
-    const knownNotPrepared = (
+    const knownNotPrepared = !preparationMayHaveStarted || (
       error instanceof GatewayAdminRpcError
       && ["ADMIN_RPC_NOT_INSTALLED", "INVALID_REQUEST"].includes(error.code)
     );
@@ -592,7 +628,9 @@ export async function prepareHostSuspension(input: {
       const latest = await readHostSuspensionState(deps);
       const failureState = latest?.operationId === state.operationId ? latest : state;
       await writePhase(failureState, {
-        phase: "failed",
+        // An unknown prepare outcome may have committed Gateway suspension.
+        // Keep the monitor-owned phase live until reconciliation rolls it back.
+        phase: knownNotPrepared ? "failed" : failureState.phase,
         ingressFenced: !knownNotPrepared,
         ...classifyError(error),
       }, deps);
@@ -722,7 +760,7 @@ export async function rollbackHostSuspension(input: {
     }, deps);
   } catch (rollbackError) {
     await writePhase(input.state, {
-      phase: "failed",
+      phase: "rollback-pending",
       ingressFenced: true,
       stopRequestDeadlineAtMs: null,
       ...classifyError(rollbackError),
@@ -740,20 +778,37 @@ export async function rollbackHostSuspension(input: {
  */
 export async function thawHostSuspensionIfNeeded(input: {
   sandbox: SandboxHandle;
+  lifecycleAttemptId?: string | null;
 }, deps: HostSuspensionDeps = defaultDeps): Promise<boolean> {
   const state = await readHostSuspensionState(deps);
   if (!state?.ingressFenced) return true;
-  if (state.phase !== "stopped" && state.phase !== "thawing") return false;
+  if (
+    state.phase !== "stopped"
+    && state.phase !== "thawing"
+    && state.phase !== "rollback-pending"
+  ) return false;
   if (state.sandboxId !== input.sandbox.sandboxId) {
     // Snapshot restore may produce a replacement sandbox ID. Its fresh Gateway
     // cannot retain the old process-local suspension; reaching this thaw path
     // proves the replacement is the lifecycle-owned running target.
     const cleared = await withHostSuspensionStateLock(deps, async () => {
-      const latest = await readHostSuspensionState(deps);
+      const [latest, currentGeneration] = await Promise.all([
+        readHostSuspensionState(deps),
+        deps.getCurrentGeneration(),
+      ]);
       if (
         !latest
         || latest.operationId !== state.operationId
-        || (latest.phase !== "stopped" && latest.phase !== "thawing")
+        || (
+          latest.phase !== "stopped"
+          && latest.phase !== "thawing"
+          && latest.phase !== "rollback-pending"
+        )
+        || currentGeneration.sandboxId !== input.sandbox.sandboxId
+        || (
+          input.lifecycleAttemptId !== undefined
+          && currentGeneration.lifecycleAttemptId !== input.lifecycleAttemptId
+        )
       ) {
         return false;
       }
@@ -768,6 +823,10 @@ export async function thawHostSuspensionIfNeeded(input: {
     });
     return true;
   }
+  if (
+    input.lifecycleAttemptId !== undefined
+    && state.lifecycleAttemptId !== input.lifecycleAttemptId
+  ) return false;
 
   const thawing = await writePhase(state, {
     phase: "thawing",
@@ -787,7 +846,7 @@ export async function thawHostSuspensionIfNeeded(input: {
     return true;
   } catch (error) {
     await writePhase(thawing, {
-      phase: "failed",
+      phase: "rollback-pending",
       ingressFenced: true,
       ...classifyError(error),
     }, deps);
@@ -797,7 +856,9 @@ export async function thawHostSuspensionIfNeeded(input: {
 
 /** Successful destructive reset has no Gateway left to resume. */
 export async function clearHostSuspensionAfterDelete(
-  input: { sandboxId: string; operationId?: string },
+  input:
+    | { sandboxId: string; operationId: string }
+    | { sandboxId: string; recoverCorruptState: true },
   deps: HostSuspensionDeps = defaultDeps,
 ): Promise<void> {
   let state: HostSuspensionState | null;
@@ -805,21 +866,34 @@ export async function clearHostSuspensionAfterDelete(
     state = await readHostSuspensionState(deps);
   } catch (error) {
     if (!(error instanceof HostSuspensionStateCorruptError)) throw error;
+    if (!("recoverCorruptState" in input)) throw error;
     // A successful destructive delete is the explicit recovery owner for a
     // corrupt lifecycle record: no sandbox remains whose admission state must
     // be preserved.
-    await withHostSuspensionStateLock(deps, () => deps.clear());
+    await withHostSuspensionStateLock(deps, async () => {
+      try {
+        // The unlocked observation is only a hint. A valid replacement may
+        // have committed before lock acquisition and must remain intact.
+        await readHostSuspensionState(deps);
+      } catch (latestError) {
+        if (!(latestError instanceof HostSuspensionStateCorruptError)) {
+          throw latestError;
+        }
+        await deps.clear();
+      }
+    });
     return;
   }
   if (
-    state?.sandboxId === input.sandboxId
-    && (!input.operationId || state.operationId === input.operationId)
+    "operationId" in input
+    && state?.sandboxId === input.sandboxId
+    && state.operationId === input.operationId
   ) {
     await withHostSuspensionStateLock(deps, async () => {
       const latest = await readHostSuspensionState(deps);
       if (
         latest?.sandboxId === input.sandboxId
-        && (!input.operationId || latest.operationId === input.operationId)
+        && latest.operationId === input.operationId
       ) {
         await deps.clear();
       }

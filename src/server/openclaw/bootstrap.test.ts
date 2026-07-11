@@ -267,9 +267,9 @@ test("setupOpenClaw installs the exact external Slack package before writing the
       OPENCLAW_BUNDLE_SHA256: "3".repeat(64),
     },
     async () => {
-      _setBundleAdmissionForTesting(admission);
-      const h = createScenarioHarness();
+      const h = createScenarioHarness({ preserveBundleEnv: true });
       try {
+        _setBundleAdmissionForTesting(admission);
         const handle = await createHandle(h);
         const result = await setupOpenClaw(handle, {
           gatewayToken: "tok-external-slack",
@@ -309,9 +309,9 @@ test("setupOpenClaw installs the exact external Slack package before writing the
         h.teardown();
       }
 
-      _setBundleAdmissionForTesting(admission);
-      const failing = createScenarioHarness();
+      const failing = createScenarioHarness({ preserveBundleEnv: true });
       try {
+        _setBundleAdmissionForTesting(admission);
         const handle = await createHandle(failing);
         handle.responders.push((command, args) => {
           if (

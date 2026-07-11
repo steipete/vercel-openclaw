@@ -107,6 +107,7 @@ function makeDeps(overrides: Partial<WatchdogDeps> = {}): WatchdogDeps {
       reason: "skipped" as const,
       candidateSandboxId: null,
     }),
+    armDeadline: async () => null,
     now: (() => {
       let current = 0;
       return () => (current += 10);

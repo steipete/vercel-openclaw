@@ -10,7 +10,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { SnapshotRecord } from "@/shared/types";
-import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
+import {
+  _setSandboxControllerForTesting,
+} from "@/server/sandbox/controller";
+import {
+  FakeSandboxController,
+  FakeSandboxHandle,
+} from "@/test-utils/fake-sandbox-controller";
 import {
   _resetStoreForTesting,
   mutateMeta,
@@ -144,6 +150,32 @@ test("POST /api/admin/snapshots: returns 409 when sandbox is not running", async
     assert.equal(result.status, 409);
     const body = result.json as { error: string };
     assert.equal(body.error, "SANDBOX_NOT_RUNNING");
+  });
+});
+
+test("POST /api/admin/snapshots: delegates to cooperative persistent stop", async () => {
+  await withTestEnv(async () => {
+    const fake = new FakeSandboxController();
+    const handle = new FakeSandboxHandle("sbx-running-snap", fake.events);
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    _setSandboxControllerForTesting(fake);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+    });
+
+    const route = getAdminSnapshotsRoute();
+    const request = buildAuthPostRequest("/api/admin/snapshots", "{}");
+    const result = await callRoute(route.POST!, request);
+
+    assert.equal(result.status, 200);
+    assert.equal(handle.stopCalled, true);
+    assert.equal(handle.snapshotCalled, false);
+    assert.deepEqual(result.json, {
+      status: "snapshotting",
+      snapshotId: null,
+      record: null,
+    });
   });
 });
 

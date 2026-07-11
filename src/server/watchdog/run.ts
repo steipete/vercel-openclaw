@@ -33,6 +33,8 @@ import type {
   OperationContext,
   SingleMeta,
 } from "@/shared/types";
+import { armSandboxDeadline } from "@/server/sandbox/deadline-coordinator";
+import { getSandboxController } from "@/server/sandbox/controller";
 import type { WatchdogCheck, WatchdogReport } from "@/shared/watchdog";
 import {
   readWatchdogReport,
@@ -78,6 +80,7 @@ export type WatchdogDeps = {
   prepareHotSpare: (options?: {
     op?: OperationContext;
   }) => Promise<PrepareHotSpareResult>;
+  armDeadline: (meta: SingleMeta) => Promise<unknown>;
   now: () => number;
 };
 
@@ -91,7 +94,7 @@ const WATCHDOG_CRON_WAKE_CLEAR_OUTCOMES = new Set<CronRestoreOutcome>([
 const defaultDeps: WatchdogDeps = {
   buildContract: buildDeploymentContract,
   getMeta: getInitializedMeta,
-  probe: probeGatewayReady,
+  probe: () => probeGatewayReady({ resume: false, thaw: false }),
   reconcileStale: reconcileStaleRunningStatus,
   reconcile: reconcileSandboxHealth,
   ensureReady: ensureSandboxReady,
@@ -113,6 +116,19 @@ const defaultDeps: WatchdogDeps = {
       now: () => Date.now(),
     }),
   prepareHotSpare: prepareHotSpareFromPreparedRestore,
+  armDeadline: async (meta) => {
+    if (!meta.sandboxId) return null;
+    const sandbox = await getSandboxController().get({
+      sandboxId: meta.sandboxId,
+      resume: false,
+    });
+    return armSandboxDeadline(meta, undefined, {
+      refreshDeadline: false,
+      forceWorkflowStart: true,
+      activityAtMs: meta.lastAccessedAt ?? meta.updatedAt,
+      nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
+    });
+  },
   now: () => Date.now(),
 };
 
@@ -285,9 +301,10 @@ export async function runSandboxWatchdog(
         meta = reconciledMeta;
         status = failingRequirementIds.length > 0 ? "failed" : "idle";
       } else {
+        await deps.armDeadline(reconciledMeta);
 
-      const probeStartedAt = deps.now();
-      const probe = await deps.probe();
+        const probeStartedAt = deps.now();
+        const probe = await deps.probe();
 
       if (probe.ready) {
         addCheck("probe", "pass", probeStartedAt, "Gateway probe returned the openclaw-app marker.");

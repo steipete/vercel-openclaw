@@ -15,6 +15,8 @@ import {
 } from "@/server/sandbox/restore-attestation";
 import type { RestoreTargetInspectionPayload } from "@/shared/launch-verification";
 
+export const maxDuration = 300;
+
 /**
  * Authoritative restore-readiness contract.
  *

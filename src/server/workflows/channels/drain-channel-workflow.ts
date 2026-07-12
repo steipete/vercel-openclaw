@@ -30,9 +30,10 @@ export async function processChannelStep(
   );
 }
 
-// Cleanup owns a 25-attempt budget; Workflow counts this initial execution
-// separately from retries.
-processChannelStep.maxRetries = 24;
+// Delivery and accepted cleanup each own 25 executions. A crash after the
+// acceptance fence can consume the last delivery execution before cleanup is
+// reserved, so Workflow must allow both full budgets (initial + 49 retries).
+processChannelStep.maxRetries = 49;
 
 export type DrainChannelWorkflowEnvelopeV1 = {
   version: 1;

@@ -60,8 +60,8 @@ class TestRetryableError extends Error {
   }
 }
 
-test("drain channel step retry policy reaches the cleanup budget", () => {
-  assert.equal(processChannelWorkflowStep.maxRetries, 24);
+test("drain channel step retry policy covers delivery and cleanup budgets", () => {
+  assert.equal(processChannelWorkflowStep.maxRetries, 49);
 });
 
 class TestFatalError extends Error {

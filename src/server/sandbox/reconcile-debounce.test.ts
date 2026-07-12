@@ -158,7 +158,7 @@ test("reconcile: reset clears cache so next call hits SDK again", async () => {
       persistent: true,
       ports: [3000],
     });
-    (handle as unknown as { setStatus: (s: string) => void }).setStatus("stopped");
+    (handle as unknown as { setStatus: (s: string) => void }).setStatus("running");
 
     await mutateMeta((meta) => {
       meta.status = "running";
@@ -176,13 +176,9 @@ test("reconcile: reset clears cache so next call hits SDK again", async () => {
     await reconcileStaleRunningStatus();
     assert.equal(innerGetCount, 1);
 
-    // Reset the debounce; but reconciled meta is stopped now, so next
-    // reconcile short-circuits before SDK.get anyway. Force meta back
-    // to running to exercise the fresh-reconcile path.
+    // Reset the debounce while keeping the same running generation so the
+    // next reconcile must exercise a fresh SDK lookup.
     _resetReconcileStaleRunningDebounceForTesting();
-    await mutateMeta((meta) => {
-      meta.status = "running";
-    });
 
     await reconcileStaleRunningStatus();
     assert.equal(innerGetCount, 2, "post-reset reconcile hits SDK again");

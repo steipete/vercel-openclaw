@@ -219,18 +219,24 @@ test("watchdog repairs a persisted firewall fail-closed handoff", async () => {
 
 test("watchdog reconciles an interrupted host thaw before status classification", async () => {
   let reconciliationCalls = 0;
+  let currentMeta = {
+    status: "error",
+    sandboxId: "sbx-thawing",
+    lastError: "worker exited during thaw",
+  } as SingleMeta;
   const report = await runSandboxWatchdog(
     { request: new Request("https://app.test/api/cron/watchdog") },
     makeDeps({
-      getMeta: async () => ({
-        status: "error",
-        sandboxId: "sbx-thawing",
-        lastError: "worker exited during thaw",
-      }) as SingleMeta,
+      getMeta: async () => currentMeta,
       reconcileLifecycleState: async () => {
         reconciliationCalls += 1;
-        return { status: "running", sandboxId: "sbx-thawing" } as SingleMeta;
+        currentMeta = {
+          status: "running",
+          sandboxId: "sbx-thawing",
+        } as SingleMeta;
+        return currentMeta;
       },
+      reconcileStale: async () => currentMeta,
     }),
   );
 

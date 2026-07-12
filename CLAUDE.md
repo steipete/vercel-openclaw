@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`vercel-openclaw` is a single-instance Next.js 16 app that manages exactly one persistent Vercel Sandbox running OpenClaw: auth, on-demand create/resume, proxy at `/gateway`, HTML injection for WebSocket rewrite and gateway-token handoff, firewall learning, and hosted channel webhooks (Slack, Telegram, Discord). Hosted WhatsApp is cleanup-only and fails closed.
+`vercel-openclaw` is a single-instance Next.js 16 app that manages exactly one persistent Vercel Sandbox running OpenClaw: auth, on-demand create/resume, proxy at `/gateway`, HTML injection for WebSocket rewrite and gateway-token handoff, firewall learning, and hosted Slack/Telegram webhooks. Hosted Discord and WhatsApp are cleanup-only and fail closed.
 
 For operator docs, start with `docs/getting-started/README.md`. It is the main handoff for the three-repo system (`vclaw`, `vercel-openclaw`, and the OpenClaw fork), `vclaw create`, operational paths, release, and reliability contracts. Then use `README.md`, `CONTRIBUTING.md`, and the deep docs under `docs/` (`architecture.md`, `channels-and-webhooks.md`, `lifecycle-and-restore.md`, `preflight-and-launch-verification.md`, `deployment-protection.md`, `environment-variables.md`, `api-reference.md`).
 
@@ -83,7 +83,7 @@ These are the things Claude will otherwise get wrong:
 - **Telegram `webhookSecret` must flow through every config path**: `buildGatewayConfig()`, `buildDynamicResumeFiles()`, `syncRestoreAssetsIfNeeded()`, and `computeGatewayConfigHash()`. Missing it causes OpenClaw validation failure ("webhookUrl requires webhookSecret").
 - **Channel connect guard**: `buildChannelConnectability()` and `buildChannelConnectabilityReport()` are **async**. Every channel `PUT` handler must await them and return the shared `buildChannelConnectBlockedResponse` (HTTP 409) when `canConnect` is false. Blockers: no canonical HTTPS webhook URL; AI Gateway auth is `unavailable` on Vercel; missing Redis on Vercel.
 - **Auth must happen before proxying any HTML that contains the injected gateway token.** Keep the WebSocket rewrite, the heartbeat `POST /api/status` behavior, and the waiting-page flow in the lifecycle — the proxy depends on them.
-- **Cron wake**: only an exact, verified bundle identity declaring `cron-projection-v1` may enable the preboot `vercel-cron-projection` plugin. It adopts the live scheduler from `gateway_start`, coalesces `cron_changed` hints into bounded earliest-wake snapshots (up to 4,096), and durably protects the post-wake execution runway even when the configured idle timeout is shorter. The host persists a sanitized CAS record, then a token-revalidating Workflow sleeps until the earliest wake and resumes the sandbox. Never scrape, copy, or restore `jobs.json`; OpenClaw remains the job authority. The watchdog is anti-entropy for missing/stale Workflow dispatch, not a second timer.
+- **Cron wake**: only an exact, verified bundle identity declaring `cron-projection-v1` or `cron-projection-v2` may enable the preboot `vercel-cron-projection` plugin. Legacy v1 adopts its baseline from `gateway_start`; v2 waits for the complete `cron_reconciled` snapshot and ignores premature `cron_changed` hints. The modes are exclusive, and v2 wins if both capabilities are declared. The host persists bounded earliest-wake snapshots (up to 4,096) in a sanitized CAS record, then a token-revalidating Workflow sleeps until the earliest wake and resumes the sandbox. Never scrape, copy, or restore `jobs.json`; OpenClaw remains the job authority. The watchdog is anti-entropy for missing/stale Workflow dispatch, not a second timer.
 - **`logDebug` vs `logInfo`**: the `/api/admin/logs` ring buffer only retains info-level entries. Use `logDebug` on any code that runs on every request (status polling, connectability, URL resolution) so operational logs don't get evicted.
 - **Test-only controller override**: `_setSandboxControllerForTesting()` is a no-op unless `NODE_ENV=test`. In production, `getSandboxController()` always returns the real `@vercel/sandbox` v2 SDK.
 - **`_setAiGatewayTokenOverrideForTesting()`** is the supported way to stub OIDC in tests — do not mock `@vercel/oidc` directly.
@@ -91,11 +91,11 @@ These are the things Claude will otherwise get wrong:
 
 ## Debugging channel delivery
 
-When a hosted channel (Slack/Telegram/Discord) is "stuck" — message sent, bot doesn't reply — start here. **Always read the structured surfaces before guessing**: vague error strings have repeatedly masked different bugs.
+When a supported hosted channel (Slack/Telegram) is "stuck" — message sent, bot doesn't reply — start here. Use the Discord and WhatsApp lanes only to prove their hosted fail-closed and legacy-cleanup behavior. **Always read the structured surfaces before guessing**: vague error strings have repeatedly masked different bugs.
 
 ### Discipline first, code second
 
-This system has layered failures (OAuth, sandbox lifecycle, gateway routes, plugin loading, cached URLs, fast path vs workflow). When debugging it, follow this discipline — past sessions burned hours when we let momentum override evidence.
+This system has layered failures (OAuth, sandbox lifecycle, gateway routes, plugin loading, cached URLs, and Workflow delivery). When debugging it, follow this discipline — past sessions burned hours when we let momentum override evidence. Direct native dispatch remains test-only until it has an atomic queued-owner/idempotency contract.
 
 ### Start with parallel evidence fan-out
 
@@ -153,7 +153,7 @@ Merge gate before fixes: all lane handoffs are present, or any missing lane is e
 
 1. **Runtime path diagram.** The full delivery pipeline for the channel in question:
    ```
-   Slack UI message → webhook route → fast path? → workflow fallback?
+   Slack UI message → webhook route → durable Workflow handoff
      → sandbox public URL → gateway → plugin route registered? → native handler
      → bot reply → readiness/summary updated
    ```
@@ -207,7 +207,7 @@ This makes rollback and review sane and forces honest scoping.
 
 ### Codex channel specialists
 
-Use the repo-local Codex channel specialists for Slack, Telegram, Discord, and WhatsApp delivery work. The custom agent role files live in `.codex/agents/*.toml`; the reusable playbooks live in `.agents/skills/*/SKILL.md`. Codex loads `.agents/skills` as shared skills, but channel specialist roles must stay in `.codex/agents`.
+Use the repo-local Codex channel specialists for Slack and Telegram delivery work, and for Discord/WhatsApp fail-closed or legacy-cleanup proof. The custom agent role files live in `.codex/agents/*.toml`; the reusable playbooks live in `.agents/skills/*/SKILL.md`. Codex loads `.agents/skills` as shared skills, but channel specialist roles must stay in `.codex/agents`.
 
 Start every channel incident with `$channel-debug-core`; it requires deployment proof, the admin readiness surfaces, a runtime path diagram, a hypothesis table, and a handoff before any fix. Use `$channel-forward-parity` before changing a webhook route or `src/server/workflows/channels/drain-channel-workflow.ts`.
 
@@ -215,10 +215,10 @@ For parallel triage, explicitly spawn project agents and keep ownership narrow:
 
 | Channel | Agent | Primary skill | Evidence focus |
 | --- | --- | --- | --- |
-| Telegram | `channel_telegram` | `telegram-native-8787` | Native port 8787, webhook secret flow, boot cleanup, user-visible replies |
-| Slack | `channel_slack` | `slack-delivery` | OAuth vs delivery-ready, raw-body signature forwarding, `/slack/events` fast path |
-| Discord | `channel_discord` | `discord-delivery` | Ed25519 verification, interaction deferral, token expiry, workflow forwarding |
-| WhatsApp | `channel_whatsapp` | `whatsapp-delivery` | Meta verification, raw-body signatures, link-state projection, boot messages |
+| Telegram | `channel_telegram` | `telegram-native-8787` | Native port 8787, webhook secret flow, durable acceptance, user-visible replies |
+| Slack | `channel_slack` | `slack-delivery` | OAuth vs delivery-ready, raw-body signature Workflow forwarding, `/slack/events` acceptance |
+| Discord (hosted disabled) | `channel_discord` | `discord-delivery` | Ed25519 verification, immediate fail-closed replies, legacy endpoint cleanup |
+| WhatsApp (hosted disabled) | `channel_whatsapp` | `whatsapp-delivery` | Fail-closed setup/webhook proof and legacy credential removal |
 
 | Lane | Agent | Evidence focus |
 | --- | --- | --- |
@@ -303,9 +303,9 @@ When debugging, search `/api/admin/logs` for the requestId and follow the chain.
 - `sandbox.port_urls.refreshed` — `getSandboxDomain` cache miss with new URL
 - `sandbox.port_url_dead` — `markSandboxPortUrlStale` was called
 
-### Channel parity rules — every fast path MUST
+### Channel parity rules — test-only direct dispatch
 
-These invariants hold across Slack, Telegram, and Discord webhook routes (`src/app/api/channels/<ch>/webhook/route.ts`). When adding a new channel or touching an existing fast path:
+Production Slack and Telegram ingress always uses Workflow. The direct-dispatch branches in their webhook routes are test-only until native admission and queued ownership can be made atomic. If that experimental code is touched, preserve these invariants:
 
 1. Call `recordChannelLastForward(<channel>, {...})` in **every** fast-path branch (success, gateway-error, non-ok, network/timeout) — both the success and failure cases. Otherwise `lastForward` stays null and `/api/channels/summary` can't surface readiness.
 2. Use the unified classification rules in failure branches: body matches `/^This sandbox is not listening/` → `sandbox-not-listening`; status ≥ 502 → `proxy-error`; status === 404 → `handler-not-ready`; other non-2xx → `handler-error`; network/timeout → `fetch-exception`.
@@ -323,9 +323,9 @@ When a Slack message arrives while sandbox is `snapshotting`/`suspended`:
 
 ```
 channels.slack_webhook_accepted
-channels.slack_fast_path_skipped reason="sandbox_status_<state>"
-channels.slack_boot_message_sent          ← user sees "Waking up..."
-channels.slack_workflow_started           ← workflow path takes over
+channels.slack_fast_path_skipped reason="workflow_only"
+channels.slack_workflow_started           ← durable owner established
+channels.slack_boot_message_sent          ← Workflow posts "Waking up..."
 sandbox.status_transition: <state> → setup → running
 gateway.config_built / gateway.restart_*
 channels.forward_attempt attempt=1 status=404 classification=handler-not-ready
@@ -349,7 +349,7 @@ curl -s $H "$URL/api/admin/sandbox-diag"   | jq '.sandboxStatus, .ports'
 curl -s $H "$URL/api/admin/logs"           | jq '.logs[] | select(.message | startswith("channels.") or startswith("gateway.") or startswith("sandbox."))' | head -100
 ```
 
-If `lastForward.classification === "sandbox-not-listening"` and the URL doesn't auto-refresh, the fix has regressed — check `markSandboxPortUrlStale` is still wired into the relevant fast path. If `sandbox-diag` shows port 3000 with `httpStatus:404 message:"Handler not registered yet"` and stays stuck, the gateway's bundle never bound the channel route — `POST /api/admin/reset`.
+If Workflow `lastForward.classification === "sandbox-not-listening"` and the next attempt does not refresh the URL, check `markSandboxPortUrlStale` in the shared forward loop. If `sandbox-diag` shows port 3000 with `httpStatus:404 message:"Handler not registered yet"` and stays stuck, the gateway's bundle never bound the channel route — `POST /api/admin/reset`.
 
 ## Auth modes
 
@@ -368,6 +368,7 @@ Full list is in `.env.example`. Non-obvious policies:
 - **`NEXT_PUBLIC_APP_URL`, `NEXT_PUBLIC_BASE_DOMAIN`, `BASE_DOMAIN`**: inputs to `getPublicOrigin()` alongside forwarded headers and Vercel system env vars. Admin-visible URLs must use `buildPublicDisplayUrl()`.
 - **`NEXT_PUBLIC_VERCEL_APP_CLIENT_ID` + `VERCEL_APP_CLIENT_SECRET`**: required for `sign-in-with-vercel` OAuth. Missing these is a `auth-config` fail in preflight when that mode is selected.
 - **`OPENCLAW_INSTANCE_ID`**: namespaces Redis keys. On Vercel it auto-uses `VERCEL_PROJECT_ID` when unset; locally falls back to `openclaw-single`. Changing it points at a new namespace — it does not migrate existing state.
+- **`OPENCLAW_OWNER_ALLOW_FROM`**: comma-separated, channel-scoped explicit owners for owner-only commands, such as `telegram:123456789,slack:U12345678`. Wildcards are rejected. When unset, normal channel chat works but owner-only commands fail closed.
 - **`OPENCLAW_SANDBOX_SLEEP_AFTER_MS`**: existing running sandboxes can only be lengthened in place; shortening takes effect on next create/restore.
 - **`SESSION_SECRET`**: auto-generated in admin-secret mode; must be explicitly set for `sign-in-with-vercel` on Vercel.
 

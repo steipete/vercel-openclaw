@@ -34,9 +34,12 @@ import {
 import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-workflow";
 
 class TestRetryableError extends Error {
-  retryAfter?: string;
+  retryAfter?: string | number | Date;
 
-  constructor(message: string, options?: { retryAfter?: string }) {
+  constructor(
+    message: string,
+    options?: { retryAfter?: string | number | Date },
+  ) {
     super(message);
     this.name = "RetryableError";
     this.retryAfter = options?.retryAfter;
@@ -2388,6 +2391,895 @@ test("processChannelStep durably retries Slack boot cleanup after API rejection"
   }
 });
 
+test("processChannelStep honors Slack cleanup Retry-After without forwarding again", async () => {
+  const config = {
+    signingSecret: "signing",
+    botToken: "rate-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  let deleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).endsWith("chat.delete")) {
+        deleteCalls += 1;
+        return deleteCalls === 1
+          ? Response.json(
+              { ok: false, error: "ratelimited" },
+              { status: 429, headers: { "retry-after": "301" } },
+            )
+          : Response.json({ ok: true });
+      }
+      return Response.json({ ok: true });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-cleanup-rate-limit" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      {
+        event_id: "Ev-cleanup-rate-limit",
+        event: { channel: "C-cleanup-rate-limit" },
+      },
+      "test",
+      "req-cleanup-rate-limit",
+      "boot-cleanup-rate-limit",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: config,
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: {
+            channel: "C-cleanup-rate-limit",
+            threadTs: null,
+          },
+        },
+      },
+    );
+
+  try {
+    await assert.rejects(run(), (error: unknown) => {
+      assert.ok(error instanceof TestRetryableError);
+      assert.equal(error.retryAfter, 301_000);
+      return true;
+    });
+    await run();
+    assert.equal(forwardCalls, 1);
+    assert.equal(deleteCalls, 2);
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep exhausts cleanup when Retry-After exceeds its remaining budget", async () => {
+  const config = {
+    signingSecret: "signing",
+    botToken: "rate-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  let deleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (!String(input).endsWith("chat.delete")) {
+        return Response.json({ ok: true });
+      }
+      deleteCalls += 1;
+      return deleteCalls === 1
+        ? Response.json({ ok: false, error: "service_unavailable" })
+        : Response.json(
+            { ok: false, error: "ratelimited" },
+            { status: 429, headers: { "retry-after": "301" } },
+          );
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-cleanup-rate-exhausted" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      {
+        event_id: "Ev-cleanup-rate-exhausted",
+        event: { channel: "C-cleanup-rate-exhausted" },
+      },
+      "test",
+      "req-cleanup-rate-exhausted",
+      "boot-cleanup-rate-exhausted",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: config,
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: {
+            channel: "C-cleanup-rate-exhausted",
+            threadTs: null,
+          },
+        },
+      },
+    );
+  let nowMs = Date.now();
+  const dateMock = mock.method(Date, "now", () => nowMs);
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    nowMs += 5 * 60 * 1000;
+    await run();
+    assert.equal(forwardCalls, 1);
+    assert.equal(deleteCalls, 2);
+    const abandoned = getServerLogs().find(
+      (entry) =>
+        entry.message === "channels.slack_boot_message_cleanup_abandoned" &&
+        String(entry.data?.cleanupRetryReason).includes("rate_limit_301000ms"),
+    );
+    assert.ok(abandoned);
+  } finally {
+    dateMock.mock.restore();
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep retries cleanup-only when owner retirement fails after delete", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const store = getStore();
+  const originalDeleteValue = store.deleteValue.bind(store);
+  let ownerDeleteFailures = 1;
+  const deleteValueMock = mock.method(
+    store,
+    "deleteValue",
+    async (key: string) => {
+      if (key.includes(":boot-message:") && ownerDeleteFailures > 0) {
+        ownerDeleteFailures -= 1;
+        throw new Error("owner retirement unavailable");
+      }
+      return originalDeleteValue(key);
+    },
+  );
+  let slackDeleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).endsWith("chat.delete")) {
+        slackDeleteCalls += 1;
+        return slackDeleteCalls === 1
+          ? Response.json({ ok: true })
+          : Response.json({ ok: false, error: "message_not_found" });
+      }
+      return Response.json({ ok: true });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    isRetryable: (error) =>
+      (error as { name?: unknown } | null)?.name === "RetryableSendError",
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-owner-retire" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      { event_id: "Ev-owner-retire", event: { channel: "C-owner-retire" } },
+      "test",
+      "req-owner-retire",
+      "boot-owner-retire",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: config,
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: { channel: "C-owner-retire", threadTs: null },
+        },
+      },
+    );
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    await run();
+    assert.equal(forwardCalls, 1);
+    assert.equal(slackDeleteCalls, 2);
+  } finally {
+    fetchMock.mock.restore();
+    deleteValueMock.mock.restore();
+  }
+});
+
+test("processChannelStep retires cleanup debt on permanent Slack rejection", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-revoked",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) =>
+      String(input).endsWith("chat.delete")
+        ? Response.json({ ok: false, error: "invalid_auth" })
+        : Response.json({ ok: true }),
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-permanent-cleanup" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  try {
+    await processChannelStep(
+      "slack",
+      { event_id: "Ev-permanent-cleanup", event: { channel: "C-permanent" } },
+      "test",
+      "req-permanent-cleanup",
+      "boot-permanent-cleanup",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: config,
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: { channel: "C-permanent", threadTs: null },
+        },
+      },
+    );
+    assert.equal(forwardCalls, 1);
+    const abandoned = getServerLogs().find(
+      (entry) =>
+        entry.message === "channels.slack_boot_message_cleanup_abandoned",
+    );
+    assert.equal(abandoned?.data?.permanentCleanupFailure, true);
+    assert.equal(abandoned?.data?.slackErrorCode, "invalid_auth");
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep retries invalid_auth cleanup with a rotated same-bot token", async () => {
+  const originalConfig = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-cleanup-old",
+    configuredAt: Date.now(),
+    team: "T-cleanup-rotation",
+    botId: "B-cleanup-rotation",
+  };
+  const rotatedConfig = {
+    ...originalConfig,
+    botToken: "xoxb-cleanup-current",
+    configuredAt: originalConfig.configuredAt + 1,
+  };
+  await setSlackChannelConfig(originalConfig);
+  const deleteAuthorizations: string[] = [];
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      if (!String(input).endsWith("chat.delete")) {
+        return Response.json({ ok: true });
+      }
+      deleteAuthorizations.push(String(new Headers(init?.headers).get("authorization")));
+      if (deleteAuthorizations.length === 1) {
+        await setSlackChannelConfig(rotatedConfig);
+        return Response.json({ ok: false, error: "invalid_auth" });
+      }
+      return Response.json({ ok: true });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-cleanup-rotation" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      {
+        event_id: "Ev-cleanup-rotation",
+        event: { channel: "C-cleanup-rotation" },
+      },
+      "test",
+      "req-cleanup-rotation",
+      "boot-cleanup-rotation",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: originalConfig,
+          slackConfigGeneration: originalConfig.configuredAt,
+          slackBootTarget: {
+            channel: "C-cleanup-rotation",
+            threadTs: null,
+          },
+        },
+      },
+    );
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    assert.equal(
+      getServerLogs().some(
+        (entry) =>
+          entry.message === "channels.slack_boot_message_cleanup_abandoned",
+      ),
+      false,
+    );
+    await run();
+    assert.equal(forwardCalls, 1);
+    assert.deepEqual(deleteAuthorizations, [
+      `Bearer ${originalConfig.botToken}`,
+      `Bearer ${rotatedConfig.botToken}`,
+    ]);
+    assert.ok(
+      getServerLogs().some(
+        (entry) =>
+          entry.message ===
+          "channels.slack_boot_message_cleanup_credential_refreshed",
+      ),
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep retires cleanup after the rotated token also rejects", async () => {
+  const originalConfig = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-cleanup-old-terminal",
+    configuredAt: Date.now(),
+    team: "T-cleanup-rotation-terminal",
+    botId: "B-cleanup-rotation-terminal",
+  };
+  const rotatedConfig = {
+    ...originalConfig,
+    botToken: "xoxb-cleanup-current-terminal",
+    configuredAt: originalConfig.configuredAt + 1,
+  };
+  await setSlackChannelConfig(originalConfig);
+  const deleteAuthorizations: string[] = [];
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (
+      input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      if (!String(input).endsWith("chat.delete")) {
+        return Response.json({ ok: true });
+      }
+      deleteAuthorizations.push(String(new Headers(init?.headers).get("authorization")));
+      if (deleteAuthorizations.length === 1) {
+        await setSlackChannelConfig(rotatedConfig);
+      }
+      return Response.json({ ok: false, error: "invalid_auth" });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-cleanup-rotation-terminal",
+      }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      {
+        event_id: "Ev-cleanup-rotation-terminal",
+        event: { channel: "C-cleanup-rotation-terminal" },
+      },
+      "test",
+      "req-cleanup-rotation-terminal",
+      "boot-cleanup-rotation-terminal",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: originalConfig,
+          slackConfigGeneration: originalConfig.configuredAt,
+          slackBootTarget: {
+            channel: "C-cleanup-rotation-terminal",
+            threadTs: null,
+          },
+        },
+      },
+    );
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    await run();
+    assert.equal(forwardCalls, 1);
+    assert.deepEqual(deleteAuthorizations, [
+      `Bearer ${originalConfig.botToken}`,
+      `Bearer ${rotatedConfig.botToken}`,
+    ]);
+    const abandoned = getServerLogs().find(
+      (entry) =>
+        entry.message === "channels.slack_boot_message_cleanup_abandoned",
+    );
+    assert.equal(abandoned?.data?.permanentCleanupFailure, true);
+    assert.equal(abandoned?.data?.slackErrorCode, "invalid_auth");
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep keeps cleanup ledger store failures out of delivery failure", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-cleanup-ledger",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const store = getStore();
+  const originalSetValue = store.setValue.bind(store);
+  const originalCompareAndSetValueToken =
+    store.compareAndSetValueToken.bind(store);
+  let failResolvedFence = false;
+  let failedResolvedFenceWrites = 0;
+  let failCleanupCas = false;
+  const setValueMock = mock.method(
+    store,
+    "setValue",
+    async (...args: Parameters<typeof store.setValue>) => {
+      if (
+        failResolvedFence &&
+        failedResolvedFenceWrites < 5 &&
+        args[0].includes(":failed-resolved:")
+      ) {
+        failedResolvedFenceWrites += 1;
+        throw new Error("accepted fence store unavailable");
+      }
+      return originalSetValue(...args);
+    },
+  );
+  const compareAndSetValueTokenMock = mock.method(
+    store,
+    "compareAndSetValueToken",
+    async (...args: Parameters<typeof store.compareAndSetValueToken>) => {
+      if (failCleanupCas && args[0].includes(":boot-message:")) {
+        failCleanupCas = false;
+        throw new Error("cleanup owner CAS unavailable");
+      }
+      return originalCompareAndSetValueToken(...args);
+    },
+  );
+  let deleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).endsWith("chat.delete")) {
+        deleteCalls += 1;
+        return deleteCalls === 1
+          ? Response.json({ ok: false, error: "service_unavailable" })
+          : Response.json({ ok: true });
+      }
+      return Response.json({ ok: true });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-cleanup-ledger" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      { event_id: "Ev-cleanup-ledger", event: { channel: "C-cleanup-ledger" } },
+      "test",
+      "req-cleanup-ledger",
+      "boot-cleanup-ledger",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: config,
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: { channel: "C-cleanup-ledger", threadTs: null },
+        },
+      },
+    );
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    failResolvedFence = true;
+    await assert.rejects(run(), TestRetryableError);
+    failResolvedFence = false;
+    failCleanupCas = true;
+    await assert.rejects(run(), TestRetryableError);
+    await run();
+    assert.equal(forwardCalls, 1);
+    assert.equal(deleteCalls, 2);
+    assert.equal(
+      getServerLogs().some(
+        (entry) =>
+          entry.message === "channels.workflow_retryable_failure_recorded" ||
+          entry.message === "channels.workflow_terminal_failure_recorded",
+      ),
+      false,
+    );
+  } finally {
+    fetchMock.mock.restore();
+    compareAndSetValueTokenMock.mock.restore();
+    setValueMock.mock.restore();
+  }
+});
+
+test("processChannelStep gives accepted cleanup a fresh retry budget", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-transient",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  let deleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).endsWith("chat.delete")) {
+        deleteCalls += 1;
+        return Response.json({ ok: false, error: "service_unavailable" });
+      }
+      return Response.json({ ok: true });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    getStepMetadata: (() => ({
+      stepName: "processChannelStep",
+      stepId: "cleanup-budget-step",
+      stepStartedAt: new Date(),
+      attempt: 25,
+    })) as never,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-cleanup-budget" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  try {
+    await assert.rejects(
+      processChannelStep(
+        "slack",
+        { event_id: "Ev-cleanup-budget", event: { channel: "C-budget" } },
+        "test",
+        "req-cleanup-budget",
+        "boot-cleanup-budget",
+        {
+          dependencies,
+          receivedAtMs: Date.now() - 2 * 60 * 60 * 1000,
+          workflowHandoff: {
+            slackCleanupConfig: config,
+            slackConfigGeneration: config.configuredAt,
+            slackBootTarget: { channel: "C-budget", threadTs: null },
+          },
+        },
+      ),
+      TestRetryableError,
+    );
+    assert.equal(forwardCalls, 1);
+    assert.equal(deleteCalls, 1);
+    assert.equal(
+      getServerLogs().some(
+        (entry) =>
+          entry.message === "channels.slack_boot_message_cleanup_abandoned",
+      ),
+      false,
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep bounds accepted cleanup by its persisted attempt count", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-cleanup-attempt-cap",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  let deleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).endsWith("chat.delete")) {
+        deleteCalls += 1;
+        return Response.json({ ok: false, error: "service_unavailable" });
+      }
+      return Response.json({ ok: true });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-cleanup-attempt-cap" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      {
+        event_id: "Ev-cleanup-attempt-cap",
+        event: { channel: "C-cleanup-attempt-cap" },
+      },
+      "test",
+      "req-cleanup-attempt-cap",
+      "boot-cleanup-attempt-cap",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: config,
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: {
+            channel: "C-cleanup-attempt-cap",
+            threadTs: null,
+          },
+        },
+      },
+    );
+
+  try {
+    for (let attempt = 1; attempt < 25; attempt += 1) {
+      await assert.rejects(run(), TestRetryableError);
+    }
+    await run();
+    assert.equal(forwardCalls, 1);
+    assert.equal(deleteCalls, 25);
+    const abandoned = getServerLogs().find(
+      (entry) =>
+        entry.message === "channels.slack_boot_message_cleanup_abandoned",
+    );
+    assert.equal(abandoned?.data?.permanentCleanupFailure, false);
+    assert.equal(abandoned?.data?.cleanupAttempt, 25);
+    assert.match(
+      String(abandoned?.data?.cleanupRetryReason),
+      /25_attempts/,
+    );
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep bounds accepted cleanup by its persisted elapsed time", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-cleanup-wall-clock",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  let deleteCalls = 0;
+  const fetchMock = mock.method(
+    globalThis,
+    "fetch",
+    async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).endsWith("chat.delete")) {
+        deleteCalls += 1;
+        return Response.json({ ok: false, error: "service_unavailable" });
+      }
+      return Response.json({ ok: true });
+    },
+  );
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    buildExistingBootHandle,
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-cleanup-wall-clock" }),
+      bootMessageSent: true,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const run = () =>
+    processChannelStep(
+      "slack",
+      {
+        event_id: "Ev-cleanup-wall-clock",
+        event: { channel: "C-cleanup-wall-clock" },
+      },
+      "test",
+      "req-cleanup-wall-clock",
+      "boot-cleanup-wall-clock",
+      {
+        dependencies,
+        workflowHandoff: {
+          slackCleanupConfig: config,
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: {
+            channel: "C-cleanup-wall-clock",
+            threadTs: null,
+          },
+        },
+      },
+    );
+  let nowMs = Date.now();
+  const dateMock = mock.method(Date, "now", () => nowMs);
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    nowMs += 10 * 60 * 1000;
+    await run();
+    assert.equal(forwardCalls, 1);
+    assert.equal(deleteCalls, 1);
+    const abandoned = getServerLogs().find(
+      (entry) =>
+        entry.message === "channels.slack_boot_message_cleanup_abandoned",
+    );
+    assert.equal(abandoned?.data?.cleanupAttempt, 1);
+    assert.equal(abandoned?.data?.cleanupElapsedMs, 10 * 60 * 1000);
+  } finally {
+    dateMock.mock.restore();
+    fetchMock.mock.restore();
+  }
+});
+
 test("processChannelStep repairs stopped-sandbox Slack config sync before forwarding", async () => {
   const config = {
     signingSecret: "slack-signing-secret",
@@ -2623,7 +3515,7 @@ test("Slack accepted-placeholder cleanup retries without forwarding twice", asyn
       null,
       {
         dependencies,
-        receivedAtMs: Date.now() - 20 * 60 * 1000,
+        receivedAtMs: Date.now(),
         workflowHandoff: {
           slackCleanupConfig: {
             botToken: config.botToken,
@@ -2646,17 +3538,7 @@ test("Slack accepted-placeholder cleanup retries without forwarding twice", asyn
       botToken: "xoxb-rotated-after-accept",
       configuredAt: config.configuredAt + 1,
     });
-    const realNow = Date.now();
-    const dateMock = mock.method(
-      Date,
-      "now",
-      () => realNow + 2 * 60 * 60 * 1000,
-    );
-    try {
-      await run();
-    } finally {
-      dateMock.mock.restore();
-    }
+    await run();
     assert.equal(forwardCalls, 1);
     assert.equal(postCalls, 1);
     assert.equal(deleteCalls, 2);
@@ -3500,6 +4382,220 @@ test("generic 403 closes workflow forwarding as unknown without replay", async (
   } finally {
     fetchMock.mock.restore();
   }
+});
+
+test("admitted direct-local Telegram 500 remains unknown without retry", async () => {
+  let localCalls = 0;
+  const result = await forwardToNativeHandlerWithRetry(
+    "telegram",
+    { update_id: 7001 },
+    asMeta({
+      status: "running",
+      sandboxId: "sbx-local-telegram-500",
+      channels: {
+        telegram: {
+          ...createFallbackTelegramConfig(),
+          webhookSecret: "local-secret",
+        },
+        slack: null,
+        discord: null,
+        whatsapp: null,
+      },
+    }),
+    async () => "https://sandbox.example",
+    async () => {
+      localCalls += 1;
+      return {
+        ok: false,
+        status: 500,
+        durationMs: 5,
+        bodyLength: 18,
+        bodyHead: "response failed after spool commit",
+        headers: null,
+      };
+    },
+    true,
+    null,
+    null,
+    "telegram:bot:7001",
+    true,
+    false,
+    "https://control.example",
+  );
+
+  assert.equal(localCalls, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.acceptance, "unknown");
+  assert.equal(result.attempts, 1);
+  assert.equal(result.attemptsDetail?.[0]?.transport, "local");
+  assert.equal(
+    result.attemptsDetail?.[0]?.classification,
+    "acceptance-unknown",
+  );
+  assert.equal(result.attemptsDetail?.[0]?.acceptance, "unknown");
+});
+
+test("admitted direct-local Telegram durable marker stays accepted", async () => {
+  let localCalls = 0;
+  const result = await forwardToNativeHandlerWithRetry(
+    "telegram",
+    { update_id: 7003 },
+    asMeta({
+      status: "running",
+      sandboxId: "sbx-local-telegram-durable",
+      channels: {
+        telegram: {
+          ...createFallbackTelegramConfig(),
+          webhookSecret: "local-secret",
+        },
+        slack: null,
+        discord: null,
+        whatsapp: null,
+      },
+    }),
+    async () => "https://sandbox.example",
+    async () => {
+      localCalls += 1;
+      return {
+        ok: false,
+        status: 500,
+        durationMs: 5,
+        bodyLength: 0,
+        bodyHead: "",
+        headers: { openclawDeliveryAccepted: "durable" },
+      };
+    },
+    true,
+    null,
+    null,
+    "telegram:bot:7003",
+    true,
+    false,
+    "https://control.example",
+  );
+
+  assert.equal(localCalls, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 500);
+  assert.equal(result.acceptance, "accepted");
+  assert.equal(result.attemptsDetail?.[0]?.classification, "accepted");
+  assert.equal(result.attemptsDetail?.[0]?.acceptance, "accepted");
+});
+
+test("public Telegram 500 remains acceptance-unknown", async () => {
+  let fetchCalls = 0;
+  const fetchMock = mock.method(globalThis, "fetch", async () => {
+    fetchCalls += 1;
+    return new Response("spool status unavailable", { status: 500 });
+  });
+  try {
+    const result = await forwardToNativeHandlerWithRetry(
+      "telegram",
+      { update_id: 7002 },
+      asMeta({
+        status: "running",
+        sandboxId: "sbx-public-telegram-500",
+        channels: {
+          telegram: createFallbackTelegramConfig(),
+          slack: null,
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      async () => "https://sandbox.example",
+      null,
+      false,
+      null,
+      null,
+      "telegram:bot:7002",
+      true,
+      false,
+      "https://control.example",
+    );
+
+    assert.equal(fetchCalls, 1);
+    assert.equal(result.ok, false);
+    assert.equal(result.acceptance, "unknown");
+    assert.equal(result.attemptsDetail?.[0]?.transport, "public");
+  } finally {
+    fetchMock.mock.restore();
+  }
+});
+
+test("processChannelStep preserves Slack native acceptance across config rotation", async () => {
+  const originalConfig = {
+    signingSecret: "original-signing-secret",
+    botToken: "xoxb-original-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(originalConfig);
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-slack-post-dispatch-rotation",
+        channels: {
+          telegram: null,
+          slack: originalConfig,
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      bootMessageSent: false,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (): Promise<RetryingForwardResult> => {
+      await setSlackChannelConfig({
+        ...originalConfig,
+        botToken: "xoxb-rotated-token",
+        configuredAt: originalConfig.configuredAt + 1,
+      });
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 20,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep(
+    "slack",
+    { event_id: "Ev-accepted-before-rotation", event: {} },
+    "test",
+    "req-slack-accepted-before-rotation",
+    null,
+    {
+      dependencies,
+      workflowHandoff: {
+        slackCleanupConfig: {
+          botToken: originalConfig.botToken,
+          configuredAt: originalConfig.configuredAt,
+        },
+        slackConfigGeneration: originalConfig.configuredAt,
+        slackForwardHeaders: {
+          "x-slack-signature": "v0=original",
+          "x-slack-request-timestamp": "1700000000",
+        },
+        slackRawBody:
+          '{"event_id":"Ev-accepted-before-rotation","event":{}}',
+      },
+    },
+  );
+
+  const meta = await getInitializedMeta();
+  assert.equal(meta.channelDiagnostics?.slack?.lastForward?.ok, true);
+  assert.equal(
+    meta.channelDiagnostics?.slack?.lastForward?.classification,
+    "accepted",
+  );
+  assert.equal(
+    await getChannelDlqRecord("slack", "slack:Ev-accepted-before-rotation"),
+    null,
+  );
 });
 
 test("processChannelStep passes slackForwardHeaders from handoff through to the retry wrapper", async () => {

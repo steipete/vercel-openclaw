@@ -12,10 +12,7 @@ import assert from "node:assert/strict";
 import { mock } from "node:test";
 import test from "node:test";
 
-import {
-  channelDedupKey,
-  channelUserMessageDedupKey,
-} from "@/server/channels/keys";
+import { channelDedupKey } from "@/server/channels/keys";
 import { hostSuspensionOperationKey } from "@/server/store/keyspace";
 import type { HostSuspensionState } from "@/server/sandbox/host-suspension";
 import { getStore } from "@/server/store/store";
@@ -531,6 +528,13 @@ test("Slack webhook: app_mention + message for same user post collapses to one w
         buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET, payload: appMention }),
       );
       assert.equal(r1.status, 200);
+      assert.equal(
+        (await readChannelHandoff(
+          "slack",
+          `slack:user-message:${channel}:${ts}`,
+        ))?.state,
+        "handed-off",
+      );
       resetAfterCallbacks();
       const r2 = await callRoute(
         route.POST,
@@ -1142,11 +1146,6 @@ test("Slack webhook: releases dedup lock and returns 500 when workflow start fai
       },
     };
     const dedupKey = channelDedupKey("slack", payload.event_id);
-    const userMessageDedupKey = channelUserMessageDedupKey(
-      "slack",
-      payload.event.channel,
-      payload.event.ts,
-    );
     const startMock = mock.method(slackWebhookWorkflowRuntime, "start", async () => {
       throw new Error("workflow engine unavailable");
     });
@@ -1164,16 +1163,6 @@ test("Slack webhook: releases dedup lock and returns 500 when workflow start fai
       const reacquiredToken = await getStore().acquireLock(dedupKey, 60);
       assert.ok(reacquiredToken, "dedup lock should be released when workflow start fails");
       await getStore().releaseLock(dedupKey, reacquiredToken!);
-
-      const reacquiredUserMessageToken = await getStore().acquireLock(
-        userMessageDedupKey,
-        60,
-      );
-      assert.ok(
-        reacquiredUserMessageToken,
-        "user-message dedup lock should be released when workflow start fails",
-      );
-      await getStore().releaseLock(userMessageDedupKey, reacquiredUserMessageToken!);
 
       assert.equal(startMock.mock.callCount(), 1);
       const handoffFailure = getServerLogs().find(

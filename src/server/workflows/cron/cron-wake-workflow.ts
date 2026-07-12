@@ -50,6 +50,7 @@ export async function cronWakeWorkflow(
         await sleep(monitorAfterMs);
         const monitor = await settleCronWakeStep(envelope);
         if (monitor.status === "settled") return;
+        if (monitor.status === "rehandoff") break;
         settlementRecoveryAttempts = countCronSettlementRecoveryAttempt(
           settlementRecoveryAttempts,
           monitor.settlementRecoveryAttempted,
@@ -59,6 +60,7 @@ export async function cronWakeWorkflow(
         }
         monitorAfterMs = monitor.retryAfterMs;
       }
+      continue;
     }
     await sleep(
       getCronWakeDurableRetryMs(recoveryCycle, outcome.retryAfterMs),
@@ -80,6 +82,7 @@ export async function cronDispatchRepairWorkflow(
   while (true) {
     const outcome = await settleCronWakeStep(envelope);
     if (outcome.status === "settled") return;
+    if (outcome.status === "rehandoff") return;
     if (!(await isCronDispatchRepairNeededStep(envelope))) return;
     await sleep(outcome.retryAfterMs);
   }

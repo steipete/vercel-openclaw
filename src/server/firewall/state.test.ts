@@ -18,6 +18,7 @@ import {
   getFirewallState,
   ingestLearningFromSandbox,
   promoteLearnedDomainsToEnforcing,
+  reconcileFirewallPolicyIfNeeded,
   removeDomains,
   setFirewallMode,
   syncFirewallPolicyIfRunning,
@@ -1816,6 +1817,126 @@ test("syncFirewallPolicyIfRunning persists lastSyncOutcome in metadata", async (
       assert.equal(state.lastSyncOutcome.applied, true);
       assert.equal(state.lastSyncOutcome.reason, "policy-applied");
       assert.equal(state.lastSyncOutcome.policyHash.length, 64);
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("firewall reconciliation repairs an interrupted desired-policy revision", async () => {
+  await withFirewallTestStore(async () => {
+    const ctrl = installSucceedingSandboxController();
+    try {
+      const oldHash = computePolicyHash("enforcing", ["old.example.com"]);
+      await prepareRunningSandbox((meta) => {
+        meta.lifecycleAttemptId = "attempt-interrupted-policy";
+        meta.firewall.mode = "enforcing";
+        meta.firewall.allowlist = ["old.example.com"];
+        meta.firewall.policyRevisionId = "old-revision";
+        meta.firewall.lastPolicySdkCompletionRevisionId = "old-revision";
+        meta.firewall.lastPolicySdkCompletionHash = oldHash;
+        meta.firewall.lastPolicySdkSuccessRevisionId = "old-revision";
+        meta.firewall.lastPolicySdkSuccessHash = oldHash;
+        meta.firewall.lastSyncOutcome = {
+          timestamp: 1,
+          durationMs: 1,
+          allowlistCount: 1,
+          policyHash: oldHash,
+          applied: true,
+          reason: "policy-applied",
+        };
+      });
+      await mutateMeta((meta) => {
+        meta.firewall.allowlist = ["new.example.com"];
+        meta.firewall.policyRevisionId = "interrupted-revision";
+      });
+
+      const outcome = await reconcileFirewallPolicyIfNeeded();
+      const meta = await getInitializedMeta();
+
+      assert.equal(outcome?.applied, true);
+      assert.deepEqual(ctrl.appliedPolicies, [{ allow: ["new.example.com"] }]);
+      assert.equal(
+        meta.firewall.policyRevisionId,
+        meta.firewall.lastPolicySdkCompletionRevisionId,
+      );
+      assert.equal(
+        meta.firewall.policyRevisionId,
+        meta.firewall.lastPolicySdkSuccessRevisionId,
+      );
+      assert.equal(
+        meta.firewall.lastSyncOutcome?.policyHash,
+        computePolicyHash("enforcing", ["new.example.com"]),
+      );
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("firewall reconciliation skips a currently attested policy", async () => {
+  await withFirewallTestStore(async () => {
+    const ctrl = installSucceedingSandboxController();
+    try {
+      const policyHash = computePolicyHash("enforcing", ["api.example.com"]);
+      await prepareRunningSandbox((meta) => {
+        meta.firewall.mode = "enforcing";
+        meta.firewall.allowlist = ["api.example.com"];
+        meta.firewall.lastSyncOutcome = {
+          timestamp: 1,
+          durationMs: 1,
+          allowlistCount: 1,
+          policyHash,
+          applied: true,
+          reason: "create-policy-applied",
+        };
+      });
+
+      assert.equal(await reconcileFirewallPolicyIfNeeded(), null);
+      assert.deepEqual(ctrl.appliedPolicies, []);
+    } finally {
+      ctrl.restore();
+    }
+  });
+});
+
+test("firewall reconciliation repairs a same-hash interrupted revision", async () => {
+  await withFirewallTestStore(async () => {
+    const ctrl = installSucceedingSandboxController();
+    try {
+      const policyHash = computePolicyHash("enforcing", ["api.example.com"]);
+      await prepareRunningSandbox((meta) => {
+        meta.lifecycleAttemptId = "attempt-same-hash-interrupted";
+        meta.firewall.mode = "enforcing";
+        meta.firewall.allowlist = ["api.example.com"];
+        meta.firewall.policyRevisionId = "interrupted-revision";
+        meta.firewall.lastPolicySdkCompletionRevisionId = "prior-revision";
+        meta.firewall.lastPolicySdkCompletionHash = policyHash;
+        meta.firewall.lastPolicySdkSuccessRevisionId = "prior-revision";
+        meta.firewall.lastPolicySdkSuccessHash = policyHash;
+        meta.firewall.lastSyncOutcome = {
+          timestamp: 1,
+          durationMs: 1,
+          allowlistCount: 1,
+          policyHash,
+          applied: true,
+          reason: "policy-applied",
+        };
+      });
+
+      const outcome = await reconcileFirewallPolicyIfNeeded();
+      const meta = await getInitializedMeta();
+
+      assert.equal(outcome?.applied, true);
+      assert.deepEqual(ctrl.appliedPolicies, [{ allow: ["api.example.com"] }]);
+      assert.equal(
+        meta.firewall.policyRevisionId,
+        meta.firewall.lastPolicySdkCompletionRevisionId,
+      );
+      assert.equal(
+        meta.firewall.policyRevisionId,
+        meta.firewall.lastPolicySdkSuccessRevisionId,
+      );
     } finally {
       ctrl.restore();
     }

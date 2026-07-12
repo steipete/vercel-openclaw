@@ -4,6 +4,7 @@ import {
   isVerifiedBundleIdentity,
   type VerifiedBundleIdentity,
 } from "@/shared/bundle-identity";
+import { getCronProjectionBaselineMode } from "@/server/cron/compatibility";
 
 export type { VerifiedBundleIdentity } from "@/shared/bundle-identity";
 
@@ -12,7 +13,6 @@ export const OPENCLAW_BUNDLE_COMPATIBILITY_ERROR_CODE =
 
 export const REQUIRED_OPENCLAW_BUNDLE_CAPABILITIES = [
   "admin-http-rpc-v1",
-  "cron-projection-v1",
   "gateway-suspend-v1",
   "telegram-durable-ack-v1",
 ] as const;
@@ -465,6 +465,11 @@ function requireBundleCapabilities(
     if (!capabilities.includes(capability)) {
       throw compatibilityError(`${CAPABILITY_MANIFEST_NAME} lacks ${capability}`);
     }
+  }
+  if (getCronProjectionBaselineMode(capabilities) === null) {
+    throw compatibilityError(
+      `${CAPABILITY_MANIFEST_NAME} lacks cron-projection-v1 or cron-projection-v2`,
+    );
   }
   return capabilities;
 }

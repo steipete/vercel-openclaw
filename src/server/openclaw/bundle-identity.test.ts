@@ -262,6 +262,37 @@ test("admits one exact manifest v2 identity with independent upstream version", 
   }
 });
 
+test("admits cron projection v2 without requiring the legacy v1 contract", async () => {
+  const restore = configureVerifiedBundle();
+  try {
+    const data = fixture();
+    const capabilities = JSON.parse(
+      data.capabilityBytes.toString("utf8"),
+    ) as { capabilities: string[] };
+    capabilities.capabilities = capabilities.capabilities.map((capability) =>
+      capability === "cron-projection-v1"
+        ? "cron-projection-v2"
+        : capability,
+    );
+    data.capabilityBytes = jsonBytes(capabilities);
+    replaceManifestAsset(
+      data,
+      "bundle-capabilities.json",
+      data.capabilityBytes,
+    );
+
+    const admission = await admitConfiguredOpenClawBundle(fixtureFetch(data));
+    assert.deepEqual(admission?.identity.capabilities, [
+      "admin-http-rpc-v1",
+      "cron-projection-v2",
+      "gateway-suspend-v1",
+      "telegram-durable-ack-v1",
+    ]);
+  } finally {
+    restore();
+  }
+});
+
 test("derives bundle packageSpec from manifest without npm fallback", async () => {
   const restore = configureVerifiedBundle();
   try {
@@ -319,7 +350,9 @@ test("rejects capability and external plugin semantic drift", async () => {
     const parsedCapabilities = JSON.parse(
       badCapabilities.capabilityBytes.toString("utf8"),
     ) as { capabilities: string[] };
-    parsedCapabilities.capabilities = ["admin-http-rpc-v1"];
+    parsedCapabilities.capabilities = parsedCapabilities.capabilities.filter(
+      (capability) => !capability.startsWith("cron-projection-"),
+    );
     badCapabilities.capabilityBytes = jsonBytes(parsedCapabilities);
     replaceManifestAsset(
       badCapabilities,
@@ -328,7 +361,7 @@ test("rejects capability and external plugin semantic drift", async () => {
     );
     await assert.rejects(
       admitConfiguredOpenClawBundle(fixtureFetch(badCapabilities)),
-      /bundle-capabilities\.json lacks cron-projection-v1/,
+      /bundle-capabilities\.json lacks cron-projection-v1 or cron-projection-v2/,
     );
 
     _resetBundleIdentityForTesting();

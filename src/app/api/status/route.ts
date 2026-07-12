@@ -74,6 +74,10 @@ export async function GET(request: Request): Promise<Response> {
     let timeoutRemainingMs: number | null;
     let timeoutSource: "live" | "estimated" | "none";
 
+    if (responseMeta.status === "running" || responseMeta.status === "snapshotting") {
+      responseMeta = await reconcileSnapshottingStatus();
+    }
+
     if (includeHealth) {
       const checkedAt = Date.now();
       const probe = await probeGatewayReady();
@@ -87,11 +91,11 @@ export async function GET(request: Request): Promise<Response> {
       timeoutRemainingMs = await getRunningSandboxTimeoutRemainingMs();
       timeoutSource = "live";
     } else {
-      const cachedGateway = getCachedGatewayStatus(meta);
+      const cachedGateway = getCachedGatewayStatus(responseMeta);
       gatewayStatus = cachedGateway.gatewayStatus;
       gatewayCheckedAt = cachedGateway.gatewayCheckedAt;
       timeoutRemainingMs = estimateSandboxTimeoutRemainingMs(
-        meta.lastAccessedAt,
+        responseMeta.lastAccessedAt,
         sleepConfig.sleepAfterMs,
       );
       timeoutSource = "estimated";

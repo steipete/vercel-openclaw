@@ -54,13 +54,8 @@ export type PublicDiscordState = {
   endpointDrift: boolean;
   canRepairEndpoint: boolean;
   nextSafeAction:
-    | "paste-token"
-    | "repair-endpoint"
-    | "configure-endpoint"
-    | "register-command"
-    | "invite-bot"
-    | "run-ask-test"
-    | "inspect-final-reply-path";
+    | "disconnect-legacy"
+    | "use-local-openclaw";
   applicationId: string | null;
   publicKey: string | null;
   configuredAt: number | null;

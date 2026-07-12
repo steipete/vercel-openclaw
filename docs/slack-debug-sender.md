@@ -2,7 +2,7 @@
 
 This guide describes the operator-only tool for sending real Slack user messages during channel incidents.
 
-The sender uses Slack Web API `chat.postMessage` with an explicitly authorized OAuth user token. It does not use Slack CLI app-management credentials, bot tokens, incoming webhooks, browser cookies, or fake Events API payloads. The goal is to trigger the same Slack Events API path that a real user message triggers: Slack -> `/api/channels/slack/webhook` -> fast path or Workflow -> sandbox `/slack/events` -> user-visible reply.
+The sender uses Slack Web API `chat.postMessage` with an explicitly authorized OAuth user token. It does not use Slack CLI app-management credentials, bot tokens, incoming webhooks, browser cookies, or fake Events API payloads. The goal is to trigger the same Slack Events API path that a real user message triggers: Slack -> `/api/channels/slack/webhook` -> durable Workflow handoff -> sandbox `/slack/events` -> user-visible reply.
 
 For first-time setup in a new workspace or Enterprise Grid org, follow [Slack Debug Sender Setup Guide](slack-debug-sender/GUIDE.md).
 

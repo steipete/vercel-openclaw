@@ -88,23 +88,6 @@ export function SnapshotsPanel({
     void fetchSnapshots();
   }, [active, fetchSnapshots]);
 
-  const handleRestore = async (snapshotId: string) => {
-    const ok = await confirm({
-      title: "Restore snapshot?",
-      description: `This will stop the current sandbox and restore from snapshot ${snapshotId.slice(0, 12)}... Any unsaved state will be lost.`,
-      confirmLabel: "Restore",
-      variant: "danger",
-    });
-    if (!ok) return;
-
-    await requestJson<{ status: string }>("/api/admin/snapshots/restore", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ snapshotId }),
-      label: `Restore ${snapshotId.slice(0, 12)}...`,
-    });
-  };
-
   const handleDelete = async (snapshotId: string) => {
     const ok = await confirm({
       title: "Delete snapshot?",
@@ -135,13 +118,13 @@ export function SnapshotsPanel({
     });
     if (!ok) return;
 
-    const success = await runAction("/api/admin/reset", {
+    await runAction("/api/admin/reset", {
       label: "Reset Sandbox",
       method: "POST",
     });
-    if (success) {
-      setSnapshots([]);
-    }
+    // Reset can retain provider snapshots when deletion is incomplete. Always
+    // reload server truth instead of optimistically hiding those records.
+    await fetchSnapshots();
   };
 
   return (
@@ -150,7 +133,8 @@ export function SnapshotsPanel({
         <div>
           <h2>Snapshot history</h2>
           <p className="muted-copy snapshots-intro">
-            Current is the active restore point. The tag shows how it was created.
+            Current is the active restore point. Historical snapshots are
+            read/delete-only because Vercel deletes them with their source sandbox.
           </p>
         </div>
       </div>
@@ -218,14 +202,6 @@ export function SnapshotsPanel({
                   onClick={() => void handleDelete(snap.snapshotId)}
                 >
                   Delete
-                </button>
-                <button
-                  type="button"
-                  className="button ghost"
-                  disabled={busy || isCurrent}
-                  onClick={() => void handleRestore(snap.snapshotId)}
-                >
-                  Restore
                 </button>
               </div>
             </li>

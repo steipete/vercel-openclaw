@@ -292,6 +292,76 @@ test("host mutation admission refuses while lifecycle lock is held", async () =>
   }
 });
 
+test("only admin ensure is admitted to lifecycle-owned Gateway replacement recovery", async () => {
+  setAuthMode(undefined);
+  const previousAdminAuth = process.env.ADMIN_SECRET;
+  process.env.ADMIN_SECRET = "fixture";
+  const now = Date.now();
+  const replacement = {
+    version: 2,
+    operationId: "operation-route-replacement",
+    requestId: "request-route-replacement",
+    sandboxId: "sbx-route-replacement",
+    lifecycleAttemptId: "attempt-route-replacement",
+    reason: "gateway-replacement-clear-retry",
+    intent: "stop",
+    phase: "replacement-starting",
+    ingressFenced: true,
+    suspensionId: null,
+    leaseExpiresAtMs: null,
+    stopRequestDeadlineAtMs: null,
+    monitorHeartbeatAtMs: now,
+    startedAtMs: now - 1_000,
+    updatedAtMs: now,
+    stoppedAtMs: now - 500,
+    resumedAtMs: null,
+    lastError: null,
+    lastErrorCode: null,
+    lastErrorClass: null,
+    replacementSessionId: "replacement-session",
+    replacementStage: "launching",
+  } as const;
+  try {
+    await getStore().setValue(hostSuspensionOperationKey(), replacement);
+
+    const ensure = await requireMutationAuth(new Request(
+      "http://localhost:3000/api/admin/ensure",
+      { method: "POST", headers: { authorization: "Bearer fixture" } },
+    ));
+    assert.equal(ensure instanceof Response, false);
+
+    const watchdog = await requireMutationAuth(new Request(
+      "http://localhost:3000/api/admin/watchdog",
+      { method: "POST", headers: { authorization: "Bearer fixture" } },
+    ));
+    assert.ok(watchdog instanceof Response);
+    assert.equal(watchdog.status, 503);
+    assert.equal(
+      ((await watchdog.json()) as { error?: unknown }).error,
+      "HOST_INGRESS_FENCED",
+    );
+
+    await getStore().setValue(hostSuspensionOperationKey(), {
+      ...replacement,
+      phase: "replacement-failed",
+      lastError: "injected launch failure",
+      lastErrorCode: "Error",
+      lastErrorClass: "Error",
+      updatedAtMs: now + 1,
+    });
+    const failedEnsure = await requireMutationAuth(new Request(
+      "http://localhost:3000/api/admin/ensure",
+      { method: "POST", headers: { authorization: "Bearer fixture" } },
+    ));
+    assert.equal(failedEnsure instanceof Response, false);
+  } finally {
+    _resetStoreForTesting();
+    if (previousAdminAuth === undefined) delete process.env.ADMIN_SECRET;
+    else process.env.ADMIN_SECRET = previousAdminAuth;
+    setAuthMode(originalAuthMode);
+  }
+});
+
 test("lifecycle-managed mutation routes leave lifecycle admission to their handlers", async () => {
   setAuthMode(undefined);
   const previousAdminAuth = process.env.ADMIN_SECRET;

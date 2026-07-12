@@ -1,4 +1,9 @@
-export const CRON_PROJECTION_CAPABILITY = "cron-projection-v1";
+export const CRON_PROJECTION_V1_CAPABILITY = "cron-projection-v1";
+export const CRON_PROJECTION_V2_CAPABILITY = "cron-projection-v2";
+
+export type CronProjectionBaselineMode =
+  | "gateway-start"
+  | "cron-reconciled";
 
 export type CronProjectionBundleIdentity = {
   packageSpec: string;
@@ -15,6 +20,20 @@ function isExactOpenclawPackageSpec(spec: string, version: string): boolean {
   return spec === `openclaw@${version}`;
 }
 
+export function getCronProjectionBaselineMode(
+  capabilities: readonly string[],
+): CronProjectionBaselineMode | null {
+  // Upgrade releases may carry both capabilities. Prefer v2 so a reconciled
+  // bundle never also installs the legacy gateway-start baseline.
+  if (capabilities.includes(CRON_PROJECTION_V2_CAPABILITY)) {
+    return "cron-reconciled";
+  }
+  if (capabilities.includes(CRON_PROJECTION_V1_CAPABILITY)) {
+    return "gateway-start";
+  }
+  return null;
+}
+
 export function supportsCronProjectionBundleIdentity(
   identity: CronProjectionBundleIdentity | null,
   configuredPackageSpec?: string | null,
@@ -26,6 +45,6 @@ export function supportsCronProjectionBundleIdentity(
       /^[a-f0-9]{40}$/.test(identity.forkSha) &&
       /^[a-f0-9]{40}$/.test(identity.upstreamSha) &&
       /^[a-f0-9]{64}$/.test(identity.canonicalSha256) &&
-      identity.capabilities.includes(CRON_PROJECTION_CAPABILITY),
+      getCronProjectionBaselineMode(identity.capabilities) !== null,
   );
 }

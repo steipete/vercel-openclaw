@@ -57,6 +57,14 @@ For the main OpenClaw sandbox, stopping means `sandbox.stop({ blocking: false })
 
 `POST /api/admin/snapshot` and `POST /api/admin/snapshots` are compatibility aliases for that cooperative persistent stop. The plural endpoint returns `record: null`; it does not create a manual snapshot-history record. Direct SDK snapshots remain limited to disposable diagnostic sandboxes, not the managed OpenClaw sandbox.
 
+Legacy snapshot-history rows are read/delete-only. Vercel snapshots belong to
+the sandbox that produced them, and deleting that sandbox also deletes its
+snapshots. A request for the current snapshot is therefore a non-destructive
+ensure/wake; a request for a historical snapshot fails with
+`HISTORICAL_SNAPSHOT_RESTORE_UNSUPPORTED` before changing metadata or deleting
+the current sandbox. A future historical-restore implementation must clone the
+target into a separately owned recovery sandbox before retiring its source.
+
 The stop path parks metadata in `snapshotting` before calling `sandbox.stop({ blocking: false })`. That ordering closes the race where a concurrent heartbeat still sees `running` and resumes the sandbox while the stop request is being accepted. While metadata is `snapshotting`, status reconciliation must inspect the sandbox with `Sandbox.get({ resume: false })`; observation must not wake the sandbox being observed. Normal wake uses `Sandbox.get({ resume: true })`.
 
 ### Cooperative stop protocol
@@ -157,7 +165,7 @@ This separation makes it easy to tell whether a failure is inside the sandbox or
 
 OpenClaw remains the only authority for cron jobs and due checks. The hosted app projects only wake times:
 
-1. **After gateway startup:** a trusted plugin adopts the live scheduler from the `gateway_start` context, lists its jobs, and posts a bounded snapshot of the earliest 4,096 wake times plus credential-keyed job hashes to the authenticated host endpoint. Later `cron_changed` hooks refresh that full snapshot from their live scheduler context.
+1. **After the capability-owned baseline:** a legacy `cron-projection-v1` bundle adopts its scheduler from `gateway_start`. A `cron-projection-v2` bundle waits for the complete `cron_reconciled` snapshot, whose abort signal fences that exact scheduler generation. The modes are exclusive, v2 wins when both are declared, and premature `cron_changed` hints cannot establish a v2 baseline. The plugin lists the adopted scheduler and posts a bounded snapshot of the earliest 4,096 wake times plus credential-keyed job hashes to the authenticated host endpoint.
 2. **After job changes:** `cron_changed` is a coalesced hint to reread the adopted scheduler. Event deltas are never treated as ordered state.
 3. **On host acceptance:** the endpoint atomically replaces the sanitized Redis projection. Job IDs are keyed-hashed inside the sandbox before transmission; job names, prompts, payloads, delivery targets, and other job configuration never enter the host store.
 4. **For the earliest wake:** Vercel Workflow sleeps until the projected time. Its step rereads the Redis projection and atomically claims the current revision and dispatch token before resuming the sandbox. Superseded workflows become no-ops.
@@ -165,7 +173,7 @@ OpenClaw remains the only authority for cron jobs and due checks. The hosted app
 
 The wake extends the current sandbox session through a 15-minute post-due safety window, covering OpenClaw's default 10-minute command timeout. Longer agent runs remain constrained by the Vercel plan's per-session maximum and are not yet a supported hosted cron guarantee.
 
-The migration from the former `cron-next-wake-ms` / `cron-jobs-json` keys is gated on an exact verified bundle identity declaring `cron-projection-v1`. It imports only the old earliest wake as a temporary fallback. If only the legacy jobs key exists for a resumable sleeping sandbox, key presence can arm one immediate bootstrap wake without reading or importing its payload. An authoritative plugin baseline retires the old wake key, but the jobs backup remains until an explicit verified data migration or destructive reset owns its removal.
+The migration from the former `cron-next-wake-ms` / `cron-jobs-json` keys is gated on an exact verified bundle identity declaring `cron-projection-v1` or `cron-projection-v2`. It imports only the old earliest wake as a temporary fallback. If only the legacy jobs key exists for a resumable sleeping sandbox, key presence can arm one immediate bootstrap wake without reading or importing its payload. An authoritative plugin baseline retires the old wake key, but the jobs backup remains until an explicit verified data migration or destructive reset owns its removal.
 
 Enabling bundle mode does not authorize replacing an existing persistent sandbox. Missing or stale bundle identity fails with `OPENCLAW_BUNDLE_MIGRATION_REQUIRED` so OpenClaw-owned cron state stays intact; use an explicit verified migration, or reset only when discarding the sandbox is intentional.
 

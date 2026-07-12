@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   buildClearStaleGatewayLockShell,
   buildGatewayConfig,
+  buildGatewayKillShell,
   buildGatewayRestartScript,
   computeGatewayConfigHash,
   GATEWAY_CONFIG_HASH_VERSION,
@@ -43,7 +44,8 @@ import {
   TELEGRAM_PUBLIC_WEBHOOK_PATH,
 } from "@/server/openclaw/config";
 import {
-  CRON_PROJECTION_CAPABILITY,
+  CRON_PROJECTION_V1_CAPABILITY,
+  CRON_PROJECTION_V2_CAPABILITY,
 } from "@/server/cron/compatibility";
 
 function withEnv<T>(
@@ -125,6 +127,50 @@ test("buildGatewayConfig disables update checks on startup", () => {
   assert.equal(config.update?.checkOnStart, false);
 });
 
+test("buildGatewayConfig keeps hosted owner commands closed by default", () => {
+  withEnv({ OPENCLAW_OWNER_ALLOW_FROM: undefined }, () => {
+    const config = JSON.parse(buildGatewayConfig()) as {
+      commands?: { ownerAllowFrom?: string[] };
+    };
+
+    assert.deepEqual(config.commands?.ownerAllowFrom, [
+      "telegram:hosted-no-owner-configured",
+      "slack:hosted-no-owner-configured",
+    ]);
+    assert.equal(config.commands?.ownerAllowFrom?.includes("*"), false);
+  });
+});
+
+test("buildGatewayConfig grants owner commands only to explicit sender IDs", () => {
+  withEnv(
+    {
+      OPENCLAW_OWNER_ALLOW_FROM:
+        "telegram:123456789, slack:U12345678",
+    },
+    () => {
+      const config = JSON.parse(buildGatewayConfig()) as {
+        commands?: { ownerAllowFrom?: string[] };
+      };
+
+      assert.deepEqual(config.commands?.ownerAllowFrom, [
+        "telegram:123456789",
+        "slack:U12345678",
+      ]);
+    },
+  );
+});
+
+test("buildGatewayConfig rejects wildcard hosted ownership", () => {
+  for (const value of ["*", "telegram:*", "slack:U123,*"]) {
+    withEnv({ OPENCLAW_OWNER_ALLOW_FROM: value }, () => {
+      assert.throws(
+        () => buildGatewayConfig(),
+        /must list explicit sender IDs; wildcard ownership is not allowed/,
+      );
+    });
+  }
+});
+
 test("buildGatewayConfig allowlists bundled channel plugins without rejected legacy discovery key", () => {
   const config = JSON.parse(buildGatewayConfig()) as {
     plugins?: {
@@ -174,7 +220,7 @@ test("buildGatewayConfig explicitly enables authenticated admin HTTP RPC only fo
   );
 });
 
-test("buildGatewayConfig enables cron projection only for an admitted capability", () => {
+test("buildGatewayConfig selects the admitted cron projection baseline contract", () => {
   withEnv(
     {
       OPENCLAW_PACKAGE_SPEC: undefined,
@@ -188,13 +234,16 @@ test("buildGatewayConfig enables cron projection only for an admitted capability
           undefined,
           undefined,
           undefined,
-          [CRON_PROJECTION_CAPABILITY],
+          [CRON_PROJECTION_V1_CAPABILITY],
         ),
       ) as {
         plugins?: {
           allow?: string[];
           load?: { paths?: string[] };
-          entries?: Record<string, { enabled?: boolean; config?: { endpoint?: string } }>;
+          entries?: Record<string, {
+            enabled?: boolean;
+            config?: { endpoint?: string; baselineMode?: string };
+          }>;
         };
       };
       const entry = config.plugins?.entries?.["vercel-cron-projection"];
@@ -208,6 +257,25 @@ test("buildGatewayConfig enables cron projection only for an admitted capability
       assert.equal(
         entry?.config?.endpoint,
         "https://app.example.com/api/internal/cron-projection?x-vercel-protection-bypass=test-bypass",
+      );
+      assert.equal(entry?.config?.baselineMode, "gateway-start");
+
+      const reconciledConfig = JSON.parse(
+        buildGatewayConfig(
+          undefined,
+          "https://app.example.com",
+          undefined,
+          undefined,
+          undefined,
+          [CRON_PROJECTION_V2_CAPABILITY],
+        ),
+      ) as {
+        plugins?: { entries?: Record<string, { config?: { baselineMode?: string } }> };
+      };
+      assert.equal(
+        reconciledConfig.plugins?.entries?.["vercel-cron-projection"]?.config
+          ?.baselineMode,
+        "cron-reconciled",
       );
     },
   );
@@ -541,6 +609,418 @@ test("buildGatewayRestartScript kills existing gateway and relaunches it", () =>
   assert.ok(script.includes("gateway --port 3000 --bind loopback"), "restart script should launch the gateway");
   assert.match(script, /OPENCLAW_RESTART_PHASE:-all/);
   assert.match(script, /restart_phase" = "kill"/);
+});
+
+test("buildGatewayKillShell confirms process and listener exit before success", () => {
+  const script = buildGatewayKillShell();
+  const termIndex = script.indexOf("kill -TERM");
+  const killIndex = script.indexOf("kill -KILL");
+  const finalFailureIndex = script.lastIndexOf("_gw_fail_unconfirmed");
+
+  assert.ok(termIndex >= 0, "kill should request graceful termination first");
+  assert.ok(killIndex > termIndex, "kill should escalate after the bounded TERM wait");
+  assert.ok(
+    finalFailureIndex > killIndex,
+    "kill should fail closed after escalation",
+  );
+  assert.match(script, /ss -H -ltn 'sport = :3000'/);
+  assert.match(script, /\/proc\/net\/tcp6?/);
+  assert.match(script, /exit 70/);
+});
+
+test("buildGatewayKillShell waits for delayed exit and rejects a stubborn Gateway", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-kill-confirm-"));
+  const statePath = join(dir, "state");
+  const countPath = join(dir, "count");
+  const signalsPath = join(dir, "signals");
+  const procTcpPath = join(dir, "tcp");
+  const procTcp6Path = join(dir, "tcp6");
+  const gatewayKillShell = buildGatewayKillShell();
+  const harness = [
+    "set -euo pipefail",
+    "command() {",
+    '  if [ "$1" = "-v" ] && [ "$2" = "ss" ] && [ "${GW_NO_SS:-0}" -eq 1 ]; then return 1; fi',
+    '  builtin command "$@"',
+    "}",
+    "ps() {",
+    '  if [ "${GW_PS_FAIL:-0}" -eq 1 ]; then return 1; fi',
+    '  if [ "$(cat "$GW_STATE")" = "running" ]; then',
+    "    printf '123 openclaw openclaw\\n'",
+    "  fi",
+    "}",
+    "ss() {",
+    '  if [ "${GW_SS_FAIL:-0}" -eq 1 ]; then return 1; fi',
+    '  if [ "$#" -ne 3 ] || [ "$1" != "-H" ] || [ "$2" != "-ltn" ] || [ "$3" != "sport = :3000" ]; then return 1; fi',
+    '  if [ -n "${GW_SS_OUTPUT:-}" ]; then printf "%s\\n" "$GW_SS_OUTPUT"; return 0; fi',
+    '  if [ "${GW_SS_MALFORMED:-0}" -eq 1 ]; then printf "truncated listener\\n"; return 0; fi',
+    '  if [ "${GW_SS_GARBAGE:-0}" -eq 1 ]; then printf "garbage garbage garbage 127.0.0.1:2999 0.0.0.0:*\\n"; return 0; fi',
+    '  if [ -n "${GW_SS_SOURCE:-}" ]; then',
+    '    if [ "${GW_SS_FILTER_MATCH:-0}" -eq 1 ]; then printf "%s\\n" "$GW_SS_SOURCE"; fi',
+    "    return 0",
+    "  fi",
+    '  if [ "$(cat "$GW_STATE")" = "running" ]; then',
+    "    printf 'LISTEN 0 128 127.0.0.1:3000 0.0.0.0:*\\n'",
+    "  fi",
+    "}",
+    "kill() { printf '%s\\n' \"$1\" >> \"$GW_SIGNALS\"; }",
+    "sleep() {",
+    '  _test_count="$(cat "$GW_COUNT")"',
+    "  _test_count=$((_test_count + 1))",
+    '  printf "%s\\n" "$_test_count" > "$GW_COUNT"',
+    '  if [ "$GW_CLEAR_AFTER" -gt 0 ] && [ "$_test_count" -ge "$GW_CLEAR_AFTER" ]; then',
+    '    printf "quiet\\n" > "$GW_STATE"',
+    "  fi",
+    "}",
+    gatewayKillShell,
+  ].join("\n");
+  const procHarness = harness.replace(
+    "/proc/net/tcp /proc/net/tcp6",
+    '"$GW_PROC_TCP" "$GW_PROC_TCP6"',
+  );
+  const procHeader =
+    "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode";
+  const procRecord = (
+    localEndpoint: string,
+    trailingFields = ["100", "0", "0", "10", "0"],
+  ) => [
+    "0:",
+    localEndpoint,
+    "00000000:0000",
+    "0A",
+    "00000000:00000000",
+    "00:00000000",
+    "00000000",
+    "1000",
+    "0",
+    "12345",
+    "1",
+    "0000000000000000",
+    ...trailingFields,
+  ].join(" ");
+
+  try {
+    await writeFile(statePath, "running\n");
+    await writeFile(countPath, "0\n");
+    await writeFile(signalsPath, "");
+    const delayed = spawnSync("bash", ["-c", harness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "3",
+        GW_PS_FAIL: "0",
+        GW_SS_FAIL: "0",
+      },
+    });
+    assert.equal(delayed.status, 0, delayed.stderr);
+    assert.equal(await readFile(countPath, "utf8"), "3\n");
+    assert.equal(await readFile(signalsPath, "utf8"), "-TERM\n");
+
+    await writeFile(statePath, "running\n");
+    await writeFile(countPath, "0\n");
+    await writeFile(signalsPath, "");
+    const stubborn = spawnSync("bash", ["-c", harness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_SS_FAIL: "0",
+      },
+    });
+    assert.equal(stubborn.status, 70);
+    assert.match(stubborn.stderr, /gateway_kill\.unconfirmed/);
+    assert.equal(await readFile(countPath, "utf8"), "50\n");
+    assert.equal(await readFile(signalsPath, "utf8"), "-TERM\n-KILL\n");
+
+    await writeFile(statePath, "quiet\n");
+    await writeFile(countPath, "0\n");
+    await writeFile(signalsPath, "");
+    const enumerationFailure = spawnSync("bash", ["-c", harness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "1",
+        GW_SS_FAIL: "0",
+      },
+    });
+    assert.equal(enumerationFailure.status, 70);
+    assert.match(enumerationFailure.stderr, /gateway_kill\.unconfirmed/);
+    assert.equal(await readFile(countPath, "utf8"), "0\n");
+    assert.equal(await readFile(signalsPath, "utf8"), "");
+
+    const listenerEnumerationFailure = spawnSync("bash", ["-c", harness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_SS_FAIL: "1",
+      },
+    });
+    assert.equal(listenerEnumerationFailure.status, 70);
+    assert.match(
+      listenerEnumerationFailure.stderr,
+      /gateway_kill\.unconfirmed/,
+    );
+
+    await writeFile(countPath, "0\n");
+    const malformedListenerOutput = spawnSync("bash", ["-c", harness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_SS_MALFORMED: "1",
+      },
+    });
+    assert.equal(malformedListenerOutput.status, 70);
+    assert.match(malformedListenerOutput.stderr, /gateway_kill\.unconfirmed/);
+
+    await writeFile(countPath, "0\n");
+    const numericFieldGarbage = spawnSync("bash", ["-c", harness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_SS_GARBAGE: "1",
+      },
+    });
+    assert.equal(numericFieldGarbage.status, 70);
+    assert.match(numericFieldGarbage.stderr, /gateway_kill\.unconfirmed/);
+
+    for (const unrelatedListener of [
+      "LISTEN 0 128 [:::]:2999 [::]:*",
+      "LISTEN 0 128 127.0.0.1:99999 0.0.0.0:*",
+      "LISTEN 0 128 [::]:0 [::]:*",
+      "LISTEN 0 128 [2001:db8::1]:65535 [::1]:65535",
+      "LISTEN 0 128 [::ffff:127.0.0.1]:3350 [::]:*",
+      "LISTEN 0 128 [2001:db8::192.0.2.1]:3350 [::]:*",
+      "LISTEN 0 128 [:1::2]:3350 [::]:*",
+      "LISTEN 0 128 [::1:]:3350 [::]:*",
+      "LISTEN 0 128 [::ffff:127.0.0]:3350 [::]:*",
+      "LISTEN 0 128 [::ffff:127.0.0.999]:3350 [::]:*",
+      "LISTEN 0 128 [::ffff:127.0.0.1:2]:3350 [::]:*",
+    ]) {
+      await writeFile(countPath, "0\n");
+      const ignoredByScopedSsQuery = spawnSync("bash", ["-c", harness], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GW_STATE: statePath,
+          GW_COUNT: countPath,
+          GW_SIGNALS: signalsPath,
+          GW_CLEAR_AFTER: "0",
+          GW_PS_FAIL: "0",
+          GW_SS_SOURCE: unrelatedListener,
+          GW_SS_FILTER_MATCH: "0",
+        },
+      });
+      assert.equal(
+        ignoredByScopedSsQuery.status,
+        0,
+        `${unrelatedListener}\n${ignoredByScopedSsQuery.stderr}`,
+      );
+    }
+
+    for (const targetListener of [
+      "LISTEN 0 128 [::ffff:127.0.0.1]:3000 [::]:*",
+      "LISTEN 0 128 127.0.0.1:03000 0.0.0.0:*",
+    ]) {
+      await writeFile(countPath, "0\n");
+      const returnedByScopedSsQuery = spawnSync("bash", ["-c", harness], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GW_STATE: statePath,
+          GW_COUNT: countPath,
+          GW_SIGNALS: signalsPath,
+          GW_CLEAR_AFTER: "0",
+          GW_PS_FAIL: "0",
+          GW_SS_SOURCE: targetListener,
+          GW_SS_FILTER_MATCH: "1",
+        },
+      });
+      assert.equal(returnedByScopedSsQuery.status, 70, targetListener);
+      assert.match(returnedByScopedSsQuery.stderr, /gateway_kill\.unconfirmed/);
+    }
+
+    await writeFile(
+      procTcpPath,
+      `${procHeader}\n${procRecord("0100007F:0BB9", ["0", "0", "0", "0", "-1"])}\n`,
+    );
+    await writeFile(procTcp6Path, `${procHeader}\n`);
+    await writeFile(countPath, "0\n");
+    const validAbsentProcListener = spawnSync("bash", ["-c", procHarness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_NO_SS: "1",
+        GW_PROC_TCP: procTcpPath,
+        GW_PROC_TCP6: procTcp6Path,
+      },
+    });
+    assert.equal(validAbsentProcListener.status, 0, validAbsentProcListener.stderr);
+
+    await writeFile(
+      procTcpPath,
+      `${procHeader}\n${procRecord("0100007F:0BB8")}\n`,
+    );
+    await writeFile(countPath, "0\n");
+    const validPresentProcListener = spawnSync("bash", ["-c", procHarness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_NO_SS: "1",
+        GW_PROC_TCP: procTcpPath,
+        GW_PROC_TCP6: procTcp6Path,
+      },
+    });
+    assert.equal(validPresentProcListener.status, 70);
+    assert.match(validPresentProcListener.stderr, /gateway_kill\.unconfirmed/);
+
+    await writeFile(
+      procTcpPath,
+      `${procHeader}\n${procRecord("0100007F:0BB9:extra")}\n`,
+    );
+    await writeFile(procTcp6Path, `${procHeader}\n`);
+    await writeFile(countPath, "0\n");
+    const malformedProcOutput = spawnSync("bash", ["-c", procHarness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_NO_SS: "1",
+        GW_PROC_TCP: procTcpPath,
+        GW_PROC_TCP6: procTcp6Path,
+      },
+    });
+    assert.equal(malformedProcOutput.status, 70);
+    assert.match(malformedProcOutput.stderr, /gateway_kill\.unconfirmed/);
+
+    await writeFile(
+      procTcpPath,
+      `${procHeader}\n${procRecord("A:0BB9")}\n`,
+    );
+    await writeFile(procTcp6Path, `${procHeader}\n`);
+    await writeFile(countPath, "0\n");
+    const shortProcAddress = spawnSync("bash", ["-c", procHarness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_NO_SS: "1",
+        GW_PROC_TCP: procTcpPath,
+        GW_PROC_TCP6: procTcp6Path,
+      },
+    });
+    assert.equal(shortProcAddress.status, 70);
+    assert.match(shortProcAddress.stderr, /gateway_kill\.unconfirmed/);
+
+    await writeFile(
+      procTcpPath,
+      `${procHeader}\n${procRecord("0100007F:0BB9", ["-1", "0", "0", "10", "0"])}\n`,
+    );
+    await writeFile(procTcp6Path, `${procHeader}\n`);
+    await writeFile(countPath, "0\n");
+    const signedUnsignedProcField = spawnSync("bash", ["-c", procHarness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_NO_SS: "1",
+        GW_PROC_TCP: procTcpPath,
+        GW_PROC_TCP6: procTcp6Path,
+      },
+    });
+    assert.equal(signedUnsignedProcField.status, 70);
+    assert.match(signedUnsignedProcField.stderr, /gateway_kill\.unconfirmed/);
+
+    await writeFile(
+      procTcpPath,
+      `${procHeader}\n${procRecord("0100007F:0BB9", ["0", "0", "0", "10", "-2"])}\n`,
+    );
+    await writeFile(countPath, "0\n");
+    const invalidProcFinalMetric = spawnSync("bash", ["-c", procHarness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_NO_SS: "1",
+        GW_PROC_TCP: procTcpPath,
+        GW_PROC_TCP6: procTcp6Path,
+      },
+    });
+    assert.equal(invalidProcFinalMetric.status, 70);
+    assert.match(invalidProcFinalMetric.stderr, /gateway_kill\.unconfirmed/);
+
+    await writeFile(procTcpPath, "sl local_address rem_address st\n");
+    await writeFile(procTcp6Path, `${procHeader}\n`);
+    await writeFile(countPath, "0\n");
+    const partialProcHeader = spawnSync("bash", ["-c", procHarness], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GW_STATE: statePath,
+        GW_COUNT: countPath,
+        GW_SIGNALS: signalsPath,
+        GW_CLEAR_AFTER: "0",
+        GW_PS_FAIL: "0",
+        GW_NO_SS: "1",
+        GW_PROC_TCP: procTcpPath,
+        GW_PROC_TCP6: procTcp6Path,
+      },
+    });
+    assert.equal(partialProcHeader.status, 70);
+    assert.match(partialProcHeader.stderr, /gateway_kill\.unconfirmed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("buildGatewayRestartScript kill matches both pre- and post-title-overwrite forms", () => {

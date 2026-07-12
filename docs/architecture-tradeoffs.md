@@ -11,7 +11,7 @@ vercel-openclaw owns the Slack and Telegram channel layer in the control plane. 
 The app provides dedicated webhook routes (`/api/channels/telegram/webhook`, `/api/channels/slack/webhook`). When a message arrives:
 
 1. The Vercel Function validates the platform signature (always running, even when sandbox is stopped).
-2. For Telegram, sends an immediate "🦞 Waking up…" boot message so the user knows something is happening.
+2. For Slack, may create one Workflow-owned "🦞 Waking up…" placeholder. Telegram creates no new wake placeholder because Bot API sends cannot be made idempotent.
 3. Starts a Vercel Workflow that durably holds the message payload.
 4. The Workflow restores the sandbox if stopped, delivers the message to OpenClaw, and sends the reply back to the channel.
 5. Native acceptance updates and retains the boot message until a user-visible reply is observed; terminal failure or uncertain acceptance updates it with the corresponding status.
@@ -85,7 +85,7 @@ OpenClaw opens a WebSocket to Slack's servers. Events arrive over that WebSocket
 | Boot message | Sent immediately on webhook receipt | Not possible (no trigger) |
 | Complexity | ~1,500 lines (webhook route + adapter + workflow) | Zero (OpenClaw handles it) |
 
-**Wake-from-sleep and deployment protection now work together.** When `VERCEL_AUTOMATION_BYPASS_SECRET` is configured, the app appends the bypass secret to supported channel webhook URLs, allowing Slack, Telegram, and Discord webhooks to pass through Vercel Deployment Protection. The app auto-detects active protection and hard-blocks channel connections if the bypass secret is missing.
+**Wake-from-sleep and deployment protection now work together.** When `VERCEL_AUTOMATION_BYPASS_SECRET` is configured, the app appends the bypass secret to supported channel webhook URLs, allowing Slack and Telegram webhooks to pass through Vercel Deployment Protection. The app auto-detects active protection and hard-blocks supported channel connections if the bypass secret is missing. Hosted Discord remains fail-closed.
 
 ## Telegram: no outbound-only option
 

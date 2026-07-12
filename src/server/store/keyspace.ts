@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { ChannelName } from "@/shared/channels";
 import { getOpenclawInstanceId } from "@/server/env";
 import { resolveOpenclawInstanceId } from "@/shared/types";
@@ -159,14 +161,6 @@ export function channelDedupKey(channel: ChannelName, dedupId: string): string {
   return buildKey(`channels:${channel}:dedup:${dedupId}`);
 }
 
-export function channelUserMessageDedupKey(
-  channel: ChannelName,
-  channelId: string,
-  ts: string,
-): string {
-  return buildKey(`channels:${channel}:user-message-dedup:${channelId}:${ts}`);
-}
-
 export function channelConfigLockKey(channel: ChannelName): string {
   return buildKey(`channels:${channel}:config-lock`);
 }
@@ -217,7 +211,8 @@ export function slackAppConfigKey(): string {
 }
 
 export function slackInstallTokenKey(token: string): string {
-  return buildKey(`slack:install-token:${token}`);
+  const digest = createHash("sha256").update(token).digest("hex");
+  return buildKey(`slack:install-token:${digest}`);
 }
 
 export function smokeChannelConfigLockKey(): string {

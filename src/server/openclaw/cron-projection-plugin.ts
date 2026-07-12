@@ -14,9 +14,13 @@ const pluginManifest = {
   configSchema: {
     type: "object",
     additionalProperties: false,
-    required: ["endpoint"],
+    required: ["endpoint", "baselineMode"],
     properties: {
       endpoint: { type: "string", format: "uri" },
+      baselineMode: {
+        type: "string",
+        enum: ["gateway-start", "cron-reconciled"],
+      },
     },
   },
 };
@@ -65,9 +69,17 @@ export default definePluginEntry({
   },
   register(api) {
     const endpoint = api.pluginConfig?.endpoint;
+    const baselineMode = api.pluginConfig?.baselineMode;
     const gatewayValue = process.env.OPENCLAW_GATEWAY_TOKEN?.trim();
-    if (typeof endpoint !== "string" || !endpoint || !gatewayValue) {
-      throw new Error("vercel cron projection requires endpoint and gateway token");
+    if (
+      typeof endpoint !== "string"
+      || !endpoint
+      || (baselineMode !== "gateway-start" && baselineMode !== "cron-reconciled")
+      || !gatewayValue
+    ) {
+      throw new Error(
+        "vercel cron projection requires endpoint, baseline mode, and gateway token",
+      );
     }
     const gatewayGeneration = createHash("sha256")
       .update(gatewayValue)
@@ -94,7 +106,7 @@ export default definePluginEntry({
       ownerSignal = lifecycle.signal,
     ) => {
       const nextCron = ctx.getCron?.();
-      if (!nextCron) return false;
+      if (!nextCron && enabledOverride !== false) return false;
       cron = nextCron;
       enabled = enabledOverride ?? (
         process.env.OPENCLAW_SKIP_CRON !== "1"
@@ -272,26 +284,27 @@ export default definePluginEntry({
       return worker;
     };
 
-    api.on("gateway_start", (_event, ctx) => {
-      if (!adoptCronContext(ctx)) {
-        api.logger.warn("gateway startup did not expose a cron scheduler");
-        return;
-      }
-      return requestProjection("startup");
-    });
+    if (baselineMode === "gateway-start") {
+      api.on("gateway_start", (_event, ctx) => {
+        if (!adoptCronContext(ctx)) {
+          api.logger.warn("gateway startup did not expose a cron scheduler");
+          return;
+        }
+        return requestProjection("startup");
+      });
+    }
 
-    api.on("cron_reconciled", (event, ctx) => {
-      const reconciledCron = ctx.getCron?.();
-      if (event.enabled && !reconciledCron) {
-        api.logger.warn("cron reconciliation did not expose a scheduler");
-        return;
-      }
-      cron = reconciledCron;
-      enabled = event.enabled;
-      hasBaseline = true;
-      reconciliationSignal = ctx.abortSignal;
-      return requestProjection(event.reason);
-    });
+    if (baselineMode === "cron-reconciled") {
+      api.on("cron_reconciled", (event, ctx) => {
+        if (!adoptCronContext(ctx, event.enabled, ctx.abortSignal)) {
+          if (event.enabled) {
+            api.logger.warn("cron reconciliation did not expose a scheduler");
+          }
+          return;
+        }
+        return requestProjection(event.reason);
+      });
+    }
 
     api.on("cron_changed", () => {
       if (hasBaseline && !reconciliationSignal?.aborted) {

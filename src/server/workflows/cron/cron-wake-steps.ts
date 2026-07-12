@@ -181,7 +181,9 @@ export async function settleCronWakeStep(
 ): Promise<CronWakeSettleOutcome> {
   "use step";
 
-  const { RetryableError, getStepMetadata } = await import("workflow");
+  const { RetryableError, getStepMetadata, getWorkflowMetadata } =
+    await import("workflow");
+  const parentWorkflowRunId = getWorkflowMetadata().workflowRunId;
   let settlementRecoveryAttempted = false;
   try {
     const meta = await getInitializedMeta();
@@ -228,6 +230,13 @@ export async function settleCronWakeStep(
       latest.dispatch.status !== "none" &&
       latest.dispatch.token === envelope.token;
     if (!stillOwned) return { status: "settled" };
+    if (
+      latest.dispatch.status === "scheduled" &&
+      latest.dispatch.workflowRunId === parentWorkflowRunId &&
+      latest.dispatch.executionWorkflowRunId === null
+    ) {
+      return { status: "rehandoff" };
+    }
     if (latest.dispatch.status === "completed") {
       const settlementAtMs =
         envelope.runAtMs + CRON_DISPATCH_SETTLEMENT_GRACE_MS;

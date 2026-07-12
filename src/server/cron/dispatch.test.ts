@@ -7,6 +7,7 @@ import {
   cancelSupersededCronWake,
   completeCronWake,
   cronDispatchWorkflowRuntime,
+  getCronWakeHandoffState,
   isCronWakeClaimCurrent,
   recordCronWakeHandoff,
   reconcileCronProjection,
@@ -705,8 +706,138 @@ test("handoff records the current-deployment child before watchdog probes", asyn
     now: () => now + 2,
   });
   assert.equal(result.status, "scheduled");
-  assert.deepEqual(probed, ["wrun-parent-timer"]);
+  assert.deepEqual(probed, ["wrun-parent-timer", "wrun-current-child"]);
   assert.equal(starts, 0);
+});
+
+test("live timer parent releases a missing execution child for token-safe re-handoff", async () => {
+  await acceptCronProjection(projection(1, now + 10 * 60_000));
+  let envelope: CronWakeWorkflowEnvelopeV1 | undefined;
+  await startCronProjectionDispatch({
+    origin: "https://app.test",
+    startWorkflow: async (value) => {
+      envelope = value;
+      return { runId: "wrun-parent-timer" };
+    },
+    now: () => now,
+  });
+  assert.ok(envelope);
+  await recordCronWakeHandoff(
+    envelope,
+    "wrun-missing-child",
+    "wrun-parent-timer",
+    now + 1,
+  );
+  const before = await readCronProjection();
+  assert.equal(before?.dispatch.status, "scheduled");
+
+  const probed: string[] = [];
+  let starts = 0;
+  const result = await reconcileCronProjection({
+    origin: "https://app.test",
+    enabled: true,
+    getWorkflowRunStatus: async (runId) => {
+      probed.push(runId);
+      return runId === "wrun-parent-timer" ? "running" : "missing";
+    },
+    startWorkflow: async () => {
+      starts += 1;
+      return { runId: "must-not-replace-parent" };
+    },
+    now: () => now + 2,
+  });
+
+  assert.equal(result.status, "scheduled");
+  assert.equal(starts, 0);
+  assert.deepEqual(probed, ["wrun-parent-timer", "wrun-missing-child"]);
+  const released = await readCronProjection();
+  assert.equal(released?.dispatch.status, "scheduled");
+  if (released?.dispatch.status === "scheduled") {
+    assert.equal(released.dispatch.token, envelope.token);
+    assert.equal(released.dispatch.workflowRunId, "wrun-parent-timer");
+    assert.equal(released.dispatch.executionWorkflowRunId, null);
+  }
+  assert.equal(
+    await getCronWakeHandoffState(envelope, "wrun-parent-timer"),
+    "ready",
+  );
+  assert.equal(
+    await recordCronWakeHandoff(
+      envelope,
+      "wrun-replacement-child",
+      "wrun-parent-timer",
+      now + 3,
+    ),
+    "installed",
+  );
+  assert.equal(
+    await claimCronWake(
+      envelope,
+      "wrun-missing-child",
+      envelope.wakeAtMs,
+      true,
+      "wrun-parent-timer",
+    ),
+    false,
+  );
+  assert.equal(
+    await claimCronWake(
+      envelope,
+      "wrun-replacement-child",
+      envelope.wakeAtMs,
+      true,
+      "wrun-parent-timer",
+    ),
+    true,
+  );
+});
+
+test("live timer parent releases a terminal running child without replacing its token", async () => {
+  await acceptCronProjection(projection(1, now));
+  let envelope: CronWakeWorkflowEnvelopeV1 | undefined;
+  await startCronProjectionDispatch({
+    origin: "https://app.test",
+    startWorkflow: async (value) => {
+      envelope = value;
+      return { runId: "wrun-running-parent" };
+    },
+    now: () => now,
+  });
+  assert.ok(envelope);
+  await recordCronWakeHandoff(
+    envelope,
+    "wrun-failed-child",
+    "wrun-running-parent",
+    now,
+  );
+  assert.equal(
+    await claimCronWake(
+      envelope,
+      "wrun-failed-child",
+      now,
+      true,
+      "wrun-running-parent",
+    ),
+    true,
+  );
+
+  const result = await reconcileCronProjection({
+    origin: "https://app.test",
+    enabled: true,
+    getWorkflowRunStatus: async (runId) =>
+      runId === "wrun-running-parent" ? "running" : "failed",
+    startWorkflow: async () => ({ runId: "must-not-replace-parent" }),
+    now: () => now + 1,
+  });
+
+  assert.equal(result.status, "scheduled");
+  const released = await readCronProjection();
+  assert.equal(released?.dispatch.status, "scheduled");
+  if (released?.dispatch.status === "scheduled") {
+    assert.equal(released.dispatch.token, envelope.token);
+    assert.equal(released.dispatch.workflowRunId, "wrun-running-parent");
+    assert.equal(released.dispatch.executionWorkflowRunId, null);
+  }
 });
 
 test("terminal parent probe rearms a concurrently installed unmonitored child", async () => {

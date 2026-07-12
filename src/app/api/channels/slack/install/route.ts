@@ -41,7 +41,6 @@ export async function GET(request: Request): Promise<Response> {
     // the browser arriving, something is pre-consuming one-time tokens —
     // that was the `provisionSlack.installUrl.probe` bug in vclaw < 0.2.1.
     logInfo("slack_install.request_received", {
-      tokenPrefix: installTokenParam.slice(0, 6),
       clientKind,
       userAgent: userAgent.slice(0, 160),
       referer: request.headers.get("referer")?.slice(0, 160) ?? null,
@@ -49,14 +48,12 @@ export async function GET(request: Request): Promise<Response> {
     usedInstallToken = await consumeSlackInstallToken(installTokenParam);
     if (!usedInstallToken) {
       logWarn("slack_install.install_token_invalid", {
-        tokenPrefix: installTokenParam.slice(0, 6),
         clientKind,
         userAgent: userAgent.slice(0, 160),
       });
       return redirectToAdmin(request, "install_token_invalid");
     }
     logInfo("slack_install.install_token_consumed", {
-      tokenPrefix: installTokenParam.slice(0, 6),
       clientKind,
     });
   } else {

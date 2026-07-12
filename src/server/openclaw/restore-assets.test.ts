@@ -176,18 +176,18 @@ test("static restore files stage the host-owned cron projection plugin before bo
   assert.equal(OPENCLAW_CRON_PROJECTION_MAX_WAKES, CRON_PROJECTION_MAX_WAKES);
   assert.match(source, /\.slice\(0, maxProjectedWakes\)/);
   assert.match(source, /createHmac\("sha256", gatewayValue\)/);
+  assert.match(source, /baselineMode === "gateway-start"/);
   assert.match(source, /api\.on\("gateway_start"/);
+  assert.match(source, /baselineMode === "cron-reconciled"/);
   assert.match(source, /api\.on\("cron_reconciled"/);
   assert.match(source, /api\.on\("cron_changed"/);
   assert.match(source, /api\.on\("cron_changed", \(\) =>/);
   assert.match(source, /cron\.list\(\{ includeDisabled: true \}\)/);
   assert.doesNotMatch(source, /jobId: job\.id/);
   assert.match(source, /const nextCron = ctx\.getCron\?\.\(\)/);
-  assert.match(source, /ctx\.config\?\.cron\?\.enabled !== false/);
-  assert.match(source, /enabled = event\.enabled/);
-  assert.match(source, /reconciliationSignal = ctx\.abortSignal/);
+  assert.match(source, /adoptCronContext\(ctx, event\.enabled, ctx\.abortSignal\)/);
+  assert.match(source, /if \(hasBaseline && !reconciliationSignal\?\.aborted\)/);
   assert.match(source, /!ownerSignal\.aborted/);
-  assert.match(source, /return requestProjection\("startup"\)/);
   assert.match(source, /AbortSignal\.timeout\(attemptTimeoutMs\)/);
   assert.match(source, /Promise\.race\(\[/);
   assert.match(source, /response\.body\?\.cancel\(\)/);
@@ -203,6 +203,114 @@ test("static restore files stage the host-owned cron projection plugin before bo
     /restartPrefixes:[\s\S]*plugins\.entries\.vercel-cron-projection/,
   );
   assert.doesNotMatch(source, /job\.payload|job\.name|job\.description/);
+});
+
+type GeneratedCronHook = (
+  event: Record<string, unknown>,
+  context: {
+    abortSignal?: AbortSignal;
+    config?: { cron?: { enabled?: boolean } };
+    getCron?: () => {
+      list: (options: { includeDisabled: boolean }) => Promise<unknown[]>;
+    };
+  },
+) => unknown;
+
+async function registerGeneratedCronPlugin(
+  baselineMode: "gateway-start" | "cron-reconciled",
+): Promise<Map<string, GeneratedCronHook>> {
+  const source = buildCronProjectionPluginSource().replace(
+    'import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";',
+    "const definePluginEntry = (entry) => entry;",
+  );
+  const url = `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`;
+  const loaded = await import(url) as {
+    default: {
+      register: (api: {
+        pluginConfig: { endpoint: string; baselineMode: string };
+        logger: { warn: (message: string) => void };
+        on: (name: string, handler: GeneratedCronHook) => void;
+      }) => void;
+    };
+  };
+  const hooks = new Map<string, GeneratedCronHook>();
+  loaded.default.register({
+    pluginConfig: {
+      endpoint: "https://host.test/api/internal/cron-projection",
+      baselineMode,
+    },
+    logger: { warn: () => undefined },
+    on: (name, handler) => hooks.set(name, handler),
+  });
+  return hooks;
+}
+
+test("generated cron plugin keeps v1 and v2 baseline hooks exclusive", async (t) => {
+  const previousGatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
+  process.env.OPENCLAW_GATEWAY_TOKEN = "generated-plugin-test-token";
+  try {
+    let fetchCalls = 0;
+    const projectionBodies: Array<{ wakes?: unknown[] }> = [];
+    t.mock.method(
+      globalThis,
+      "fetch",
+      async (_input: string | URL | Request, init?: RequestInit) => {
+        fetchCalls += 1;
+        projectionBodies.push(
+          JSON.parse(String(init?.body)) as { wakes?: unknown[] },
+        );
+        return Response.json({
+          status: "accepted",
+          sourceLeaseToken: "source-lease-token",
+        });
+      },
+    );
+    const cron = {
+      list: async () => [],
+    };
+
+    const v1 = await registerGeneratedCronPlugin("gateway-start");
+    assert.equal(v1.has("gateway_start"), true);
+    assert.equal(v1.has("cron_reconciled"), false);
+    await v1.get("gateway_start")?.(
+      {},
+      { config: { cron: { enabled: true } }, getCron: () => cron },
+    );
+    assert.equal(fetchCalls, 1, "v1 gateway_start must publish its baseline");
+    await v1.get("gateway_stop")?.({}, {});
+
+    const v2 = await registerGeneratedCronPlugin("cron-reconciled");
+    assert.equal(v2.has("gateway_start"), false);
+    assert.equal(v2.has("cron_reconciled"), true);
+    await v2.get("cron_changed")?.({}, { getCron: () => cron });
+    assert.equal(fetchCalls, 1, "v2 must ignore cron_changed before reconciliation");
+    const reconciliation = new AbortController();
+    await v2.get("cron_reconciled")?.(
+      { enabled: false, reason: "startup" },
+      { abortSignal: reconciliation.signal },
+    );
+    assert.equal(
+      fetchCalls,
+      2,
+      "disabled v2 reconciliation must publish an empty baseline without a scheduler",
+    );
+    assert.deepEqual(projectionBodies[1]?.wakes, []);
+    await v2.get("cron_reconciled")?.(
+      { enabled: true, reason: "startup" },
+      {
+        abortSignal: reconciliation.signal,
+        getCron: () => cron,
+      },
+    );
+    assert.equal(fetchCalls, 3, "v2 cron_reconciled must publish its baseline");
+    await v2.get("gateway_stop")?.({}, {});
+  } finally {
+    if (previousGatewayToken === undefined) {
+      delete process.env.OPENCLAW_GATEWAY_TOKEN;
+    } else {
+      process.env.OPENCLAW_GATEWAY_TOKEN = previousGatewayToken;
+    }
+  }
 });
 
 test("buildRestoreRuntimeEnv ignores apiKey param (network policy handles real credential)", () => {

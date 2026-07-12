@@ -20,15 +20,18 @@ export type HostSuspensionPhase =
   | "stop-requesting"
   | "stopping"
   | "stopped"
+  | "replacement-starting"
+  | "replacement-failed"
   | "thawing"
   | "rollback-pending"
   | "running"
   | "failed";
 
 export type HostSuspensionIntent = "stop" | "reset";
+export type GatewayReplacementStage = "preparing" | "launching";
 
 export type HostSuspensionState = {
-  version: 1;
+  version: 1 | 2;
   operationId: string;
   requestId: string;
   sandboxId: string;
@@ -48,6 +51,9 @@ export type HostSuspensionState = {
   lastError: string | null;
   lastErrorCode: string | null;
   lastErrorClass: string | null;
+  // Absent on records written before durable Gateway replacement ownership.
+  replacementSessionId?: string | null;
+  replacementStage?: GatewayReplacementStage | null;
 };
 
 // Vercel Functions/Workflow steps executing lifecycle calls are bounded below
@@ -112,8 +118,22 @@ export type HostSuspensionDeps = {
   startMonitor: (operationId: string) => Promise<void>;
 };
 
+export async function readPersistedHostSuspensionState(
+  store: Pick<ReturnType<typeof getStore>, "getValueState"> = getStore(),
+): Promise<HostSuspensionState | null> {
+  const stored = await store.getValueState<HostSuspensionState>(
+    hostSuspensionOperationKey(),
+  );
+  if (stored.status === "absent") return null;
+  // getValue() collapses malformed JSON into absence. Suspension state is a
+  // fail-closed safety record, so preserve key presence and reject a value
+  // that the store could not decode.
+  if (stored.value === null) throw new HostSuspensionStateCorruptError();
+  return stored.value;
+}
+
 const defaultDeps: HostSuspensionDeps = {
-  read: () => getStore().getValue<HostSuspensionState>(hostSuspensionOperationKey()),
+  read: readPersistedHostSuspensionState,
   write: (state) => getStore().setValue(hostSuspensionOperationKey(), state),
   clear: () => getStore().deleteValue(hostSuspensionOperationKey()),
   getCurrentGeneration: async () => {
@@ -218,6 +238,8 @@ function isPhase(value: unknown): value is HostSuspensionPhase {
     "stop-requesting",
     "stopping",
     "stopped",
+    "replacement-starting",
+    "replacement-failed",
     "thawing",
     "rollback-pending",
     "running",
@@ -248,6 +270,11 @@ const HOST_SUSPENSION_STATE_KEYS = [
   "version",
 ] as const;
 
+const HOST_SUSPENSION_REPLACEMENT_KEYS = [
+  "replacementSessionId",
+  "replacementStage",
+] as const;
+
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
@@ -268,9 +295,39 @@ function isHostSuspensionState(value: unknown): value is HostSuspensionState {
     ? isFiniteNumber(state.stopRequestDeadlineAtMs)
     : state.stopRequestDeadlineAtMs === null;
 
-  return keys.length === HOST_SUSPENSION_STATE_KEYS.length
+  const replacementPhase = state.phase === "replacement-starting"
+    || state.phase === "replacement-failed";
+  const replacementSessionIdValid = state.replacementSessionId === undefined
+    || state.replacementSessionId === null
+    || (
+      typeof state.replacementSessionId === "string"
+      && state.replacementSessionId.length > 0
+    );
+  const replacementStageValid = state.replacementStage === undefined
+    || state.replacementStage === null
+    || state.replacementStage === "preparing"
+    || state.replacementStage === "launching";
+  const replacementOwnershipValid = replacementPhase
+    ? state.version === 2
+      && typeof state.replacementSessionId === "string"
+      && state.replacementSessionId.length > 0
+      && (
+        state.replacementStage === "preparing"
+        || state.replacementStage === "launching"
+      )
+    : state.version === 1
+      && state.replacementSessionId == null
+      && state.replacementStage == null;
+
+  return keys.length >= HOST_SUSPENSION_STATE_KEYS.length
+    && keys.length <= (
+      HOST_SUSPENSION_STATE_KEYS.length + HOST_SUSPENSION_REPLACEMENT_KEYS.length
+    )
     && HOST_SUSPENSION_STATE_KEYS.every((key) => Object.hasOwn(state, key))
-    && state.version === 1
+    && keys.every((key) =>
+      (HOST_SUSPENSION_STATE_KEYS as readonly string[]).includes(key)
+      || (HOST_SUSPENSION_REPLACEMENT_KEYS as readonly string[]).includes(key))
+    && (state.version === 1 || state.version === 2)
     && typeof state.operationId === "string"
     && state.operationId.length > 0
     && typeof state.requestId === "string"
@@ -299,7 +356,10 @@ function isHostSuspensionState(value: unknown): value is HostSuspensionState {
     && isNullableFiniteNumber(state.resumedAtMs)
     && isNullableString(state.lastError)
     && isNullableString(state.lastErrorCode)
-    && isNullableString(state.lastErrorClass);
+    && isNullableString(state.lastErrorClass)
+    && replacementSessionIdValid
+    && replacementStageValid
+    && replacementOwnershipValid;
 }
 
 export async function readHostSuspensionState(
@@ -404,6 +464,8 @@ function createOperation(input: {
     lastError: null,
     lastErrorCode: null,
     lastErrorClass: null,
+    replacementSessionId: null,
+    replacementStage: null,
   };
 }
 
@@ -444,13 +506,37 @@ export async function recordPlatformStoppedHostSuspension(input: {
           "A fenced lifecycle operation belongs to another sandbox generation.",
         );
       }
-      if (
-        existing.suspensionId
-        && (existing.phase === "stop-requesting" || existing.phase === "stopping")
-      ) {
+      const platformTerminalPhase = [
+        "fencing",
+        "preparing",
+        "prepared",
+        "stop-requesting",
+        "stopping",
+        "stopped",
+        "thawing",
+        "rollback-pending",
+      ].includes(existing.phase);
+      if (existing.intent === "reset" && platformTerminalPhase) {
+        // A reset still owes a destructive delete. The platform stopping the
+        // session only makes that delete safe to resume; it does not complete
+        // the reset or reopen ingress.
+        const stopping: HostSuspensionState = {
+          ...existing,
+          phase: "stopping",
+          stopRequestDeadlineAtMs: null,
+          monitorHeartbeatAtMs: null,
+          updatedAtMs: deps.now(),
+        };
+        await deps.write(stopping);
+        return stopping;
+      }
+      if (existing.intent === "stop" && platformTerminalPhase) {
         const stopped: HostSuspensionState = {
           ...existing,
           phase: "stopped",
+          reason: existing.suspensionId
+            ? existing.reason
+            : PLATFORM_STOP_CONFIRMED_REASON,
           stopRequestDeadlineAtMs: null,
           stoppedAtMs: deps.now(),
           updatedAtMs: deps.now(),
@@ -853,12 +939,343 @@ export async function markHostSuspensionStopped(
   });
 }
 
-/** Retire the exact old-process lease after its Gateway has been killed. */
+/** Transfer an exact stopped-process fence to the lifecycle attempt replacing it. */
+export async function adoptHostSuspensionForGatewayReplacement(
+  input: {
+    expected: HostSuspensionState;
+    sandboxId: string;
+    lifecycleAttemptId: string;
+    allowMissingSandboxId: boolean;
+  },
+  deps: HostSuspensionDeps = defaultDeps,
+): Promise<HostSuspensionState> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const [current, generation] = await Promise.all([
+      readHostSuspensionState(deps),
+      deps.getCurrentGeneration(),
+    ]);
+    const sandboxMatches = generation.sandboxId === input.sandboxId
+      || (input.allowMissingSandboxId && generation.sandboxId === null);
+    if (
+      !current
+      || current.operationId !== input.expected.operationId
+      || current.sandboxId !== input.expected.sandboxId
+      || current.lifecycleAttemptId !== input.expected.lifecycleAttemptId
+      || current.phase !== input.expected.phase
+      || current.intent !== "stop"
+      || !current.ingressFenced
+      || (
+        current.phase !== "stopped"
+        && current.phase !== "rollback-pending"
+      )
+      || input.sandboxId !== current.sandboxId
+      || !sandboxMatches
+      || generation.lifecycleAttemptId !== input.lifecycleAttemptId
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_ADOPTION_CONFLICT",
+        "The stopped Gateway fence no longer owns this sandbox generation.",
+      );
+    }
+    const adopted: HostSuspensionState = {
+      ...current,
+      lifecycleAttemptId: input.lifecycleAttemptId,
+      updatedAtMs: deps.now(),
+    };
+    await deps.write(adopted);
+    return adopted;
+  });
+}
+
+/**
+ * Record confirmed termination before any replacement work can begin. The
+ * exact Sandbox session is part of the owner: a retry must never infer that a
+ * different current session contains the Gateway this operation killed.
+ */
+export async function beginHostSuspensionGatewayReplacement(
+  input: {
+    expected: HostSuspensionState;
+    sandboxId: string;
+    lifecycleAttemptId: string;
+    sessionId: string;
+  },
+  deps: HostSuspensionDeps = defaultDeps,
+): Promise<HostSuspensionState> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const [current, generation] = await Promise.all([
+      readHostSuspensionState(deps),
+      deps.getCurrentGeneration(),
+    ]);
+    if (
+      !current
+      || current.operationId !== input.expected.operationId
+      || current.requestId !== input.expected.requestId
+      || current.sandboxId !== input.expected.sandboxId
+      || current.lifecycleAttemptId !== input.expected.lifecycleAttemptId
+      || current.phase !== input.expected.phase
+      || current.intent !== "stop"
+      || !current.ingressFenced
+      || (
+        current.phase !== "stopped"
+        && current.phase !== "rollback-pending"
+      )
+      || current.sandboxId !== input.sandboxId
+      || generation.sandboxId !== input.sandboxId
+      || generation.lifecycleAttemptId !== input.lifecycleAttemptId
+      || input.sessionId.length === 0
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_REPLACEMENT_CONFLICT",
+        "The confirmed Gateway termination no longer owns this sandbox session.",
+      );
+    }
+    const replacement: HostSuspensionState = {
+      ...current,
+      version: 2,
+      phase: "replacement-starting",
+      replacementSessionId: input.sessionId,
+      replacementStage: "preparing",
+      stopRequestDeadlineAtMs: null,
+      lastError: null,
+      lastErrorCode: null,
+      lastErrorClass: null,
+      updatedAtMs: deps.now(),
+    };
+    await deps.write(replacement);
+    return replacement;
+  });
+}
+
+/** Transfer an interrupted exact-session replacement to a new lifecycle attempt. */
+export async function adoptHostSuspensionGatewayReplacement(
+  input: {
+    expected: HostSuspensionState;
+    sandboxId: string;
+    lifecycleAttemptId: string;
+    sessionId: string;
+  },
+  deps: HostSuspensionDeps = defaultDeps,
+): Promise<HostSuspensionState> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const [current, generation] = await Promise.all([
+      readHostSuspensionState(deps),
+      deps.getCurrentGeneration(),
+    ]);
+    if (
+      !current
+      || current.operationId !== input.expected.operationId
+      || current.requestId !== input.expected.requestId
+      || current.sandboxId !== input.expected.sandboxId
+      || current.lifecycleAttemptId !== input.expected.lifecycleAttemptId
+      || current.phase !== input.expected.phase
+      || (
+        current.phase !== "replacement-starting"
+        && current.phase !== "replacement-failed"
+      )
+      || !current.ingressFenced
+      || current.replacementSessionId !== input.sessionId
+      || current.replacementStage == null
+      || current.sandboxId !== input.sandboxId
+      || generation.sandboxId !== input.sandboxId
+      || generation.lifecycleAttemptId !== input.lifecycleAttemptId
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_REPLACEMENT_ADOPTION_CONFLICT",
+        "The interrupted Gateway replacement no longer owns this sandbox session.",
+      );
+    }
+    const adopted: HostSuspensionState = {
+      ...current,
+      lifecycleAttemptId: input.lifecycleAttemptId,
+      phase: "replacement-starting",
+      lastError: null,
+      lastErrorCode: null,
+      lastErrorClass: null,
+      updatedAtMs: deps.now(),
+    };
+    await deps.write(adopted);
+    return adopted;
+  });
+}
+
+/**
+ * A platform-stopped Sandbox has no live replacement session to preserve.
+ * Convert the exact v2 owner back to the canonical platform-stopped fence so
+ * the ordinary stopped adoption path can resume it safely.
+ */
+export async function canonicalizeStoppedHostSuspensionGatewayReplacement(
+  input: {
+    expected: HostSuspensionState;
+    sandboxId: string;
+    expectedCurrentLifecycleAttemptId: string;
+  },
+  deps: HostSuspensionDeps = defaultDeps,
+): Promise<HostSuspensionState> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const [current, generation] = await Promise.all([
+      readHostSuspensionState(deps),
+      deps.getCurrentGeneration(),
+    ]);
+    if (
+      !current
+      || current.version !== 2
+      || current.operationId !== input.expected.operationId
+      || current.requestId !== input.expected.requestId
+      || current.sandboxId !== input.expected.sandboxId
+      || current.lifecycleAttemptId !== input.expected.lifecycleAttemptId
+      || current.phase !== input.expected.phase
+      || (
+        current.phase !== "replacement-starting"
+        && current.phase !== "replacement-failed"
+      )
+      || !current.ingressFenced
+      || current.replacementSessionId !== input.expected.replacementSessionId
+      || current.replacementStage !== input.expected.replacementStage
+      || current.sandboxId !== input.sandboxId
+      || generation.sandboxId !== input.sandboxId
+      || generation.lifecycleAttemptId
+        !== input.expectedCurrentLifecycleAttemptId
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_REPLACEMENT_STOPPED_CONFLICT",
+        "The stopped Gateway replacement no longer owns this sandbox generation.",
+      );
+    }
+    const stopped: HostSuspensionState = {
+      ...current,
+      version: 1,
+      phase: "stopped",
+      reason: PLATFORM_STOP_CONFIRMED_REASON,
+      suspensionId: null,
+      leaseExpiresAtMs: null,
+      stoppedAtMs: deps.now(),
+      replacementSessionId: null,
+      replacementStage: null,
+      lastError: null,
+      lastErrorCode: null,
+      lastErrorClass: null,
+      updatedAtMs: deps.now(),
+    };
+    await deps.write(stopped);
+    return stopped;
+  });
+}
+
+async function transitionGatewayReplacementStage(
+  input: {
+    expected: HostSuspensionState;
+    stage: GatewayReplacementStage;
+  },
+  deps: HostSuspensionDeps,
+): Promise<HostSuspensionState> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const [current, generation] = await Promise.all([
+      readHostSuspensionState(deps),
+      deps.getCurrentGeneration(),
+    ]);
+    if (
+      !current
+      || current.operationId !== input.expected.operationId
+      || current.requestId !== input.expected.requestId
+      || current.sandboxId !== input.expected.sandboxId
+      || current.lifecycleAttemptId !== input.expected.lifecycleAttemptId
+      || current.phase !== "replacement-starting"
+      || !current.ingressFenced
+      || current.replacementSessionId !== input.expected.replacementSessionId
+      || current.replacementStage !== input.expected.replacementStage
+      || generation.sandboxId !== current.sandboxId
+      || generation.lifecycleAttemptId !== current.lifecycleAttemptId
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_REPLACEMENT_CONFLICT",
+        "The Gateway replacement stage changed concurrently.",
+      );
+    }
+    const next: HostSuspensionState = {
+      ...current,
+      replacementStage: input.stage,
+      updatedAtMs: deps.now(),
+    };
+    await deps.write(next);
+    return next;
+  });
+}
+
+export async function markHostSuspensionGatewayReplacementLaunching(
+  expected: HostSuspensionState,
+  deps: HostSuspensionDeps = defaultDeps,
+): Promise<HostSuspensionState> {
+  if (expected.replacementStage !== "preparing") {
+    throw new ApiError(
+      409,
+      "HOST_SUSPENSION_REPLACEMENT_CONFLICT",
+      "Gateway replacement is not ready to launch.",
+    );
+  }
+  return transitionGatewayReplacementStage({ expected, stage: "launching" }, deps);
+}
+
+export async function markHostSuspensionGatewayReplacementPreparing(
+  expected: HostSuspensionState,
+  deps: HostSuspensionDeps = defaultDeps,
+): Promise<HostSuspensionState> {
+  if (expected.replacementStage !== "launching") {
+    throw new ApiError(
+      409,
+      "HOST_SUSPENSION_REPLACEMENT_CONFLICT",
+      "Gateway replacement launch is not awaiting termination confirmation.",
+    );
+  }
+  return transitionGatewayReplacementStage({ expected, stage: "preparing" }, deps);
+}
+
+/** Keep a failed replacement owned and fenced for exact-session retry. */
+export async function markHostSuspensionGatewayReplacementFailed(
+  expected: HostSuspensionState,
+  error: unknown,
+  deps: HostSuspensionDeps = defaultDeps,
+): Promise<HostSuspensionState | null> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const [current, generation] = await Promise.all([
+      readHostSuspensionState(deps),
+      deps.getCurrentGeneration(),
+    ]);
+    if (
+      !current
+      || current.operationId !== expected.operationId
+      || current.requestId !== expected.requestId
+      || current.sandboxId !== expected.sandboxId
+      || current.lifecycleAttemptId !== expected.lifecycleAttemptId
+      || current.phase !== "replacement-starting"
+      || current.replacementSessionId !== expected.replacementSessionId
+      || current.replacementStage !== expected.replacementStage
+      || !current.ingressFenced
+      || generation.sandboxId !== current.sandboxId
+      || generation.lifecycleAttemptId !== current.lifecycleAttemptId
+    ) return null;
+    const failed: HostSuspensionState = {
+      ...current,
+      phase: "replacement-failed",
+      ...classifyError(error),
+      updatedAtMs: deps.now(),
+    };
+    await deps.write(failed);
+    return failed;
+  });
+}
+
+/** Retire the exact replacement fence only after its running metadata commit. */
 export async function clearHostSuspensionAfterGatewayReplacement(
   input: {
     expected: HostSuspensionState;
     sandboxId: string;
     lifecycleAttemptId: string | null;
+    sessionId: string;
   },
   deps: HostSuspensionDeps = defaultDeps,
 ): Promise<boolean> {
@@ -872,12 +1289,12 @@ export async function clearHostSuspensionAfterGatewayReplacement(
       || current.operationId !== input.expected.operationId
       || current.sandboxId !== input.expected.sandboxId
       || current.lifecycleAttemptId !== input.expected.lifecycleAttemptId
-      || current.phase !== input.expected.phase
+      || current.phase !== "replacement-starting"
       || !current.ingressFenced
-      || (
-        current.phase !== "stopped"
-        && current.phase !== "rollback-pending"
-      )
+      || current.replacementSessionId !== input.sessionId
+      || current.replacementSessionId !== input.expected.replacementSessionId
+      || current.replacementStage !== "launching"
+      || current.replacementStage !== input.expected.replacementStage
       || input.sandboxId !== current.sandboxId
       || generation.sandboxId !== input.sandboxId
       || generation.lifecycleAttemptId !== input.lifecycleAttemptId

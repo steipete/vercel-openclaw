@@ -1,6 +1,7 @@
 import { ApiError } from "@/shared/http";
 import { createChannelAdminRouteHandlers } from "@/server/channels/admin/route-factory";
 import { fetchSlackAuthIdentity } from "@/server/channels/slack/auth";
+import { deleteSlackAppConfig } from "@/server/channels/slack/app-config";
 import { setSlackChannelConfig } from "@/server/channels/state";
 
 function parseNonEmptyString(value: unknown, field: string): string {
@@ -70,5 +71,10 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
   async delete({ assertMutationOwned }) {
     await assertMutationOwned();
     await setSlackChannelConfig(null);
+  },
+
+  async afterDeleteApplied({ assertMutationOwned }) {
+    await assertMutationOwned();
+    await deleteSlackAppConfig();
   },
 });

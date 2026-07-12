@@ -44,6 +44,11 @@ export type ChannelAdminRouteSpec<TState> = {
   get?(context: ChannelGetContext<TState>): Promise<unknown | Response>;
   put(context: ChannelMutationRouteContext): Promise<void | Response>;
   delete(context: ChannelMutationRouteContext): Promise<void | Response>;
+  afterDeleteApplied?(
+    context: ChannelMutationRouteContext & {
+      liveConfigSync: LiveConfigSyncResult;
+    },
+  ): Promise<void | Response>;
 };
 
 export function createChannelAdminRouteHandlers<TState>(
@@ -158,6 +163,17 @@ export function createChannelAdminRouteHandlers<TState>(
               channel: spec.channel,
               operation: "delete",
             }, assertOwned);
+
+          await assertOwned();
+          const afterDeleteResult = await spec.afterDeleteApplied?.({
+            request,
+            auth,
+            meta,
+            url: new URL(request.url),
+            assertMutationOwned: assertOwned,
+            liveConfigSync,
+          });
+          if (afterDeleteResult instanceof Response) return afterDeleteResult;
 
           const nextState = spec.selectState(await getPublicChannelState(request));
           const body = {

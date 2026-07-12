@@ -212,7 +212,7 @@ See [Sandbox Lifecycle and Restore](lifecycle-and-restore.md) for a plain-Englis
 
 ### Example blocked channel connect response
 
-Supported channel credential-save routes (`PUT /api/channels/slack`, `PUT /api/channels/telegram`, `PUT /api/channels/discord`) return HTTP 409 with the same envelope when deployment prerequisites are still failing. `PUT /api/channels/whatsapp` always returns `CHANNEL_CONNECT_BLOCKED` while hosted WhatsApp transport remains unsupported.
+Supported channel credential-save routes (`PUT /api/channels/slack` and `PUT /api/channels/telegram`) return HTTP 409 with the same envelope when deployment prerequisites are still failing. Discord and WhatsApp saves always return `CHANNEL_CONNECT_BLOCKED` because their hosted transports are unsupported; their DELETE routes remain available for legacy cleanup.
 
 Sample request outcome: `PUT /api/channels/telegram` while the deployment cannot resolve a public webhook origin.
 

@@ -292,6 +292,54 @@ test("ensureMetaShape: fills missing snapshotHistory with empty array", () => {
   assert.deepStrictEqual(result.snapshotHistory, []);
 });
 
+test("ensureMetaShape: admits only pre-v4 stopped persistent state for fence migration", () => {
+  const eligible = ensureMetaShape({
+    _schemaVersion: 3,
+    gatewayToken: "tok-legacy-stopped",
+    status: "stopped",
+    sandboxId: "sbx-legacy-stopped",
+  });
+  assert.deepEqual(eligible?.legacyStoppedFenceMigration, {
+    version: 1,
+    state: "legacy-eligible",
+  });
+
+  const running = ensureMetaShape({
+    _schemaVersion: 3,
+    gatewayToken: "tok-legacy-running",
+    status: "running",
+    sandboxId: "sbx-legacy-running",
+  });
+  assert.deepEqual(running?.legacyStoppedFenceMigration, {
+    version: 1,
+    state: "not-required",
+  });
+});
+
+test("ensureMetaShape: rejects missing or malformed v4 fence migration markers", () => {
+  assert.throws(
+    () => ensureMetaShape({
+      _schemaVersion: 4,
+      gatewayToken: "tok-v4-missing-marker",
+      status: "stopped",
+      sandboxId: "sbx-v4-missing-marker",
+    }),
+    /v4 meta without the stopped-fence migration marker/,
+  );
+  assert.throws(
+    () => ensureMetaShape({
+      _schemaVersion: 4,
+      gatewayToken: "tok-v4-malformed-marker",
+      legacyStoppedFenceMigration: {
+        version: 1,
+        state: "claimed",
+        sandboxId: "sbx-v4-malformed-marker",
+      },
+    }),
+    /invalid stopped-fence migration marker/,
+  );
+});
+
 test("ensureMetaShape: fills missing firewall with default disabled state", () => {
   const input = {
     gatewayToken: "tok-3",
@@ -834,6 +882,10 @@ test("[types] createDefaultMeta produces valid defaults for all required fields"
   assert.equal(meta.portUrls, null);
   assert.equal(meta.startupScript, null);
   assert.equal(meta.lastError, null);
+  assert.deepEqual(meta.legacyStoppedFenceMigration, {
+    version: 1,
+    state: "not-required",
+  });
 
   // Firewall defaults
   assert.equal(meta.firewall.mode, "disabled");

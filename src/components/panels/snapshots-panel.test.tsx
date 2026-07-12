@@ -72,7 +72,7 @@ const CHANNELS: StatusPayload["channels"] = {
     currentEndpointUrl: null,
     endpointDrift: false,
     canRepairEndpoint: false,
-    nextSafeAction: "paste-token",
+    nextSafeAction: "use-local-openclaw",
     applicationId: null,
     publicKey: null,
     configuredAt: null,
@@ -162,6 +162,8 @@ test("SnapshotsPanel renders the danger zone at the bottom", () => {
   const html = renderPanel(makeStatus());
 
   assert.ok(html.includes("Snapshot history"));
+  assert.ok(html.includes("Historical snapshots are"));
+  assert.ok(html.includes("read/delete-only"));
   assert.ok(html.includes("Danger zone"));
   assert.ok(html.includes("Delete the current sandbox and snapshots"));
   assert.match(html, /<button[^>]*>Reset Sandbox<\/button>/);
@@ -197,9 +199,7 @@ test("SnapshotsPanel disables reset during transition", () => {
   assert.match(setupHtml, /<button[^>]*disabled=""[^>]*>Reset Sandbox<\/button>/);
 });
 
-test("SnapshotsPanel shows zero history count when snapshots are empty (post-reset state)", () => {
-  // After a successful reset, setSnapshots([]) is called.
-  // This test verifies the empty-snapshots render path that the reset handler produces.
+test("SnapshotsPanel shows zero history count while snapshot truth loads", () => {
   const html = renderPanel(makeStatus());
 
   // SSR renders the loading placeholder for history count (loading=true initially),

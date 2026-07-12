@@ -61,6 +61,8 @@ import {
   reconcileTelegramWebhookCleanups,
   type TelegramWebhookCleanupResult,
 } from "@/server/channels/telegram/webhook-cleanup";
+import { reconcileFirewallPolicyIfNeeded } from "@/server/firewall/state";
+import type { FirewallSyncOutcome } from "@/shared/types";
 
 export type RunSandboxWatchdogOptions = {
   request: Request;
@@ -93,6 +95,9 @@ export type WatchdogDeps = {
     reason: string;
     controlPlaneOrigin?: string;
   }) => Promise<TokenRefreshResult>;
+  reconcileFirewallPolicy: (input: {
+    controlPlaneOrigin: string;
+  }) => Promise<FirewallSyncOutcome | null>;
   runRestoreOracle: (input: {
     origin: string;
     reason: string;
@@ -109,6 +114,14 @@ export type WatchdogDeps = {
 };
 
 const WATCHDOG_CRON_WAKE_CHECK_ID = "cron.wake" as const;
+
+const USABLE_TOKEN_REFRESH_REASONS = new Set([
+  "refreshed",
+  "meta-ttl-sufficient",
+  "meta-ttl-sufficient-after-lock",
+  "refreshed-by-another-request",
+  "api-key-no-refresh-needed",
+]);
 
 async function startCronWakeWorkflow(
   envelope: CronWakeWorkflowEnvelopeV1,
@@ -163,6 +176,10 @@ const defaultDeps: WatchdogDeps = {
     ensureUsableAiGatewayCredential({
       force: input.force,
       reason: input.reason,
+      controlPlaneOrigin: input.controlPlaneOrigin,
+    }),
+  reconcileFirewallPolicy: (input) =>
+    reconcileFirewallPolicyIfNeeded({
       controlPlaneOrigin: input.controlPlaneOrigin,
     }),
   runRestoreOracle: (input) =>
@@ -236,9 +253,8 @@ export async function runSandboxWatchdog(
       || (postRefreshMeta.lifecycleAttemptId ?? null)
         !== expectedLifecycleAttemptId;
     meta = postRefreshMeta;
-    const failed = result.reason.startsWith("refresh-failed:") ||
-      result.reason === "no-credential-available" ||
-      generationChanged;
+    const failed = !USABLE_TOKEN_REFRESH_REASONS.has(result.reason)
+      || generationChanged;
     const failureReason = generationChanged
       ? "sandbox generation changed or was fail-closed during token refresh"
       : result.reason;
@@ -530,6 +546,64 @@ export async function runSandboxWatchdog(
           message: "AI Gateway token is usable for running sandbox.",
         });
 
+        const firewallStartedAt = deps.now();
+        const expectedFirewallSandboxId = meta.sandboxId;
+        const expectedFirewallLifecycleAttemptId =
+          meta.lifecycleAttemptId ?? null;
+        try {
+          const firewall = await deps.reconcileFirewallPolicy({
+            controlPlaneOrigin: getPublicOrigin(options.request),
+          });
+          const postFirewallMeta = await deps.getMeta();
+          const generationChanged =
+            postFirewallMeta.status !== "running"
+            || postFirewallMeta.sandboxId !== expectedFirewallSandboxId
+            || (postFirewallMeta.lifecycleAttemptId ?? null)
+              !== expectedFirewallLifecycleAttemptId;
+          meta = postFirewallMeta;
+          if (generationChanged) {
+            throw new Error(
+              "Sandbox generation changed or was fail-closed during firewall reconciliation.",
+            );
+          }
+          if (!firewall) {
+            addCheck(
+              "firewall.policy",
+              "skip",
+              firewallStartedAt,
+              "Firewall policy already matches its latest successful SDK attestation.",
+            );
+          } else if (firewall.applied) {
+            triggeredRepair = true;
+            if (!tokenRefreshFailed && failingRequirementIds.length === 0) {
+              status = "repairing";
+            }
+            addCheck(
+              "firewall.policy",
+              "pass",
+              firewallStartedAt,
+              "Reconciled the desired firewall policy with the running sandbox.",
+              {
+                policyHash: firewall.policyHash,
+                reason: firewall.reason,
+              },
+            );
+          } else {
+            throw new Error(
+              `Firewall policy reconciliation did not apply: ${firewall.reason}`,
+            );
+          }
+        } catch (firewallError) {
+          meta = await deps.getMeta();
+          const message = firewallError instanceof Error
+            ? firewallError.message
+            : String(firewallError);
+          addCheck("firewall.policy", "fail", firewallStartedAt, message);
+          lastError = message;
+          status = "failed";
+          throw firewallError;
+        }
+
         // Restore oracle: attempt to seal a fresh restore target when idle
         const restorePrepareStartedAt = deps.now();
         try {
@@ -588,7 +662,11 @@ export async function runSandboxWatchdog(
                 ? "Restore target already reusable."
                 : `Skipped: ${oracle.blockedReason ?? "unknown"}.`;
             addCheck("restore.prepare", "skip", restorePrepareStartedAt, message, oracleData);
-            status = tokenRefreshFailed || failingRequirementIds.length > 0 ? "failed" : "ok";
+            if (tokenRefreshFailed || failingRequirementIds.length > 0) {
+              status = "failed";
+            } else if (status !== "repairing") {
+              status = "ok";
+            }
           }
         } catch (oracleError) {
           const errMsg = oracleError instanceof Error ? oracleError.message : String(oracleError);

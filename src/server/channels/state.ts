@@ -227,13 +227,9 @@ function toPublicTelegramState(
 function toPublicDiscordState(
   config: DiscordChannelConfig | null,
   webhookUrl: string,
-  publicUrl: boolean,
+  _publicUrl: boolean,
   connectability: ChannelConnectability,
 ): PublicDiscordState {
-  const inviteUrl =
-    config?.applicationId
-      ? `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(config.applicationId)}&scope=bot+applications.commands&permissions=3072`
-      : null;
   const currentEndpointUrl = toDisplaySafeWebhookUrl(config?.endpointUrl ?? null);
   const compareWebhookUrl = toDisplaySafeWebhookUrl(webhookUrl) ?? webhookUrl;
   const endpointDrift = Boolean(
@@ -241,18 +237,10 @@ function toPublicDiscordState(
   );
   const endpointConfigured = config?.endpointConfigured === true && !endpointDrift;
   const commandRegistered = config?.commandRegistered === true;
-  const canRepairEndpoint = Boolean(config && publicUrl && endpointDrift);
-  const nextSafeAction: PublicDiscordState["nextSafeAction"] = !config
-    ? "paste-token"
-    : endpointDrift
-      ? "repair-endpoint"
-      : !endpointConfigured
-        ? "configure-endpoint"
-        : !commandRegistered
-          ? "register-command"
-          : inviteUrl
-            ? "run-ask-test"
-            : "invite-bot";
+  const canRepairEndpoint = false;
+  const nextSafeAction: PublicDiscordState["nextSafeAction"] = config
+    ? "disconnect-legacy"
+    : "use-local-openclaw";
 
   return {
     configured: config !== null,
@@ -272,8 +260,8 @@ function toPublicDiscordState(
     endpointError: config?.endpointError ?? null,
     commandRegistered,
     commandId: config?.commandId ?? null,
-    inviteUrl,
-    isPublicUrl: publicUrl,
+    inviteUrl: null,
+    isPublicUrl: _publicUrl,
     connectability,
   };
 }

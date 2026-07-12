@@ -4,6 +4,26 @@ import { logInfo } from "@/server/log";
 const SLACK_DELETE_MESSAGE_URL = "https://slack.com/api/chat.delete";
 const SLACK_UPDATE_MESSAGE_URL = "https://slack.com/api/chat.update";
 const SLACK_REQUEST_TIMEOUT_MS = 15_000;
+const SLACK_TRANSIENT_ERROR_CODES = new Set([
+  "fatal_error",
+  "internal_error",
+  "request_timeout",
+  "service_unavailable",
+]);
+
+export class SlackMessageDeletePermanentError extends Error {
+  readonly slackErrorCode: string;
+
+  constructor(status: number, slackErrorCode: string) {
+    super(
+      slackErrorCode
+        ? `slack_message_delete_failed: status=${status} error=${slackErrorCode}`
+        : `slack_message_delete_failed: status=${status}`,
+    );
+    this.name = "SlackMessageDeletePermanentError";
+    this.slackErrorCode = slackErrorCode;
+  }
+}
 
 type SlackMessageResponse = {
   ok?: boolean;
@@ -151,12 +171,13 @@ export async function deleteSlackMessage(input: {
     });
     return;
   }
-  if (!response.ok || payload?.ok !== true) {
-    throw new Error(
-      detail
-        ? `slack_message_delete_failed: status=${response.status} error=${detail}`
-        : `slack_message_delete_failed: status=${response.status}`,
+  if (SLACK_TRANSIENT_ERROR_CODES.has(detail)) {
+    throw retryableError(
+      `slack_message_delete_retryable status=${response.status} error=${detail}`,
     );
+  }
+  if (!response.ok || payload?.ok !== true) {
+    throw new SlackMessageDeletePermanentError(response.status, detail);
   }
   logInfo("channels.slack_processing_placeholder_deleted", {
     channel: input.channel,

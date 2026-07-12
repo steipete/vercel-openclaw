@@ -4,6 +4,7 @@ import test from "node:test";
 import { buildAuthPostRequest, buildPostRequest, callRoute, patchNextServerAfter, resetAfterCallbacks } from "@/test-utils/route-caller";
 import { withHarness } from "@/test-utils/harness";
 import { loginWithAdminSecret } from "@/server/auth/admin-auth";
+import { _setSnapshotDeletionOverrideForTesting } from "@/server/sandbox/snapshot-delete";
 
 patchNextServerAfter();
 
@@ -19,6 +20,7 @@ function getAdminResetRoute(): ResetRouteModule {
 }
 
 test.afterEach(() => {
+  _setSnapshotDeletionOverrideForTesting(null);
   resetAfterCallbacks();
 });
 
@@ -148,5 +150,38 @@ test("admin/reset POST: confirms the durable reset before responding", async () 
     const stoppedHandle = h.controller.getHandle(originalSandboxId);
     assert.ok(stoppedHandle?.deleteCalled, "reset should delete the original sandbox");
     assert.equal(stoppedHandle?.snapshotCalled, false, "reset should not snapshot before deleting");
+  });
+});
+
+test("admin/reset POST: reports incomplete snapshot deletion as non-success", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    await h.mutateMeta((meta) => {
+      meta.snapshotId = "snap-reset-route-failure";
+      meta.snapshotHistory = [{
+        id: "history-reset-route-failure",
+        snapshotId: "snap-reset-route-failure",
+        timestamp: Date.now(),
+        reason: "manual",
+      }];
+    });
+    _setSnapshotDeletionOverrideForTesting(async () => {
+      throw new Error("provider deletion unavailable");
+    });
+
+    const result = await callRoute(
+      getAdminResetRoute().POST,
+      buildAuthPostRequest("/api/admin/reset", "{}"),
+    );
+
+    assert.equal(result.status, 502);
+    assert.equal(
+      (result.json as { error: string }).error,
+      "SANDBOX_RESET_INCOMPLETE",
+    );
+    const after = await h.getMeta();
+    assert.equal(after.status, "error");
+    assert.equal(after.sandboxId, null);
+    assert.equal(after.snapshotId, "snap-reset-route-failure");
   });
 });

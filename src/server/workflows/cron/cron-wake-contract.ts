@@ -20,6 +20,7 @@ export type CronWakeProcessOutcome =
 
 export type CronWakeSettleOutcome =
   | { status: "settled" }
+  | { status: "rehandoff" }
   | {
       status: "retry";
       retryAfterMs: number;

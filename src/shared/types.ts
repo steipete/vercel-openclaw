@@ -425,6 +425,30 @@ export type RestorePhaseMetrics = {
  */
 export const MAX_RESTORE_HISTORY = 50;
 
+export type LegacyStoppedFenceMigration =
+  | {
+      version: 1;
+      state: "legacy-eligible";
+    }
+  | {
+      version: 1;
+      state: "not-required";
+    }
+  | {
+      version: 1;
+      state: "claimed";
+      sandboxId: string;
+      sourceLifecycleAttemptId: string | null;
+      targetLifecycleAttemptId: string;
+    }
+  | {
+      version: 1;
+      state: "complete";
+      sandboxId: string;
+      sourceLifecycleAttemptId: string | null;
+      targetLifecycleAttemptId: string;
+    };
+
 export type SingleMeta = {
   _schemaVersion: number;
   version: number;
@@ -527,13 +551,16 @@ export type SingleMeta = {
   /** Unique ID for the current lifecycle attempt (create/restore). Used for
    *  orphan detection if the Vercel Sandbox API later supports tags/list. */
   lifecycleAttemptId?: string | null;
+  /** One-time repair owner for stopped persistent state written before the
+   *  durable Gateway fence existed. New state is never migration-eligible. */
+  legacyStoppedFenceMigration: LegacyStoppedFenceMigration;
   /** Persistent state for the restore oracle autopilot loop. */
   restoreOracle: RestoreOracleState;
   /** Optional hot-spare sandbox candidate state (feature-flagged, disabled by default). */
   hotSpare?: HotSpareState;
 };
 
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export function createDefaultMeta(
   now: number,
@@ -610,6 +637,10 @@ export function createDefaultMeta(
     lastRestoreMetrics: null,
     restoreHistory: [],
     lifecycleAttemptId: null,
+    legacyStoppedFenceMigration: {
+      version: 1,
+      state: "not-required",
+    },
     restoreOracle: {
       status: "idle",
       pendingReason: null,
@@ -644,6 +675,76 @@ function ensureChannelDiagnostics(value: unknown): ChannelDiagnostics {
   return out;
 }
 
+function ensureLegacyStoppedFenceMigration(
+  raw: Record<string, unknown>,
+  rawSchemaVersion: number,
+): LegacyStoppedFenceMigration {
+  const key = "legacyStoppedFenceMigration";
+  if (!Object.hasOwn(raw, key)) {
+    if (rawSchemaVersion >= 4) {
+      throw new Error(
+        "Refusing to hydrate v4 meta without the stopped-fence migration marker.",
+      );
+    }
+    return {
+      version: 1,
+      state:
+        raw.status === "stopped" && typeof raw.sandboxId === "string"
+          ? "legacy-eligible"
+          : "not-required",
+    };
+  }
+
+  const value = raw[key];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Refusing to hydrate an invalid stopped-fence migration marker.");
+  }
+  const marker = value as Record<string, unknown>;
+  const state = marker.state;
+  const keys = Object.keys(marker);
+  if (
+    marker.version === 1
+    && (state === "legacy-eligible" || state === "not-required")
+    && keys.length === 2
+    && keys.every((entry) => entry === "version" || entry === "state")
+  ) {
+    return { version: 1, state };
+  }
+  const exactClaimKeys = [
+    "sandboxId",
+    "sourceLifecycleAttemptId",
+    "state",
+    "targetLifecycleAttemptId",
+    "version",
+  ];
+  if (
+    marker.version === 1
+    && (state === "claimed" || state === "complete")
+    && keys.length === exactClaimKeys.length
+    && exactClaimKeys.every((entry) => Object.hasOwn(marker, entry))
+    && typeof marker.sandboxId === "string"
+    && marker.sandboxId.length > 0
+    && (
+      marker.sourceLifecycleAttemptId === null
+      || (
+        typeof marker.sourceLifecycleAttemptId === "string"
+        && marker.sourceLifecycleAttemptId.length > 0
+      )
+    )
+    && typeof marker.targetLifecycleAttemptId === "string"
+    && marker.targetLifecycleAttemptId.length > 0
+  ) {
+    return {
+      version: 1,
+      state,
+      sandboxId: marker.sandboxId,
+      sourceLifecycleAttemptId: marker.sourceLifecycleAttemptId as string | null,
+      targetLifecycleAttemptId: marker.targetLifecycleAttemptId,
+    };
+  }
+  throw new Error("Refusing to hydrate an invalid stopped-fence migration marker.");
+}
+
 export function ensureMetaShape(
   input: unknown,
   expectedInstanceId = getDefaultOpenclawInstanceId(),
@@ -660,6 +761,15 @@ export function ensureMetaShape(
       `Refusing to hydrate meta for instance "${raw.id}" while expecting "${expectedInstanceId}".`,
     );
   }
+  const rawRecord = raw as Record<string, unknown>;
+  const rawSchemaVersion = typeof raw._schemaVersion === "number"
+      && Number.isSafeInteger(raw._schemaVersion)
+    ? raw._schemaVersion
+    : 0;
+  const legacyStoppedFenceMigration = ensureLegacyStoppedFenceMigration(
+    rawRecord,
+    rawSchemaVersion,
+  );
   const now = Date.now();
   const createdAt = typeof raw.createdAt === "number" ? raw.createdAt : now;
   const legacySnapshotDynamicConfigHash =
@@ -1041,6 +1151,7 @@ export function ensureMetaShape(
       typeof (raw as Record<string, unknown>).lifecycleAttemptId === "string"
         ? (raw as Record<string, unknown>).lifecycleAttemptId as string
         : null,
+    legacyStoppedFenceMigration,
     restoreOracle: ensureRestoreOracleState(
       (raw as Record<string, unknown>).restoreOracle,
     ),

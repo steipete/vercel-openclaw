@@ -181,7 +181,7 @@ test("unconfigured telegram shows disconnected status and null webhookUrl", asyn
   });
 });
 
-test("configured discord returns invite url and public shape", async () => {
+test("configured discord returns cleanup-only public shape", async () => {
   await withHarness(async (h) => {
     await h.mutateMeta((meta) => {
       meta.channels.discord = makeDiscordConfig({
@@ -204,10 +204,10 @@ test("configured discord returns invite url and public shape", async () => {
     assert.equal(state.discord.endpointDrift, false);
     assert.equal(state.discord.currentEndpointUrl, "https://app.example.com/api/channels/discord/webhook");
     assert.equal(state.discord.desiredEndpointUrl, "https://app.example.com/api/channels/discord/webhook");
-    assert.equal(state.discord.nextSafeAction, "run-ask-test");
+    assert.equal(state.discord.nextSafeAction, "disconnect-legacy");
     assert.equal(state.discord.commandRegistered, true);
     assert.equal(state.discord.commandId, "cmd-123");
-    assert.ok(state.discord.inviteUrl?.includes("discord-app-id"));
+    assert.equal(state.discord.inviteUrl, null);
     // Secret should NOT be exposed
     assert.equal("botToken" in state.discord, false);
   });
@@ -232,11 +232,11 @@ test("configured discord ignores deployment-protection bypass query when checkin
     assert.equal(state.discord.currentEndpointUrl, "https://app.example.com/api/channels/discord/webhook");
     assert.equal(state.discord.desiredEndpointUrl, "https://app.example.com/api/channels/discord/webhook");
     assert.equal(state.discord.endpointUrl, "https://app.example.com/api/channels/discord/webhook");
-    assert.equal(state.discord.nextSafeAction, "run-ask-test");
+    assert.equal(state.discord.nextSafeAction, "disconnect-legacy");
   });
 });
 
-test("configured discord exposes endpoint drift and safe repair action", async () => {
+test("configured discord exposes endpoint drift without repair action", async () => {
   await withHarness(async (h) => {
     await h.mutateMeta((meta) => {
       meta.channels.discord = makeDiscordConfig({
@@ -252,10 +252,10 @@ test("configured discord exposes endpoint drift and safe repair action", async (
 
     assert.equal(state.discord.endpointConfigured, false);
     assert.equal(state.discord.endpointDrift, true);
-    assert.equal(state.discord.canRepairEndpoint, true);
+    assert.equal(state.discord.canRepairEndpoint, false);
     assert.equal(state.discord.currentEndpointUrl, "https://old.example.com/api/channels/discord/webhook");
     assert.equal(state.discord.desiredEndpointUrl, "https://app.example.com/api/channels/discord/webhook");
-    assert.equal(state.discord.nextSafeAction, "repair-endpoint");
+    assert.equal(state.discord.nextSafeAction, "disconnect-legacy");
   });
 });
 

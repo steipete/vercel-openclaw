@@ -104,9 +104,9 @@ Note: The `restoring` status from v1 snapshot-based flow has been removed. With 
 ### Channel delivery
 
 1. Public webhook validates the platform signature or secret.
-2. If the sandbox is already running, Telegram forwards raw updates to the native handler on port `8787`; Slack forwards to the gateway's Slack events endpoint.
-3. Otherwise Telegram may send a boot message, then the route starts `drainChannelWorkflow` via Workflow DevKit. Slack also enters the workflow path when it cannot use the fast path.
-4. The workflow restores the sandbox if needed, sends the message to `POST /v1/chat/completions`, and delivers the reply back to the originating channel.
+2. Production Slack and Telegram ingress always starts `drainChannelWorkflow` via Workflow DevKit. A running sandbox shortens readiness but does not bypass durable handoff.
+3. The workflow reuses or restores the sandbox, then forwards the original payload to Slack's native `/slack/events` handler on port `3000` or Telegram's native `/telegram-webhook` handler on port `8787`.
+4. Slack may create one Workflow-owned wake placeholder. Telegram creates no new placeholder because Bot API sends are not idempotent; the native handler owns final reply delivery.
 5. `@vercel/queue` is used for launch verification only, via `/api/queues/launch-verify`.
 
 ## Project structure
@@ -146,10 +146,11 @@ Full reference:
 | `SESSION_SECRET` | Optional (`admin-secret` mode) / Required on Vercel (`sign-in-with-vercel` mode) | Cookie encryption secret. In admin-secret mode the app auto-generates a 32-byte value and persists it in Redis on first login. In `sign-in-with-vercel` mode it must be explicitly set on deployed Vercel environments. |
 | `AI_GATEWAY_API_KEY` | No | Optional fallback when Vercel OIDC is unavailable (e.g. local dev without `vercel env pull`). OIDC is the default on deployed Vercel. |
 | `OPENCLAW_INSTANCE_ID` | No | Optional Redis key namespace. Defaults to `openclaw-single`. Required when multiple deployments share one Redis database. Changing it later points the app at a new namespace and does not migrate existing state. |
+| `OPENCLAW_OWNER_ALLOW_FROM` | No | Comma-separated explicit owners for owner-only channel commands (for example `telegram:123456789,slack:U12345678`). Wildcards are rejected. When unset, normal channel chat works but owner-only commands fail closed. |
 | `OPENCLAW_PACKAGE_SPEC` | No | OpenClaw version to install. When unset, the runtime falls back to a pinned known-good version (currently `openclaw@2026.4.12`). On Vercel deployments, the deployment contract **warns** — it does not fail — when unset or unpinned. Pin to an exact version like `openclaw@1.2.3` for deterministic sandbox resumes. |
 | `OPENCLAW_SANDBOX_VCPUS` | No | vCPU count for sandbox create and resume (valid: 1, 2, 4, 8; default: 1). Keep fixed during benchmarks. |
 | `OPENCLAW_SANDBOX_SLEEP_AFTER_MS` | No | How long the sandbox stays alive after last activity, in milliseconds (60000–2700000; default: 1800000 = 30 min). Heartbeat and touch-throttle intervals are derived proportionally. Existing running sandboxes cannot be shortened in place. If you increase this value, the next touch/heartbeat can top the sandbox timeout up to the new target. If you decrease it, the lower value becomes exact on the next create or restore. |
-| `VERCEL_AUTOMATION_BYPASS_SECRET` | No | Enables protected webhook delivery when Deployment Protection is on. All channel webhook URLs for hosted delivery (Slack, Telegram, Discord) include the bypass parameter when configured. The app auto-detects active protection and hard-blocks channel connections when it is on but this secret is missing. |
+| `VERCEL_AUTOMATION_BYPASS_SECRET` | No | Enables protected webhook delivery when Deployment Protection is on. All channel webhook URLs for supported hosted delivery (Slack and Telegram) include the bypass parameter when configured. The app auto-detects active protection and hard-blocks supported channel connections when it is on but this secret is missing. |
 | `NEXT_PUBLIC_APP_URL` | No | Base origin override |
 | `NEXT_PUBLIC_BASE_DOMAIN` | No | Preferred external host for webhook URLs |
 | `BASE_DOMAIN` | No | Legacy alias for `NEXT_PUBLIC_BASE_DOMAIN` |

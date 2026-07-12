@@ -56,6 +56,15 @@ export type SandboxStatus =
   | "aborted"
   | "snapshotting";
 
+export interface CapturedSandboxSession {
+  readonly sessionId: string;
+  runCommand(
+    commandOrOptions: string | RunCommandOptions,
+    args?: string[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<CommandResult>;
+}
+
 export interface SandboxHandle {
   sandboxId: string;
   /** Immutable ownership metadata attached when the sandbox was created. */
@@ -65,6 +74,8 @@ export interface SandboxHandle {
   /** Milliseconds until the current session reaches native expiry. */
   readonly timeoutRemaining: number;
   readonly status: SandboxStatus;
+  readonly currentSessionId?: string;
+  captureCurrentSession?(): CapturedSandboxSession;
   runCommand(
     commandOrOptions: string | RunCommandOptions,
     args?: string[],
@@ -100,6 +111,10 @@ export interface SandboxController {
 // ---------------------------------------------------------------------------
 
 function wrapSandbox(sandbox: Sandbox): SandboxHandle {
+  const wrapCommandResult = (result: Awaited<ReturnType<Sandbox["runCommand"]>>) => ({
+    exitCode: result.exitCode,
+    output: (stream?: "stdout" | "stderr" | "both") => result.output(stream),
+  });
   return {
     sandboxId: sandbox.name,
     tags: sandbox.tags,
@@ -113,6 +128,34 @@ function wrapSandbox(sandbox: Sandbox): SandboxHandle {
     },
     get status() {
       return sandbox.status;
+    },
+    get currentSessionId() {
+      return sandbox.currentSession().sessionId;
+    },
+    captureCurrentSession() {
+      const session = sandbox.currentSession();
+      return {
+        sessionId: session.sessionId,
+        async runCommand(
+          commandOrOpts: string | RunCommandOptions,
+          args?: string[],
+          opts?: { signal?: AbortSignal },
+        ) {
+          if (typeof commandOrOpts === "object") {
+            return wrapCommandResult(await session.runCommand({
+              cmd: commandOrOpts.cmd,
+              args: commandOrOpts.args ?? [],
+              env: commandOrOpts.env,
+              signal: commandOrOpts.signal,
+              stdout: commandOrOpts.stdout,
+              stderr: commandOrOpts.stderr,
+            }));
+          }
+          return wrapCommandResult(
+            await session.runCommand(commandOrOpts, args ?? [], opts),
+          );
+        },
+      };
     },
     async runCommand(
       commandOrOpts: string | RunCommandOptions,
@@ -128,16 +171,10 @@ function wrapSandbox(sandbox: Sandbox): SandboxHandle {
           stdout: commandOrOpts.stdout,
           stderr: commandOrOpts.stderr,
         });
-        return {
-          exitCode: result.exitCode,
-          output: (stream?: "stdout" | "stderr" | "both") => result.output(stream),
-        };
+        return wrapCommandResult(result);
       }
       const result = await sandbox.runCommand(commandOrOpts, args ?? [], opts);
-      return {
-        exitCode: result.exitCode,
-        output: (stream?: "stdout" | "stderr" | "both") => result.output(stream),
-      };
+      return wrapCommandResult(result);
     },
     async writeFiles(files) {
       await sandbox.writeFiles(files);

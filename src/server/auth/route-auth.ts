@@ -56,6 +56,7 @@ const LIFECYCLE_MANAGED_MUTATION_PATHS = new Set([
   "/api/admin/reset",
   "/api/admin/snapshot",
   "/api/admin/snapshots",
+  "/api/admin/snapshots/delete",
   "/api/admin/snapshots/restore",
   "/api/admin/stop",
   "/api/admin/watchdog",
@@ -140,6 +141,16 @@ function mutationAllowedDuringSuspension(
 ): boolean {
   const path = new URL(request.url).pathname;
   if (ALWAYS_ALLOWED_SUSPENSION_CONTROL_PATHS.has(path)) return true;
+  // Admin ensure is the sole public entry point for lifecycle-owned recovery
+  // of a durable Gateway replacement. The lifecycle lock revalidates the
+  // exact metadata, fence, and Sandbox session before clearing or retrying it.
+  if (
+    path === "/api/admin/ensure"
+    && (
+      fence.phase === "replacement-starting"
+      || fence.phase === "replacement-failed"
+    )
+  ) return true;
   return fence.phase === "stopped" && WAKE_CONTROL_PATHS.has(path);
 }
 

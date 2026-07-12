@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { getProtectionBypassSecret } from "@/server/public-url";
 import { logInfo } from "@/server/log";
-import { CRON_PROJECTION_CAPABILITY } from "@/server/cron/compatibility";
+import { getCronProjectionBaselineMode } from "@/server/cron/compatibility";
 import {
   OPENCLAW_CRON_PROJECTION_PLUGIN_DIR,
   OPENCLAW_CRON_PROJECTION_PLUGIN_ID,
@@ -411,7 +411,7 @@ export function buildClearStaleGatewayLockShell(): string {
   ].join("\n");
 }
 
-/** Shell fragment that kills any existing gateway and starts a fresh one.
+/** Shell fragment that kills any existing gateway and confirms shutdown.
  *  Uses the shell variables exported by buildGatewayEnvShell() so the
  *  conditional API-key logic is honoured.
  *
@@ -438,10 +438,53 @@ export function buildClearStaleGatewayLockShell(): string {
  *  itself.  awk in $2/comm comparison is a literal string match, so the
  *  comparison string `"openclaw"` does not match the awk command line
  *  through any regex either. */
-function buildGatewayKillShell(): string {
+export function buildGatewayKillShell(): string {
   return [
-    `_gw_pids="$(ps -eo pid,comm,args 2>/dev/null | awk '/[o]penclaw\\.bundle\\.mjs gateway/ {print $1; next} $2 == "openclaw" {print $1}' | sort -u | tr "\\n" " " || true)"`,
-    'if [ -n "$_gw_pids" ]; then kill $_gw_pids 2>/dev/null; sleep 1; fi',
+    "_gw_fail_unconfirmed() {",
+    `  echo '{"event":"gateway_kill.unconfirmed","port":${OPENCLAW_PORT}}' >&2`,
+    "  exit 70",
+    "}",
+    "_gw_find_pids() {",
+    `  ps -eo pid,comm,args 2>/dev/null | awk '/[o]penclaw\\.bundle\\.mjs gateway/ {print $1; next} $2 == "openclaw" {print $1}' | sort -u | tr "\\n" " "`,
+    "}",
+    "_gw_read_pids() {",
+    '  _gw_pids="$(_gw_find_pids)" || return 1',
+    "}",
+    "_gw_gateway_quiet() {",
+    "  _gw_read_pids || return 1",
+    '  [ -z "$_gw_pids" ] || return 1',
+    "  if command -v ss >/dev/null 2>&1; then",
+    `    _gw_listeners="$(ss -H -ltn 'sport = :${OPENCLAW_PORT}' 2>/dev/null)" || return 1`,
+    '    [ -z "$_gw_listeners" ] || return 1',
+    "    return 0",
+    "  fi",
+    "  _gw_proc_seen=0",
+    "  for _gw_proc_net in /proc/net/tcp /proc/net/tcp6; do",
+    '    [ -r "$_gw_proc_net" ] || continue',
+    "    _gw_proc_seen=1",
+    '    case "$_gw_proc_net" in *tcp6) _gw_addr_width=32 ;; *) _gw_addr_width=8 ;; esac',
+    `    _gw_listener_state="$(awk -v address_width="$_gw_addr_width" 'function digits(v) { return v ~ /^[0-9]+$/ } function final_metric(v) { return digits(v) || v == "-1" } function hex_width(v, width) { return length(v) == width && v ~ /^[[:xdigit:]]+$/ } function endpoint(v, width, parts, n) { n=split(v, parts, ":"); return n == 2 && hex_width(parts[1], width) && hex_width(parts[2], 4) } function pair(v, left_width, right_width, parts, n) { n=split(v, parts, ":"); return n == 2 && hex_width(parts[1], left_width) && hex_width(parts[2], right_width) } NR == 1 { header=1; if (NF != 12 || $1 != "sl" || $2 != "local_address" || $3 != "rem_address" || $4 != "st" || $5 != "tx_queue" || $6 != "rx_queue" || $7 != "tr" || $8 != "tm->when" || $9 != "retrnsmt" || $10 != "uid" || $11 != "timeout" || $12 != "inode") invalid=1; next } NF == 0 { next } { if (NF != 17 || $1 !~ /^[0-9]+:$/ || !endpoint($2, address_width) || !endpoint($3, address_width) || !hex_width($4, 2) || !pair($5, 8, 8) || !pair($6, 2, 8) || !hex_width($7, 8) || !digits($8) || !digits($9) || !digits($10) || !digits($11) || !hex_width($12, 16) || !digits($13) || !digits($14) || !digits($15) || !digits($16) || !final_metric($17)) { invalid=1; next } split($2, local_endpoint, ":"); if (toupper($4) == "0A" && toupper(local_endpoint[2]) == "${OPENCLAW_PORT.toString(16).toUpperCase().padStart(4, "0")}") found=1 } END { if (!header) invalid=1; print invalid ? "invalid" : (found ? "present" : "absent") }' "$_gw_proc_net")" || return 1`,
+    '    [ "$_gw_listener_state" = "absent" ] || return 1',
+    "  done",
+    '  [ "$_gw_proc_seen" -eq 1 ] || return 1',
+    "  return 0",
+    "}",
+    "_gw_wait_for_quiet() {",
+    "  for _gw_attempt in {1..25}; do",
+    "    if _gw_gateway_quiet; then return 0; fi",
+    "    sleep 0.2",
+    "  done",
+    "  return 1",
+    "}",
+    "_gw_read_pids || _gw_fail_unconfirmed",
+    'if [ -n "$_gw_pids" ]; then kill -TERM $_gw_pids 2>/dev/null || true; fi',
+    "if ! _gw_wait_for_quiet; then",
+    "  _gw_read_pids || _gw_fail_unconfirmed",
+    '  if [ -n "$_gw_pids" ]; then kill -KILL $_gw_pids 2>/dev/null || true; fi',
+    "  if ! _gw_wait_for_quiet; then",
+    "    _gw_fail_unconfirmed",
+    "  fi",
+    "fi",
     'true',
   ].join("\n");
 }
@@ -487,8 +530,8 @@ export function buildGatewayConfig(
   telegramWebhookSecret?: string,
   bundleCapabilities: readonly string[] = [],
 ): string {
-  const cronProjectionEnabled = bundleCapabilities.includes(
-    CRON_PROJECTION_CAPABILITY,
+  const cronProjectionBaselineMode = getCronProjectionBaselineMode(
+    bundleCapabilities,
   );
   const adminHttpRpcEnabled = bundleCapabilities.includes("admin-http-rpc-v1");
   const pluginAllow = ["slack", "telegram", "discord"];
@@ -498,7 +541,7 @@ export function buildGatewayConfig(
     pluginAllow.push("admin-http-rpc");
     pluginEntries["admin-http-rpc"] = { enabled: true };
   }
-  if (cronProjectionEnabled) {
+  if (cronProjectionBaselineMode) {
     if (!proxyOrigin) {
       throw new Error("Cron projection requires a canonical proxy origin.");
     }
@@ -514,7 +557,10 @@ export function buildGatewayConfig(
     pluginLoadPaths.push(OPENCLAW_CRON_PROJECTION_PLUGIN_DIR);
     pluginEntries[OPENCLAW_CRON_PROJECTION_PLUGIN_ID] = {
       enabled: true,
-      config: { endpoint: endpoint.toString() },
+      config: {
+        endpoint: endpoint.toString(),
+        baselineMode: cronProjectionBaselineMode,
+      },
     };
   }
 
@@ -634,17 +680,28 @@ export function buildGatewayConfig(
       },
     },
   };
-  // Grant owner-level tool access (cron, gateway, nodes) to channel
-  // senders.  Without this, OpenClaw's native handlers strip owner-only
-  // tools from non-admin senders.  The proxy already enforces auth
-  // before traffic reaches the sandbox, so elevated access defaults to
-  // all senders ("*").  Override with OPENCLAW_OWNER_ALLOW_FROM to
-  // restrict to specific Telegram chat IDs or Slack user IDs.
-  const ownerAllowFrom = process.env.OPENCLAW_OWNER_ALLOW_FROM;
+  // Platform webhook signatures authenticate Slack or Telegram, not the
+  // human sender. Keep owner-only commands closed until the operator names
+  // explicit channel-scoped identities; wildcard ownership is never safe.
+  const ownerAllowFrom = process.env.OPENCLAW_OWNER_ALLOW_FROM
+    ?.split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean) ?? [];
+  if (ownerAllowFrom.some((entry) => entry.includes("*"))) {
+    throw new Error(
+      "OPENCLAW_OWNER_ALLOW_FROM must list explicit sender IDs; wildcard ownership is not allowed.",
+    );
+  }
   config.commands = {
-    ownerAllowFrom: ownerAllowFrom
-      ? ownerAllowFrom.split(",").map((s) => s.trim()).filter(Boolean)
-      : ["*"],
+    // Provider-scoped non-matching sentinels keep upstream owner-command
+    // authorization fail-closed when no explicit owner is configured.
+    ownerAllowFrom:
+      ownerAllowFrom.length > 0
+        ? ownerAllowFrom
+        : [
+            "telegram:hosted-no-owner-configured",
+            "slack:hosted-no-owner-configured",
+          ],
   };
 
   config.tools = {
@@ -3560,7 +3617,7 @@ openclaw cron status                  # Scheduler status
 - For requests like "send here" or "the current Slack channel", bind \\\`--to\\\` to the current Slack channel as \\\`channel:<id>\\\`. Do not ask for a Slack user ID for current-channel delivery.
 - The scheduled prompt should ask the agent to produce content only. The cron runner owns final Slack delivery, so do not tell the agent to DM or resolve a person by name.
 - Jobs survive sandbox restarts via snapshot persistence.
-- When the host reports an exact verified bundle with \`cron-projection-v1\`, it arms a token-revalidating Workflow for the earliest wake. The daily watchdog only repairs missing or stale dispatch.
+- When the host reports an exact verified bundle with \`cron-projection-v1\` or \`cron-projection-v2\`, it arms a token-revalidating Workflow for the earliest wake. The daily watchdog only repairs missing or stale dispatch.
 - Minimum interval for \\\`--every\\\` is 1 minute.
 `;
 }

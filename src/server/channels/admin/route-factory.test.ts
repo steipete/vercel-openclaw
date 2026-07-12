@@ -223,6 +223,34 @@ test("DELETE handler calls spec.delete and returns updated state", async () => {
   });
 });
 
+test("DELETE handler runs cleanup only after owner deletion is applied", async () => {
+  await withHarness(async () => {
+    _setAiGatewayTokenOverrideForTesting("oidc-token");
+    const phases: string[] = [];
+
+    const { DELETE } = createChannelAdminRouteHandlers({
+      channel: "slack",
+      selectState: (s) => s.slack,
+      async put() {},
+      async delete() {
+        phases.push("channel-deleted");
+      },
+      async afterDeleteApplied({ liveConfigSync }) {
+        assert.equal(liveConfigSync.outcome, "skipped");
+        phases.push("app-config-deleted");
+      },
+    });
+
+    const result = await callRoute(
+      DELETE,
+      buildAuthDeleteRequest("/api/channels/slack", "{}"),
+    );
+
+    assert.equal(result.status, 200);
+    assert.deepEqual(phases, ["channel-deleted", "app-config-deleted"]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Live config sync headers: PUT and DELETE attach x-openclaw-live-config-sync-*
 // ---------------------------------------------------------------------------

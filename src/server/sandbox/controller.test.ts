@@ -143,6 +143,21 @@ test("controller: FakeSandboxHandle.responders override default command result",
   assert.equal(echoResult.exitCode, 0);
 });
 
+test("controller: captured session command never falls through to a replacement", async () => {
+  const events: SandboxEvent[] = [];
+  const handle = new FakeSandboxHandle("sbx-captured", events);
+  const captured = handle.captureCurrentSession();
+
+  handle.replaceCurrentSessionForTesting();
+
+  await assert.rejects(
+    captured.runCommand("bash", ["-lc", "true"]),
+    /captured sandbox session is no longer running/,
+  );
+  assert.equal(handle.currentSessionId === captured.sessionId, false);
+  assert.equal(events.some((event) => event.kind === "command"), false);
+});
+
 test("controller: FakeSandboxHandle tracks all operations in event log", async () => {
   const events: SandboxEvent[] = [];
   const handle = new FakeSandboxHandle("sbx-log", events);

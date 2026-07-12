@@ -769,6 +769,49 @@ export async function syncFirewallPolicyIfRunning(
 }
 
 /**
+ * Repair a desired firewall policy whose latest successful SDK attestation is
+ * missing or stale. This closes the serverless crash window between persisting
+ * a firewall mutation and completing its external policy write.
+ */
+export async function reconcileFirewallPolicyIfNeeded(
+  options?: FirewallPolicyContext,
+): Promise<FirewallSyncOutcome | null> {
+  const meta = await getInitializedMeta();
+  if (
+    !meta.sandboxId
+    || (meta.status !== "running" && meta.status !== "booting")
+  ) return null;
+
+  const requiredDomains = requiredControlPlaneDomains(
+    meta.firewall.mode,
+    options?.controlPlaneOrigin,
+  );
+  const desiredHash = computePolicyHash(
+    meta.firewall.mode,
+    meta.firewall.allowlist,
+    requiredDomains,
+  );
+  const lastSync = meta.firewall.lastSyncOutcome;
+  const currentRevision = meta.firewall.policyRevisionId ?? null;
+  // Bootstrap and pre-revision records have only the durable sync outcome.
+  // Once a revision exists, both completion and success must attest that exact
+  // revision and hash; a same-hash interrupted write is still unproven.
+  const currentRevisionAttested = currentRevision === null || (
+    meta.firewall.lastPolicySdkCompletionRevisionId === currentRevision
+    && meta.firewall.lastPolicySdkCompletionHash === desiredHash
+    && meta.firewall.lastPolicySdkSuccessRevisionId === currentRevision
+    && meta.firewall.lastPolicySdkSuccessHash === desiredHash
+  );
+  if (
+    currentRevisionAttested
+    && lastSync?.applied
+    && lastSync.policyHash === desiredHash
+  ) return null;
+
+  return syncFirewallPolicyIfRunning(options);
+}
+
+/**
  * Apply one policy revision while the caller owns the lifecycle lease.
  * Lifecycle token refresh uses this entry point so its network-policy write
  * shares the long-lived apply lock, revision CAS, and fail-close path.

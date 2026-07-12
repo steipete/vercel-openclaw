@@ -107,7 +107,7 @@ function makeStatus(
         currentEndpointUrl: null,
         endpointDrift: false,
         canRepairEndpoint: false,
-        nextSafeAction: "paste-token",
+        nextSafeAction: "use-local-openclaw",
         applicationId: null,
         publicKey: null,
         configuredAt: null,
@@ -160,6 +160,22 @@ test("SlackPanel renders connect form when unconfigured (manual mode)", () => {
   assert.ok(html.includes("Signing Secret"), "shows signing secret field");
   assert.ok(html.includes("Bot Token"), "shows bot token field");
   assert.ok(html.includes("Connect"), "shows connect button");
+});
+
+test("SlackPanel discloses Slack configuration-token retention", () => {
+  const html = renderToStaticMarkup(
+    <SlackPanel
+      status={makeStatus()}
+      busy={false}
+      runAction={RUN_ACTION_SUCCESS}
+      requestJson={REQUEST_JSON_SUCCESS}
+    />,
+  );
+
+  assert.ok(
+    html.includes("Stored with the Slack app credentials until you disconnect Slack."),
+  );
+  assert.ok(!html.includes("Not stored."));
 });
 
 /* ── OAuth install button ── */

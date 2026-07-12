@@ -106,6 +106,7 @@ export class FakeSandboxHandle implements SandboxHandle {
   private timeoutMs: number;
   private timeoutExpiresAtMs: number;
   private _status: SandboxStatus;
+  private sessionOrdinal = 1;
 
   constructor(sandboxId: string, eventLog: SandboxEvent[], timeoutMs = 5 * 60 * 1000) {
     this.sandboxId = sandboxId;
@@ -132,8 +133,37 @@ export class FakeSandboxHandle implements SandboxHandle {
     return this._status;
   }
 
+  get currentSessionId(): string {
+    return `${this.sandboxId}-session-${this.sessionOrdinal}`;
+  }
+
+  captureCurrentSession() {
+    const sessionId = this.currentSessionId;
+    return {
+      sessionId,
+      runCommand: async (
+        commandOrOpts: string | RunCommandOptions,
+        args?: string[],
+        opts?: { signal?: AbortSignal },
+      ): Promise<CommandResult> => {
+        if (this.currentSessionId !== sessionId || this.status !== "running") {
+          throw new Error("captured sandbox session is no longer running");
+        }
+        return this.runCommand(commandOrOpts, args, opts);
+      },
+    };
+  }
+
+  replaceCurrentSessionForTesting(): void {
+    this.sessionOrdinal += 1;
+    this._status = "running";
+  }
+
   /** Override the sandbox status (e.g. to simulate platform timeout). */
   setStatus(status: SandboxStatus): void {
+    if (status === "running" && this._status !== "running") {
+      this.sessionOrdinal += 1;
+    }
     this._status = status;
   }
 

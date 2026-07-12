@@ -66,7 +66,7 @@ const CHANNELS: StatusPayload["channels"] = {
     currentEndpointUrl: null,
     endpointDrift: false,
     canRepairEndpoint: false,
-    nextSafeAction: "paste-token",
+    nextSafeAction: "use-local-openclaw",
     applicationId: null,
     publicKey: null,
     configuredAt: null,

@@ -10,6 +10,7 @@ import {
   getSlackUrlVerificationChallenge,
   isValidSlackSignature,
 } from "@/server/channels/slack/adapter";
+import { SlackMessageDeletePermanentError } from "@/server/channels/slack/message-api";
 import type { SlackExtractedMessage } from "@/server/channels/slack/adapter";
 import {
   _resetLogBuffer,
@@ -215,7 +216,24 @@ test("deleteSlackMessage rejects HTTP 200 Slack API failures", async () => {
       fetchFn: async () =>
         Response.json({ ok: false, error: "not_authed" }),
     }),
-    /slack_message_delete_failed: status=200 error=not_authed/,
+    (error: unknown) => {
+      assert.ok(error instanceof SlackMessageDeletePermanentError);
+      assert.equal(error.slackErrorCode, "not_authed");
+      return true;
+    },
+  );
+});
+
+test("deleteSlackMessage classifies Slack transient API failures as retryable", async () => {
+  await assert.rejects(
+    deleteSlackMessage({
+      botToken: "xoxb-token",
+      channel: "C123",
+      ts: "999.05",
+      fetchFn: async () =>
+        Response.json({ ok: false, error: "service_unavailable" }),
+    }),
+    RetryableSendError,
   );
 });
 

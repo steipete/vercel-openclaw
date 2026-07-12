@@ -46,6 +46,7 @@ import {
 import { isVerifiedBundleIdentity } from "@/shared/bundle-identity";
 import {
   buildClearStaleGatewayLockShell,
+  buildGatewayKillShell,
   computeGatewayConfigHash,
   GATEWAY_CONFIG_HASH_VERSION,
   OPENCLAW_BIN,
@@ -70,7 +71,10 @@ import { buildRestoreDecision } from "@/server/sandbox/restore-attestation";
 import type { RestoreDecision } from "@/shared/restore-decision";
 import type { LiveConfigSyncResult } from "@/shared/live-config-sync";
 import { getSandboxController } from "@/server/sandbox/controller";
-import type { SandboxHandle } from "@/server/sandbox/controller";
+import type {
+  CapturedSandboxSession,
+  SandboxHandle,
+} from "@/server/sandbox/controller";
 import {
   SetupProgressWriter,
   beginSetupProgress,
@@ -78,7 +82,6 @@ import {
 } from "@/server/sandbox/setup-progress";
 import { getSandboxVcpus } from "@/server/sandbox/resources";
 import {
-  assertVercelSnapshotReady,
   deleteVercelSnapshot,
   isSnapshotNotFoundError,
 } from "@/server/sandbox/snapshot-delete";
@@ -87,6 +90,10 @@ import {
   isGatewaySuspensionCapabilityUnavailable,
 } from "@/server/openclaw/admin-rpc";
 import {
+  adoptHostSuspensionForGatewayReplacement,
+  adoptHostSuspensionGatewayReplacement,
+  beginHostSuspensionGatewayReplacement,
+  canonicalizeStoppedHostSuspensionGatewayReplacement,
   clearInactiveHostSuspension,
   clearHostSuspensionAfterGatewayReplacement,
   clearHostSuspensionAfterDelete,
@@ -100,6 +107,9 @@ import {
   markHostSuspensionStopped,
   markHostSuspensionStopRequesting,
   markHostSuspensionStopping,
+  markHostSuspensionGatewayReplacementFailed,
+  markHostSuspensionGatewayReplacementLaunching,
+  markHostSuspensionGatewayReplacementPreparing,
   PLATFORM_STOP_CONFIRMED_REASON,
   prepareHostSuspension,
   readHostSuspensionState,
@@ -622,6 +632,7 @@ async function readDurableStoppedResumeFence(input: {
   if (
     !suspension
     || !suspension.ingressFenced
+    || suspension.intent !== "stop"
     || suspension.phase !== "stopped"
     || suspension.sandboxId !== input.sandboxId
     || suspension.lifecycleAttemptId !== input.lifecycleAttemptId
@@ -633,35 +644,6 @@ async function readDurableStoppedResumeFence(input: {
     return null;
   }
   return suspension;
-}
-
-async function ensureDurableStoppedResumeFence(input: {
-  sandboxId: string;
-  lifecycleAttemptId: string | null;
-  expectedCurrentLifecycleAttemptId: string | null;
-  allowMissingSandboxId: boolean;
-}): Promise<HostSuspensionState> {
-  const existing = await readDurableStoppedResumeFence(input);
-  if (existing) return existing;
-  const backfilled = await recordPlatformStoppedHostSuspension(input);
-  if (
-    backfilled.phase !== "stopped"
-    || (
-      !backfilled.suspensionId
-      && backfilled.reason !== PLATFORM_STOP_CONFIRMED_REASON
-    )
-  ) {
-    throw new ApiError(
-      503,
-      "SANDBOX_RESUME_UNFENCED",
-      "Stopped persistent state does not have a thawable lifecycle fence.",
-    );
-  }
-  logWarn("sandbox.platform_stopped_fence_backfilled", {
-    sandboxId: input.sandboxId,
-    lifecycleAttemptId: input.lifecycleAttemptId,
-  });
-  return backfilled;
 }
 
 function assertPlatformStopBudget(deadlineAtMs: number | undefined): void {
@@ -1147,6 +1129,31 @@ async function recoverPendingHostSuspension(
         return deleted;
       }
       await assertOwned();
+      if (sandbox.status === "stopped") {
+        const terminalSuspension = await recordPlatformStoppedHostSuspension({
+          sandboxId,
+          lifecycleAttemptId,
+        });
+        if (terminalSuspension.intent === "reset") {
+          await ensureHostStopMonitor(terminalSuspension);
+          return current;
+        }
+        const stopped = await mutateMeta((meta) => {
+          if (
+            meta.status !== expectedStatus
+            || meta.sandboxId !== sandboxId
+            || (meta.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+          ) return;
+          failPendingPersistentAutoSave(meta);
+          meta.activePersistentStop = null;
+          meta.status = "stopped";
+          meta.portUrls = null;
+          meta.lastError = null;
+          meta.lastGatewayProbeReady = false;
+        });
+        await clearSandboxDeadline(sandboxId, { lifecycleAttemptId });
+        return stopped;
+      }
       if (sandbox.status !== "running") return current;
       if (!await thawHostSuspensionIfNeeded({ sandbox, lifecycleAttemptId })) {
         return getInitializedMeta();
@@ -1173,6 +1180,138 @@ async function recoverPendingHostSuspension(
   }
 }
 
+async function clearCommittedGatewayReplacement(
+  handle: SandboxHandle,
+  committedMeta: SingleMeta,
+  expected: HostSuspensionState,
+): Promise<void> {
+  const sessionId = expected.replacementSessionId;
+  const lifecycleAttemptId = committedMeta.lifecycleAttemptId ?? null;
+  if (
+    !sessionId
+    || expected.phase !== "replacement-starting"
+    || expected.replacementStage !== "launching"
+    || expected.sandboxId !== committedMeta.sandboxId
+    || expected.lifecycleAttemptId !== lifecycleAttemptId
+  ) {
+    throw new LifecycleLockOwnershipLostError();
+  }
+  const isExactFence = (
+    state: HostSuspensionState | null,
+  ): state is HostSuspensionState => Boolean(
+    state
+    && state.operationId === expected.operationId
+    && state.requestId === expected.requestId
+    && state.sandboxId === expected.sandboxId
+    && state.lifecycleAttemptId === expected.lifecycleAttemptId
+    && state.phase === "replacement-starting"
+    && state.replacementStage === "launching"
+    && state.replacementSessionId === sessionId
+    && state.ingressFenced,
+  );
+  for (let clearAttempt = 0; clearAttempt < 2; clearAttempt += 1) {
+    try {
+      const cleared = await clearHostSuspensionAfterGatewayReplacement({
+        expected,
+        sandboxId: handle.sandboxId,
+        lifecycleAttemptId,
+        sessionId,
+      });
+      if (cleared) return;
+    } catch {
+      // Redis may commit DEL and lose only its response. Re-read below;
+      // absence is success only while the exact ready generation remains.
+    }
+
+    let meta: SingleMeta;
+    let suspension: HostSuspensionState | null;
+    try {
+      [meta, suspension] = await Promise.all([
+        getInitializedMeta(),
+        readHostSuspensionState(),
+      ]);
+    } catch {
+      // Ambiguous state after a clear attempt is ownership loss, not a
+      // reason to downgrade already committed running metadata.
+      throw new LifecycleLockOwnershipLostError();
+    }
+    const committedGenerationStillReady =
+      meta.status === "running"
+      && meta.sandboxId === committedMeta.sandboxId
+      && (meta.lifecycleAttemptId ?? null) === lifecycleAttemptId
+      && handle.status === "running"
+      && handle.currentSessionId === sessionId;
+    if (suspension === null && committedGenerationStillReady) return;
+    if (!isExactFence(suspension)) {
+      throw new LifecycleLockOwnershipLostError();
+    }
+  }
+  // The exact fence survived both attempts. Leave it for a later exact
+  // finalizer; never downgrade the already committed ready generation.
+  throw new LifecycleLockOwnershipLostError();
+}
+
+async function finalizeCommittedGatewayReplacement(
+  expectedMeta: SingleMeta,
+  expectedSuspension: HostSuspensionState,
+): Promise<boolean> {
+  if (
+    expectedMeta.status !== "running"
+    || !expectedMeta.sandboxId
+    || expectedSuspension.phase !== "replacement-starting"
+    || expectedSuspension.replacementStage !== "launching"
+    || !expectedSuspension.replacementSessionId
+    || expectedSuspension.sandboxId !== expectedMeta.sandboxId
+    || expectedSuspension.lifecycleAttemptId
+      !== (expectedMeta.lifecycleAttemptId ?? null)
+  ) return false;
+  try {
+    return await withSandboxLifecycleMutationLock(async (assertOwned) => {
+      const [meta, suspension] = await Promise.all([
+        getInitializedMeta(),
+        readHostSuspensionState(),
+      ]);
+      if (
+        meta.status !== "running"
+        || meta.sandboxId !== expectedMeta.sandboxId
+        || (meta.lifecycleAttemptId ?? null)
+          !== (expectedMeta.lifecycleAttemptId ?? null)
+        || suspension?.operationId !== expectedSuspension.operationId
+        || suspension.phase !== "replacement-starting"
+        || suspension.replacementStage !== "launching"
+        || suspension.replacementSessionId
+          !== expectedSuspension.replacementSessionId
+        || suspension.sandboxId !== meta.sandboxId
+        || suspension.lifecycleAttemptId !== (meta.lifecycleAttemptId ?? null)
+      ) return false;
+      const replacementSessionId = suspension.replacementSessionId;
+      if (!replacementSessionId) return false;
+      await assertOwned();
+      const sandbox = await getSandboxController().get({
+        sandboxId: meta.sandboxId,
+        resume: false,
+      });
+      await assertOwned();
+      if (
+        sandbox.status !== "running"
+        || sandbox.currentSessionId !== replacementSessionId
+      ) return false;
+      await clearCommittedGatewayReplacement(
+        sandbox,
+        meta,
+        suspension,
+      );
+      return true;
+    });
+  } catch (error) {
+    if (
+      error instanceof SandboxLifecycleLockContendedError
+      || error instanceof LifecycleLockOwnershipLostError
+    ) return false;
+    throw error;
+  }
+}
+
 export async function ensureSandboxRunning(options: {
   origin: string;
   reason: string;
@@ -1181,9 +1320,10 @@ export async function ensureSandboxRunning(options: {
   op?: OperationContext;
 }): Promise<{ state: "running" | "waiting"; meta: SingleMeta }> {
   let meta = await getInitializedMeta();
-  // If a non-blocking stop is mid-snapshot, try to advance to "stopped" so
-  // the restore path can run instead of bouncing through "waiting" again.
-  if (meta.status === "snapshotting") {
+  // Reconcile both an in-flight non-blocking stop and the durable split where
+  // a platform-stopped fence committed before running metadata was projected.
+  // Without this, user-driven wake can return waiting forever after a crash.
+  if (meta.status === "snapshotting" || meta.status === "running") {
     meta = await reconcileSnapshottingStatus();
   }
   if (meta.sandboxId) meta = await recoverPendingHostSuspension(meta);
@@ -1204,7 +1344,16 @@ export async function ensureSandboxRunning(options: {
       meta = await fenceRunningBundleMismatch(meta);
       return { state: "waiting", meta };
     }
-    const hostSuspension = await readHostSuspensionState();
+    let hostSuspension = await readHostSuspensionState();
+    if (hostSuspension?.ingressFenced) {
+      if (
+        hostSuspension.phase === "replacement-starting"
+        && hostSuspension.replacementStage === "launching"
+        && await finalizeCommittedGatewayReplacement(meta, hostSuspension)
+      ) {
+        hostSuspension = null;
+      }
+    }
     if (hostSuspension?.ingressFenced) {
       if (
         hostSuspension.phase !== "stopped"
@@ -1752,7 +1901,11 @@ export async function resetSandbox(
           failedSnapshotIds,
           attemptedSnapshotIds: snapshotIds,
         }));
-        return getInitializedMeta();
+        throw new ApiError(
+          502,
+          "SANDBOX_RESET_INCOMPLETE",
+          errorMessage,
+        );
       }
 
       const resetMeta = await mutateMeta((meta) => {
@@ -1791,20 +1944,9 @@ export async function resetSandbox(
     }
 
     logError("sandbox.reset_failed", ctx({ error: message }));
-    if (sandboxDestroyed) {
-      await clearResetHostSuspensionAfterCommit(
-        destroyedSandboxId,
-        destroyedOperationId,
-      ).catch((cleanupError) => {
-        logWarn("sandbox.reset.host_suspension_cleanup_failed", ctx({
-          error: cleanupError instanceof Error
-            ? cleanupError.message
-            : String(cleanupError),
-        }));
-      });
-    }
+    let terminalMetaCommitted = false;
     try {
-      await mutateMeta((meta) => {
+      const failedMeta = await mutateMeta((meta) => {
         if (
           !resetTarget
           || meta.sandboxId !== resetTarget.sandboxId
@@ -1818,159 +1960,77 @@ export async function resetSandbox(
         }
         meta.lastError = `Sandbox reset failed: ${message}`;
       });
+      terminalMetaCommitted = sandboxDestroyed
+        && failedMeta.sandboxId === null
+        && failedMeta.lifecycleAttemptId === null
+        && (
+          failedMeta.status === "uninitialized"
+          || failedMeta.status === "error"
+        );
     } catch (metaError) {
       logWarn("sandbox.reset.meta_update_failed", ctx({
         error: message,
         metaError: metaError instanceof Error ? metaError.message : String(metaError),
       }));
     }
+    if (terminalMetaCommitted) {
+      await clearResetHostSuspensionAfterCommit(
+        destroyedSandboxId,
+        destroyedOperationId,
+      ).catch((cleanupError) => {
+        logWarn("sandbox.reset.host_suspension_cleanup_failed", ctx({
+          error: cleanupError instanceof Error
+            ? cleanupError.message
+            : String(cleanupError),
+        }));
+      });
+    }
     throw error;
   }
 }
 
 /**
- * Retire the current sandbox generation before selecting an older snapshot.
- * The delete and metadata switch share one lifecycle lease so no caller can
- * observe a cleared sandbox id while the previous Gateway is still admitted.
+ * Validate a requested restore point without mutating its owning sandbox.
+ * Historical restore remains disabled until it can clone the snapshot before
+ * retiring the source sandbox whose deletion also destroys that snapshot.
  */
 export async function prepareSnapshotRestore(
   options: PrepareSnapshotRestoreOptions,
 ): Promise<SingleMeta> {
-  let restoreTarget: Pick<
-    SingleMeta,
-    "sandboxId" | "lifecycleAttemptId" | "gatewayToken"
-  > | null = null;
-  let destroyedSandboxId: string | null = null;
-  let destroyedOperationId: string | null = null;
-  const ctx = (extra: Record<string, unknown> = {}) =>
-    options.op
-      ? withOperationContext(options.op, extra)
-      : { reason: options.reason, ...extra };
-
   try {
     return await withLifecycleLock(async (lease) => {
       await lease.assertOwned();
       const current = await getInitializedMeta();
-      const knownSnapshot = current.snapshotId === options.snapshotId
-        || current.snapshotHistory.some(
-          (record) => record.snapshotId === options.snapshotId,
-        );
-      if (!knownSnapshot) {
+      if (current.snapshotId === options.snapshotId) {
+        // The current restore point already owns the persistent sandbox. A
+        // normal ensure is sufficient and, critically, preserves the snapshot
+        // whose lifecycle is tied to that sandbox.
+        logInfo("sandbox.snapshot_restore_current_noop", {
+          snapshotId: options.snapshotId,
+          sandboxId: current.sandboxId,
+          reason: options.reason,
+        });
+        return current;
+      }
+      const historical = current.snapshotHistory.some(
+        (record) => record.snapshotId === options.snapshotId,
+      );
+      if (!historical) {
         throw new ApiError(
           404,
           "SNAPSHOT_NOT_FOUND",
           "Snapshot not found in history.",
         );
       }
-      await assertVercelSnapshotReady(options.snapshotId);
-      await lease.assertOwned();
-
-      restoreTarget = {
-        sandboxId: current.sandboxId,
-        lifecycleAttemptId: current.lifecycleAttemptId,
-        gatewayToken: current.gatewayToken,
-      };
-
-      await destroyCurrentSandboxWithoutSnapshot(current, ctx, {
-        lease,
-        onSandboxResolved(sandboxId) {
-          const target = restoreTarget;
-          if (target && target.sandboxId !== null) {
-            restoreTarget = {
-              sandboxId,
-              lifecycleAttemptId: target.lifecycleAttemptId,
-              gatewayToken: target.gatewayToken,
-            };
-          }
-        },
-        onSandboxDestroyed(sandboxId, operationId) {
-          destroyedSandboxId = sandboxId;
-          destroyedOperationId = operationId;
-        },
-      });
-
-      await lease.assertOwned();
-      const prepared = await mutateMeta((meta) => {
-        if (
-          !restoreTarget
-          || meta.sandboxId !== restoreTarget.sandboxId
-          || (meta.lifecycleAttemptId ?? null)
-            !== (restoreTarget.lifecycleAttemptId ?? null)
-          || meta.gatewayToken !== restoreTarget.gatewayToken
-        ) {
-          throw new LifecycleLockOwnershipLostError();
-        }
-        meta.snapshotId = options.snapshotId;
-        meta.sandboxId = null;
-        meta.portUrls = null;
-        meta.status = "stopped";
-        meta.pendingPersistentAutoSave = null;
-        meta.activePersistentStop = null;
-        meta.lifecycleAttemptId = null;
-        meta.lastAccessedAt = null;
-        meta.lastGatewayProbeReady = false;
-        meta.lastError = null;
-      });
-      if (
-        prepared.snapshotId !== options.snapshotId
-        || prepared.sandboxId !== null
-        || prepared.status !== "stopped"
-      ) {
-        throw new LifecycleLockOwnershipLostError();
-      }
-
-      await lease.assertOwned();
-      await clearResetHostSuspensionAfterCommit(
-        destroyedSandboxId ?? restoreTarget.sandboxId,
-        destroyedOperationId,
+      throw new ApiError(
+        409,
+        "HISTORICAL_SNAPSHOT_RESTORE_UNSUPPORTED",
+        "Historical snapshots cannot be restored safely because deleting their source sandbox also deletes them.",
       );
-      await lease.assertOwned();
-      logInfo("sandbox.snapshot_restore_prepared", ctx({
-        snapshotId: options.snapshotId,
-        retiredSandboxId: destroyedSandboxId,
-      }));
-      return prepared;
     });
   } catch (error) {
     if (error instanceof LifecycleLockUnavailableError) {
       throw new SandboxLifecycleLockContendedError();
-    }
-    if (destroyedSandboxId && restoreTarget) {
-      await clearResetHostSuspensionAfterCommit(
-        destroyedSandboxId,
-        destroyedOperationId,
-      ).catch((cleanupError) => {
-        logWarn("sandbox.snapshot_restore_suspension_cleanup_failed", ctx({
-          snapshotId: options.snapshotId,
-          error: cleanupError instanceof Error
-            ? cleanupError.message
-            : String(cleanupError),
-        }));
-      });
-      await mutateMeta((meta) => {
-        if (
-          !restoreTarget
-          || meta.sandboxId !== restoreTarget.sandboxId
-          || (meta.lifecycleAttemptId ?? null)
-            !== (restoreTarget.lifecycleAttemptId ?? null)
-          || meta.gatewayToken !== restoreTarget.gatewayToken
-        ) return;
-        meta.sandboxId = null;
-        meta.portUrls = null;
-        meta.status = "error";
-        meta.pendingPersistentAutoSave = null;
-        meta.activePersistentStop = null;
-        meta.lifecycleAttemptId = null;
-        meta.lastGatewayProbeReady = false;
-        meta.lastError = `Snapshot restore preparation failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`;
-      }).catch((metaError) => {
-        logWarn("sandbox.snapshot_restore_meta_cleanup_failed", ctx({
-          snapshotId: options.snapshotId,
-          error: metaError instanceof Error ? metaError.message : String(metaError),
-        }));
-      });
     }
     throw error;
   }
@@ -2022,6 +2082,68 @@ type StopSandboxInternalOptions = {
   lifecycleGuard?: SandboxLifecycleGuard;
 };
 
+async function reconcileTerminalSandboxBeforeStop(
+  meta: SingleMeta,
+  sandbox: SandboxHandle,
+  assertOwned: () => Promise<void>,
+): Promise<SingleMeta | null> {
+  const sdkStatus = sandbox.status;
+  if (
+    sdkStatus !== "stopped"
+    && sdkStatus !== "failed"
+    && sdkStatus !== "aborted"
+  ) return null;
+
+  const sandboxId = meta.sandboxId;
+  if (!sandboxId) throw new LifecycleLockOwnershipLostError();
+  const lifecycleAttemptId = meta.lifecycleAttemptId ?? null;
+  await assertOwned();
+  let terminalSuspension: HostSuspensionState | null = null;
+  if (sdkStatus === "stopped") {
+    terminalSuspension = await recordPlatformStoppedHostSuspension({
+      sandboxId,
+      lifecycleAttemptId,
+    });
+  }
+  await assertOwned();
+  if (
+    terminalSuspension?.intent === "reset"
+    && terminalSuspension.phase === "stopping"
+  ) {
+    // Platform stop makes the pending destructive reset safe to resume; it
+    // does not complete that reset or transfer ownership to an ordinary stop.
+    await ensureHostStopMonitor(terminalSuspension);
+    logInfo("sandbox.stop_terminal_reset_preserved", {
+      sandboxId,
+      operationId: terminalSuspension.operationId,
+    });
+    return getInitializedMeta();
+  }
+  const terminalMeta = await mutateMeta((next) => {
+    if (
+      next.sandboxId !== sandboxId
+      || (next.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+    ) return;
+    failPendingPersistentAutoSave(next);
+    next.activePersistentStop = null;
+    next.status = sdkStatus === "stopped" ? "stopped" : "error";
+    next.portUrls = null;
+    next.lastError = sdkStatus === "stopped" ? null : `sandbox ${sdkStatus}`;
+    next.lastGatewayProbeReady = false;
+  });
+  if (
+    terminalMeta.sandboxId !== sandboxId
+    || (terminalMeta.lifecycleAttemptId ?? null) !== lifecycleAttemptId
+  ) return terminalMeta;
+  await assertOwned();
+  await clearSandboxDeadline(sandboxId, { lifecycleAttemptId });
+  logInfo("sandbox.stop_terminal_reconciled", {
+    sandboxId,
+    sdkStatus,
+  });
+  return terminalMeta;
+}
+
 async function stopSandboxWithOptions(
   options: StopSandboxInternalOptions = {},
 ): Promise<SingleMeta> {
@@ -2068,8 +2190,20 @@ async function stopSandboxWithOptions(
 
       logInfo("sandbox.stopping", { sandboxId: meta.sandboxId });
       try {
-        const sandbox = await getSandboxController().get({ sandboxId: meta.sandboxId });
+        // Observation must not revive a platform-stopped persistent sandbox.
+        // Otherwise a stop request can restart preserved Gateway/cron work
+        // before cooperative suspension has closed admission.
+        const sandbox = await getSandboxController().get({
+          sandboxId: meta.sandboxId,
+          resume: false,
+        });
         await assertLifecycleGuardCurrent(options.lifecycleGuard);
+        const terminalMeta = await reconcileTerminalSandboxBeforeStop(
+          meta,
+          sandbox,
+          () => lease.assertOwned(),
+        );
+        if (terminalMeta) return terminalMeta;
         const stoppedMeta = await requestCooperativePersistentStop({
           meta,
           sandbox,
@@ -4180,11 +4314,14 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
     }
 
     if (sandbox.status === "stopped") {
-      if (
-        hostSuspension.phase !== "stop-requesting"
-        && hostSuspension.phase !== "stopping"
-        && hostSuspension.phase !== "stopped"
-      ) return meta;
+      const terminalSuspension = await recordPlatformStoppedHostSuspension({
+        sandboxId,
+        lifecycleAttemptId: runningLifecycleAttemptId,
+      });
+      if (terminalSuspension.intent === "reset") {
+        await ensureHostStopMonitor(terminalSuspension);
+        return meta;
+      }
       const stoppedMeta = await mutateMeta((next) => {
         if (
           next.sandboxId !== sandboxId
@@ -4200,7 +4337,6 @@ export async function reconcileSnapshottingStatus(): Promise<SingleMeta> {
         || stoppedMeta.sandboxId !== sandboxId
         || (stoppedMeta.lifecycleAttemptId ?? null) !== runningLifecycleAttemptId
       ) return stoppedMeta;
-      await markHostSuspensionStopped(hostSuspension);
       await clearSandboxDeadline(sandboxId, {
         lifecycleAttemptId: runningLifecycleAttemptId,
       });
@@ -5649,6 +5785,9 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
     }
   };
 
+  let activeGatewayReplacement: HostSuspensionState | null = null;
+  let activeGatewayReplacementSession: CapturedSandboxSession | null = null;
+
   try {
     logInfo("sandbox.status_transition", ctx({
       from: current.status,
@@ -5753,6 +5892,426 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       ) {
         throw new LifecycleLockOwnershipLostError();
       }
+    };
+
+    const killGatewayImmediatelyAfterResume = async (
+      handle: SandboxHandle,
+      session: CapturedSandboxSession,
+      expectedSuspension: HostSuspensionState,
+    ): Promise<void> => {
+      await options.lease.assertOwned();
+      await assertSandboxGenerationOwnership(handle, false);
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      const currentSuspension = await readHostSuspensionState();
+      if (
+        !currentSuspension
+        || currentSuspension.operationId !== expectedSuspension.operationId
+        || currentSuspension.requestId !== expectedSuspension.requestId
+        || currentSuspension.sandboxId !== expectedSuspension.sandboxId
+        || currentSuspension.lifecycleAttemptId
+          !== expectedSuspension.lifecycleAttemptId
+        || currentSuspension.phase !== expectedSuspension.phase
+        || currentSuspension.intent !== expectedSuspension.intent
+        || currentSuspension.ingressFenced !== expectedSuspension.ingressFenced
+        || currentSuspension.suspensionId !== expectedSuspension.suspensionId
+        || handle.currentSessionId !== session.sessionId
+        || (
+          (
+            expectedSuspension.phase === "replacement-starting"
+            || expectedSuspension.phase === "replacement-failed"
+          )
+          && expectedSuspension.replacementSessionId !== session.sessionId
+        )
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      let result: Awaited<ReturnType<SandboxHandle["runCommand"]>>;
+      try {
+        result = await session.runCommand("bash", [
+          "-lc",
+          `set -euo pipefail\n${buildGatewayKillShell()}`,
+        ]);
+      } catch (error) {
+        throw new ApiError(
+          503,
+          "GATEWAY_TERMINATION_UNCONFIRMED",
+          `Gateway termination could not be confirmed after resume: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      await options.lease.assertOwned();
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      if (result.exitCode !== 0) {
+        const failure = new CommandFailedError({
+          command: "host-defined-gateway-kill",
+          exitCode: result.exitCode,
+          output: await result.output("both").catch(() => "output unavailable"),
+        });
+        throw new ApiError(
+          503,
+          "GATEWAY_TERMINATION_UNCONFIRMED",
+          failure.message,
+        );
+      }
+    };
+
+    type PersistedSandboxAdoption = {
+      handle: SandboxHandle;
+      session: CapturedSandboxSession;
+      suspension: HostSuspensionState;
+      gatewayAlreadyTerminated: boolean;
+    };
+
+    const migrateLegacyStoppedFence = async (
+      inspected: SandboxHandle,
+    ): Promise<HostSuspensionState | null> => {
+      const marker = current.legacyStoppedFenceMigration;
+      if (marker.state === "not-required") return null;
+      const isFreshLegacy = marker.state === "legacy-eligible";
+      const isClaimed = marker.state === "claimed";
+      const isComplete = marker.state === "complete";
+      if (
+        inspected.status !== "stopped"
+        || current.sandboxId !== inspected.sandboxId
+        || (
+          (isClaimed || isComplete)
+          && marker.sandboxId !== inspected.sandboxId
+        )
+      ) return null;
+
+      const sourceLifecycleAttemptId = marker.state === "legacy-eligible"
+        ? current.lifecycleAttemptId ?? null
+        : marker.sourceLifecycleAttemptId;
+      let priorFence = await readDurableStoppedResumeFence({
+        sandboxId: inspected.sandboxId,
+        lifecycleAttemptId: sourceLifecycleAttemptId,
+      });
+      if (isComplete && !priorFence) return null;
+      if (isComplete) return priorFence;
+
+      await options.lease.assertOwned();
+      await assertSandboxGenerationOwnership(inspected, false);
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      const claimed = await mutateMeta((meta) => {
+        if (
+          meta.lifecycleAttemptId !== attemptId
+          || meta.sandboxId !== inspected.sandboxId
+        ) return;
+        const latestMarker = meta.legacyStoppedFenceMigration;
+        const mayClaimFresh = isFreshLegacy
+          && latestMarker.state === "legacy-eligible";
+        const mayReplayClaim = isClaimed
+          && latestMarker.state === "claimed"
+          && latestMarker.sandboxId === marker.sandboxId
+          && latestMarker.sourceLifecycleAttemptId
+            === marker.sourceLifecycleAttemptId
+          && latestMarker.targetLifecycleAttemptId
+            === marker.targetLifecycleAttemptId;
+        if (!mayClaimFresh && !mayReplayClaim) return;
+        meta.legacyStoppedFenceMigration = {
+          version: 1,
+          state: "claimed",
+          sandboxId: inspected.sandboxId,
+          sourceLifecycleAttemptId,
+          targetLifecycleAttemptId: attemptId,
+        };
+      });
+      const claimedMarker = claimed.legacyStoppedFenceMigration;
+      if (
+        claimed.lifecycleAttemptId !== attemptId
+        || claimed.sandboxId !== inspected.sandboxId
+        || claimedMarker.state !== "claimed"
+        || claimedMarker.sandboxId !== inspected.sandboxId
+        || claimedMarker.sourceLifecycleAttemptId !== sourceLifecycleAttemptId
+        || claimedMarker.targetLifecycleAttemptId !== attemptId
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+
+      await options.lease.assertOwned();
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      if (!priorFence) {
+        const recorded = await recordPlatformStoppedHostSuspension({
+          sandboxId: inspected.sandboxId,
+          lifecycleAttemptId: sourceLifecycleAttemptId,
+          expectedCurrentLifecycleAttemptId: attemptId,
+          allowMissingSandboxId: false,
+        });
+        priorFence = await readDurableStoppedResumeFence({
+          sandboxId: inspected.sandboxId,
+          lifecycleAttemptId: sourceLifecycleAttemptId,
+        });
+        if (!priorFence || priorFence.operationId !== recorded.operationId) {
+          throw new ApiError(
+            503,
+            "SANDBOX_RESUME_UNFENCED",
+            "Legacy stopped state could not establish an exact thawable fence.",
+          );
+        }
+      }
+      await options.lease.assertOwned();
+      await assertSandboxGenerationOwnership(inspected, false);
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      const completed = await mutateMeta((meta) => {
+        const latestMarker = meta.legacyStoppedFenceMigration;
+        if (
+          meta.lifecycleAttemptId !== attemptId
+          || meta.sandboxId !== inspected.sandboxId
+          || latestMarker.state !== "claimed"
+          || latestMarker.sandboxId !== inspected.sandboxId
+          || latestMarker.sourceLifecycleAttemptId !== sourceLifecycleAttemptId
+          || latestMarker.targetLifecycleAttemptId !== attemptId
+        ) return;
+        meta.legacyStoppedFenceMigration = {
+          ...latestMarker,
+          state: "complete",
+        };
+      });
+      const completedMarker = completed.legacyStoppedFenceMigration;
+      if (
+        completed.lifecycleAttemptId !== attemptId
+        || completed.sandboxId !== inspected.sandboxId
+        || completedMarker.state !== "complete"
+        || completedMarker.sandboxId !== inspected.sandboxId
+        || completedMarker.sourceLifecycleAttemptId !== sourceLifecycleAttemptId
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      logWarn("sandbox.legacy_stopped_fence_migrated", {
+        sandboxId: inspected.sandboxId,
+        sourceLifecycleAttemptId,
+        lifecycleAttemptId: attemptId,
+      });
+      return priorFence;
+    };
+
+    const adoptPersistedSandboxFence = async (
+      inspected: SandboxHandle,
+    ): Promise<PersistedSandboxAdoption> => {
+      let adopted = inspected;
+      let priorFence: HostSuspensionState | null = null;
+      let interruptedReplacement = false;
+      if (inspected.status === "stopped") {
+        const stoppedSuspension = await readHostSuspensionState();
+        if (
+          stoppedSuspension?.ingressFenced
+          && stoppedSuspension.intent === "stop"
+          && stoppedSuspension.sandboxId === inspected.sandboxId
+          && stoppedSuspension.lifecycleAttemptId
+            === (current.lifecycleAttemptId ?? null)
+          && (
+            stoppedSuspension.phase === "replacement-starting"
+            || stoppedSuspension.phase === "replacement-failed"
+          )
+        ) {
+          await canonicalizeStoppedHostSuspensionGatewayReplacement({
+            expected: stoppedSuspension,
+            sandboxId: inspected.sandboxId,
+            expectedCurrentLifecycleAttemptId: attemptId,
+          });
+        }
+        priorFence = await readDurableStoppedResumeFence({
+          sandboxId: inspected.sandboxId,
+          lifecycleAttemptId: current.lifecycleAttemptId ?? null,
+        });
+        priorFence ??= await migrateLegacyStoppedFence(inspected);
+      } else if (inspected.status === "running") {
+        const suspension = await readHostSuspensionState();
+        const exactPriorAttempt = current.lifecycleAttemptId !== null
+          && suspension?.lifecycleAttemptId === current.lifecycleAttemptId;
+        if (
+          suspension?.ingressFenced
+          && suspension.intent === "stop"
+          && suspension.sandboxId === inspected.sandboxId
+          && exactPriorAttempt
+          && (
+            suspension.phase === "stopped"
+            || suspension.phase === "rollback-pending"
+          )
+        ) {
+          priorFence = suspension;
+        } else if (
+          suspension?.ingressFenced
+          && suspension.intent === "stop"
+          && suspension.sandboxId === inspected.sandboxId
+          && exactPriorAttempt
+          && (
+            suspension.phase === "replacement-starting"
+            || suspension.phase === "replacement-failed"
+          )
+          && suspension.replacementSessionId !== null
+          && suspension.replacementSessionId !== undefined
+          && suspension.replacementStage != null
+          && inspected.currentSessionId === suspension.replacementSessionId
+        ) {
+          priorFence = suspension;
+          interruptedReplacement = true;
+        } else {
+          throw new ApiError(
+            503,
+            "SANDBOX_RESUME_UNFENCED",
+            "Running persistent state does not have an exact interrupted-resume fence.",
+          );
+        }
+      }
+
+      if (!priorFence) {
+        throw new ApiError(
+          503,
+          "SANDBOX_RESUME_UNFENCED",
+          "Persistent state does not have an exact interrupted-resume fence.",
+        );
+      }
+
+      const claimed = await mutateMeta((meta) => {
+        if (
+          meta.lifecycleAttemptId !== attemptId
+          || (
+            meta.sandboxId !== null
+            && meta.sandboxId !== inspected.sandboxId
+          )
+        ) return;
+        meta.sandboxId = inspected.sandboxId;
+      });
+      if (
+        claimed.lifecycleAttemptId !== attemptId
+        || claimed.sandboxId !== inspected.sandboxId
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+
+      const adoptedSuspension = interruptedReplacement
+        ? await adoptHostSuspensionGatewayReplacement({
+            expected: priorFence,
+            sandboxId: inspected.sandboxId,
+            lifecycleAttemptId: attemptId,
+            sessionId: priorFence.replacementSessionId!,
+          })
+        : await adoptHostSuspensionForGatewayReplacement({
+            expected: priorFence,
+            sandboxId: inspected.sandboxId,
+            lifecycleAttemptId: attemptId,
+            allowMissingSandboxId: false,
+          });
+      await options.lease.assertOwned();
+      await assertSandboxGenerationOwnership(inspected, false);
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      if (inspected.status === "stopped") {
+        adopted = await getSandboxController().get({
+          sandboxId: inspected.sandboxId,
+          resume: true,
+        });
+      }
+      await options.lease.assertOwned();
+      await assertSandboxGenerationOwnership(adopted, false);
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      if (!adopted.captureCurrentSession) {
+        throw new ApiError(
+          503,
+          "SANDBOX_SESSION_CAPTURE_UNAVAILABLE",
+          "The persisted sandbox session cannot be captured without auto-resume.",
+        );
+      }
+      const session = adopted.captureCurrentSession();
+      if (
+        interruptedReplacement
+        && session.sessionId !== adoptedSuspension.replacementSessionId
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+      return {
+        handle: adopted,
+        session,
+        suspension: adoptedSuspension,
+        gatewayAlreadyTerminated: interruptedReplacement,
+      };
+    };
+
+    const terminateAdoptedPersistedGateway = async (
+      adoption: PersistedSandboxAdoption,
+    ): Promise<HostSuspensionState> => {
+      if (adoption.gatewayAlreadyTerminated) {
+        let replacement = adoption.suspension;
+        activeGatewayReplacement = replacement;
+        activeGatewayReplacementSession = adoption.session;
+        if (replacement.replacementStage === "launching") {
+          // The prior launch may have reached setsid before its owner died.
+          // Re-confirm only the exact persisted session before rewriting it.
+          await killGatewayImmediatelyAfterResume(
+            adoption.handle,
+            adoption.session,
+            replacement,
+          );
+          replacement = await markHostSuspensionGatewayReplacementPreparing(
+            replacement,
+          );
+        }
+        activeGatewayReplacement = replacement;
+        return replacement;
+      }
+      await killGatewayImmediatelyAfterResume(
+        adoption.handle,
+        adoption.session,
+        adoption.suspension,
+      );
+      await assertSandboxGenerationOwnership(adoption.handle, false);
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      const replacement = await beginHostSuspensionGatewayReplacement({
+        expected: adoption.suspension,
+        sandboxId: adoption.handle.sandboxId,
+        lifecycleAttemptId: attemptId,
+        sessionId: adoption.session.sessionId,
+      });
+      await assertSandboxGenerationOwnership(adoption.handle, false);
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      adoption.suspension = replacement;
+      adoption.gatewayAlreadyTerminated = true;
+      activeGatewayReplacement = replacement;
+      activeGatewayReplacementSession = adoption.session;
+      return replacement;
+    };
+
+    const assertGatewayReplacementSessionCurrent = async (
+      handle: SandboxHandle,
+    ): Promise<void> => {
+      if (!activeGatewayReplacement) return;
+      const session = activeGatewayReplacementSession;
+      if (!session) throw new LifecycleLockOwnershipLostError();
+      await options.lease.assertOwned();
+      await assertSandboxGenerationOwnership(handle, false);
+      await assertLifecycleGuardCurrent(options.lifecycleGuard);
+      const currentSuspension = await readHostSuspensionState();
+      if (
+        !currentSuspension
+        || currentSuspension.operationId
+          !== activeGatewayReplacement.operationId
+        || currentSuspension.requestId !== activeGatewayReplacement.requestId
+        || currentSuspension.sandboxId !== handle.sandboxId
+        || currentSuspension.lifecycleAttemptId !== attemptId
+        || currentSuspension.phase !== activeGatewayReplacement.phase
+        || currentSuspension.replacementStage
+          !== activeGatewayReplacement.replacementStage
+        || currentSuspension.replacementSessionId !== session.sessionId
+        || handle.currentSessionId !== session.sessionId
+      ) {
+        throw new LifecycleLockOwnershipLostError();
+      }
+    };
+
+    const adoptPersistedSandboxForGatewayReplacement = async (
+      inspected: SandboxHandle,
+    ): Promise<SandboxHandle> => {
+      const adoption = await adoptPersistedSandboxFence(inspected);
+      await terminateAdoptedPersistedGateway(adoption);
+      return adoption.handle;
+    };
+
+    let pendingBundleGatewayAdoption: PersistedSandboxAdoption | null = null;
+
+    const adoptPersistedNpmSandbox = async (
+      inspected: SandboxHandle,
+    ): Promise<SandboxHandle> => {
+      if (bundleMode || persistedRuntimeModeMismatch) return inspected;
+      return adoptPersistedSandboxForGatewayReplacement(inspected);
     };
 
     const persistBundleCandidateHandle = async (
@@ -5918,28 +6477,32 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
                 sandboxName,
                 recovered,
               );
+            const adopted = await adoptPersistedNpmSandbox(recovered);
             if (
               !bundleMode
               &&
               !interruptedBundleCandidate
-              && unhealthyResumeStatuses.has(recovered.status)
+              && unhealthyResumeStatuses.has(adopted.status)
             ) {
               throw new Error(
-                `name_conflict_resume_unhealthy_handle:${recovered.status}:${recovered.sandboxId}`,
+                `name_conflict_resume_unhealthy_handle:${adopted.status}:${adopted.sandboxId}`,
               );
             }
             progress.appendLine(
               "system",
-              `Recovered: ${recovered.sandboxId} status=${recovered.status}`,
+              `Recovered: ${adopted.sandboxId} status=${adopted.status}`,
             );
             return {
-              handle: recovered,
+              handle: adopted,
               bundleCandidate: interruptedBundleCandidate,
               created: false,
               replaceBeforeBootstrap: interruptedBundleCandidate,
             };
           } catch (getErr) {
-            if (getErr instanceof SandboxLifecycleGuardRejectedError) {
+            if (
+              getErr instanceof SandboxLifecycleGuardRejectedError
+              || getErr instanceof ApiError
+            ) {
               throw getErr;
             }
             logError("sandbox.create.name_conflict_get_fallback_failed", ctx({
@@ -6123,23 +6686,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         sandboxId: sandboxName,
         resume: false,
       });
-      if (
-        !bundleMode
-        && !persistedRuntimeModeMismatch
-        && resumedHandle.status === "stopped"
-      ) {
-        await ensureDurableStoppedResumeFence({
-          sandboxId: resumedHandle.sandboxId,
-          lifecycleAttemptId: current.lifecycleAttemptId ?? null,
-          expectedCurrentLifecycleAttemptId: attemptId,
-          allowMissingSandboxId: current.sandboxId === null,
-        });
-        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-        resumedHandle = await getSandboxController().get({
-          sandboxId: resumedHandle.sandboxId,
-          resume: true,
-        });
-      }
+      resumedHandle = await adoptPersistedNpmSandbox(resumedHandle);
       await assertLifecycleGuardCurrent(options?.lifecycleGuard);
       const resumedBundleCandidate = bundleMode
         && candidateAuthorizesCleanup(
@@ -6267,8 +6814,28 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       !sandboxIsBundleCandidate
       && (bundleMode || persistedRuntimeModeMismatch)
     ) {
-      const persistedSandbox = sandbox;
+      let persistedSandbox = sandbox;
       if (!bundleMode || !storedBundleIdentityAdmitted) {
+        if (persistedSandbox.status === "running") {
+          const priorSuspension = await readHostSuspensionState();
+          const exactInterruptedResume = current.lifecycleAttemptId !== null
+            && priorSuspension?.ingressFenced
+            && priorSuspension.intent === "stop"
+            && priorSuspension.sandboxId === persistedSandbox.sandboxId
+            && priorSuspension.lifecycleAttemptId === current.lifecycleAttemptId
+            && (
+              priorSuspension.phase === "stopped"
+              || priorSuspension.phase === "rollback-pending"
+              || priorSuspension.phase === "replacement-starting"
+              || priorSuspension.phase === "replacement-failed"
+            );
+          if (exactInterruptedResume) {
+            const migrationAdoption = await adoptPersistedSandboxFence(
+              persistedSandbox,
+            );
+            persistedSandbox = migrationAdoption.handle;
+          }
+        }
         const migrationOwner = await mutateMeta((meta) => {
           if (meta.lifecycleAttemptId !== attemptId) return;
           meta.sandboxId = persistedSandbox.sandboxId;
@@ -6312,30 +6879,20 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       }
 
       if (persistedSandbox.status === "stopped") {
-        await assertAcquiredSandboxOwnership(persistedSandbox);
+        pendingBundleGatewayAdoption = await adoptPersistedSandboxFence(
+          persistedSandbox,
+        );
+        const adopted = pendingBundleGatewayAdoption.handle;
+        await assertAcquiredSandboxOwnership(adopted);
         await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-        await ensureDurableStoppedResumeFence({
-          sandboxId: persistedSandbox.sandboxId,
-          lifecycleAttemptId: current.lifecycleAttemptId ?? null,
-          expectedCurrentLifecycleAttemptId: attemptId,
-          allowMissingSandboxId: current.sandboxId === null,
-        });
-        await assertAcquiredSandboxOwnership(persistedSandbox);
-        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-        const resumed = await getSandboxController().get({
-          sandboxId: persistedSandbox.sandboxId,
-          resume: true,
-        });
-        await assertAcquiredSandboxOwnership(resumed);
-        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-        if (resumed.status !== "running") {
+        if (adopted.status !== "running") {
           throw new ApiError(
             503,
             "SANDBOX_RESUME_NOT_RUNNING",
-            `Sandbox resume returned status ${resumed.status}.`,
+            `Sandbox resume returned status ${adopted.status}.`,
           );
         }
-        sandbox = resumed;
+        sandbox = adopted;
       } else if (persistedSandbox.status !== "running") {
         const migrationMeta = await mutateMeta((meta) => {
           if (meta.lifecycleAttemptId !== attemptId) return;
@@ -6404,6 +6961,10 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       let markerIdentity: unknown = null;
       let markerPresent = false;
       try {
+        // @vercel/sandbox file reads call withResume(), so a stopped session
+        // must be resumed under its exact fence first. Keep its Gateway
+        // suspension intact: this marker read is the sole runtime probe before
+        // either migration quiesce or confirmed replacement termination.
         const markerResult = await sandbox.runCommand("bash", [
           "-c",
           `test -f ${JSON.stringify(OPENCLAW_BUNDLE_IDENTITY_PATH)} && cat ${JSON.stringify(OPENCLAW_BUNDLE_IDENTITY_PATH)}`,
@@ -6432,6 +6993,18 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
             "Configured bundle admission changed during persistent resume.",
           );
         }
+        const adoption = pendingBundleGatewayAdoption
+          ?? await adoptPersistedSandboxFence(sandbox);
+        await terminateAdoptedPersistedGateway(adoption);
+        sandbox = adoption.handle;
+        pendingBundleGatewayAdoption = null;
+        if (sandbox.status !== "running") {
+          throw new ApiError(
+            503,
+            "SANDBOX_RESUME_NOT_RUNNING",
+            `Sandbox resume returned status ${sandbox.status}.`,
+          );
+        }
         progress.setPhase(
           "resuming-sandbox",
           "Verifying persisted OpenClaw bundle bytes",
@@ -6443,6 +7016,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           progress,
         );
         await assertSandboxGenerationOwnership(sandbox, false);
+        await assertGatewayReplacementSessionCurrent(sandbox);
       }
 
       // The receipt is written last, after digest checks, external plugin
@@ -6459,6 +7033,14 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           "system",
           "Bundle identity missing or stale — explicit migration or reset required",
         );
+        if (!pendingBundleGatewayAdoption) {
+          // A running retry can still be fenced by the interrupted attempt.
+          // Transfer that exact operation without killing its Gateway; the
+          // migration stop below must thaw it before issuing a fresh RPC stop.
+          pendingBundleGatewayAdoption = await adoptPersistedSandboxFence(
+            mismatchedSandbox,
+          );
+        }
         await assertSandboxGenerationOwnership(mismatchedSandbox, false);
         const quiesced = await quiesceSandboxForBundleMigration({
           sandbox: mismatchedSandbox,
@@ -6480,7 +7062,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
           meta.portUrls = null;
           meta.lastAccessedAt = current.lastAccessedAt;
           meta.lastError = BUNDLE_MIGRATION_REQUIRED_LAST_ERROR;
-          meta.lifecycleAttemptId = current.lifecycleAttemptId;
+          meta.lifecycleAttemptId = attemptId;
           meta.bundleIdentity = current.bundleIdentity;
           meta.bundleCandidate = activeBundleCandidate;
         });
@@ -6519,43 +7101,9 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         apiKey: freshApiKey,
       });
 
-      // A resumed scheduler can observe past-due jobs as soon as Gateway
-      // starts. Install the fresh credential transform before that boundary.
-      const firewallStart = Date.now();
-      try {
-        await assertSandboxGenerationOwnership(
-          initialSandbox,
-          bundleMode && sandboxIsBundleCandidate,
-        );
-        progress.setPhase(
-          "applying-firewall",
-          `Applying ${latest.firewall.mode} firewall policy`,
-        );
-        await applyFirewallPolicyToSandbox(
-          sandbox,
-          latest,
-          freshApiKey,
-          requiredControlPlaneDomains(latest, origin),
-        );
-        await assertSandboxGenerationOwnership(
-          initialSandbox,
-          bundleMode && sandboxIsBundleCandidate,
-        );
-      } catch (err) {
-        const firewallError = err instanceof Error ? err.message : String(err);
-        logWarn("sandbox.create.persistent_resume.firewall_sync_failed", ctx({
-          sandboxId: sandbox.sandboxId,
-          mode: latest.firewall.mode,
-          error: firewallError,
-        }));
-        if (latest.firewall.mode === "enforcing") {
-          throw new Error(
-            `Firewall sync failed during persistent resume: ${firewallError}`,
-          );
-        }
-      }
-      const firewallSyncMs = Date.now() - firewallStart;
-
+      // Refresh the phase-aware restore script before invoking `kill`.
+      // Older persisted scripts treated every invocation as kill-and-start,
+      // which could relaunch Gateway before the firewall is authoritative.
       const assetSyncStart = Date.now();
       const slackConfig = latest.channels.slack;
       const tg = latest.channels.telegram;
@@ -6567,18 +7115,28 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         slackCredentials: validatedSlackCreds ?? undefined,
         bundleCapabilities: verifiedBundleCapabilities,
       });
+      await assertGatewayReplacementSessionCurrent(initialSandbox);
       const assetSyncMs = Date.now() - assetSyncStart;
 
-      progress.setPhase("starting-gateway", "Running fast restore script");
       const READINESS_TIMEOUT_SECONDS = 30;
+      const runFastRestore = (phase: "kill" | "start") => {
+        const runner = phase === "start" && activeGatewayReplacementSession
+          ? activeGatewayReplacementSession
+          : initialSandbox;
+        return runner.runCommand({
+          cmd: "bash",
+          args: [
+            OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+            String(READINESS_TIMEOUT_SECONDS),
+            phase,
+          ],
+          env: restoreEnv,
+        });
+      };
 
-      // Defensive pre-step: clear gateway lockfiles whose owner PID is dead.
-      // The bundle's fast-restore.sh acquires a lock that can be left over
-      // from a previous VM after snapshot/warm-restore. The PID inside is
-      // dead in the new sandbox, but the lock-acquisition still waits ~5s
-      // for that "owner" before giving up — leaving the gateway un-started
-      // and the Slack workflow showing "Verifying config…" until it hits
-      // its 120s readiness timeout. Best-effort; never fails the restore.
+      // Clear dead lockfile owners before the final suspension read. Keeping
+      // that read immediately before kill preserves the lifecycle-CAS fence:
+      // a lost lease cannot kill or restart the preserved Gateway.
       try {
         await sandbox.runCommand("bash", [
           "-c",
@@ -6592,34 +7150,12 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
               : String(lockClearError),
         });
       }
-
-      const fastRestoreStart = Date.now();
-      await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-      await assertSandboxGenerationOwnership(
-        initialSandbox,
-        bundleMode && sandboxIsBundleCandidate,
-      );
-      const runFastRestore = (phase: "all" | "kill" | "start") =>
-        initialSandbox.runCommand({
-          cmd: "bash",
-          args: [
-            OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
-            String(READINESS_TIMEOUT_SECONDS),
-            phase,
-          ],
-          env: restoreEnv,
-        });
-      const replacementSuspension = await readHostSuspensionState();
-      const replacesSuspendedGateway = Boolean(
-        replacementSuspension?.ingressFenced
-        && replacementSuspension.sandboxId === initialSandbox.sandboxId
-        && (
-          replacementSuspension.phase === "stopped"
-          || replacementSuspension.phase === "rollback-pending"
-        )
-      );
-      let retiredGatewaySuspension = false;
-      const restoreResult = await (async () => {
+      await assertGatewayReplacementSessionCurrent(initialSandbox);
+      // A canonical adoption already confirmed the old Gateway dead and owns
+      // that fact durably. Snapshot-only restores still use the phase-aware
+      // script to establish the same pre-start condition.
+      const killScriptStart = Date.now();
+      if (!activeGatewayReplacement) {
         await assertLifecycleGuardCurrent(options?.lifecycleGuard);
         await assertSandboxGenerationOwnership(
           initialSandbox,
@@ -6634,31 +7170,142 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
             output,
           });
         }
-        if (replacesSuspendedGateway && replacementSuspension) {
-          await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-          await assertSandboxGenerationOwnership(
-            initialSandbox,
-            bundleMode && sandboxIsBundleCandidate,
-          );
-          retiredGatewaySuspension = await clearHostSuspensionAfterGatewayReplacement({
-            expected: replacementSuspension,
-            sandboxId: initialSandbox.sandboxId,
-            lifecycleAttemptId: attemptId,
-          });
-          if (!retiredGatewaySuspension) {
-            throw new LifecycleLockOwnershipLostError();
-          }
-        }
-        await options?.lease?.assertOwned();
-        await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+      }
+      const killScriptMs = Date.now() - killScriptStart;
+
+      // A resumed scheduler can observe past-due jobs as soon as Gateway
+      // starts. Install the fresh credential transform before that boundary.
+      const firewallStart = Date.now();
+      try {
         await assertSandboxGenerationOwnership(
           initialSandbox,
           bundleMode && sandboxIsBundleCandidate,
         );
-        return runFastRestore("start");
-      })();
+        progress.setPhase(
+          "applying-firewall",
+          `Applying ${latest.firewall.mode} firewall policy`,
+        );
+        if (latest.firewall.mode === "enforcing") {
+          const bootingMeta = await mutateMeta((meta) => {
+            if (
+              meta.lifecycleAttemptId !== attemptId
+              || meta.sandboxId !== initialSandbox.sandboxId
+            ) return;
+            meta.status = "booting";
+          });
+          if (
+            bootingMeta.lifecycleAttemptId !== attemptId
+            || bootingMeta.sandboxId !== initialSandbox.sandboxId
+            || bootingMeta.status !== "booting"
+          ) {
+            throw new LifecycleLockOwnershipLostError();
+          }
+          // Firewall state owns revision CAS and the durable deny-all/stop
+          // fail-close path. Import lazily to avoid its lifecycle dependency.
+          const { syncFirewallPolicyWithinLifecycleLock } = await import(
+            "@/server/firewall/state"
+          );
+          const outcome = await syncFirewallPolicyWithinLifecycleLock(
+            () => options.lease.assertOwned(),
+            { controlPlaneOrigin: origin, credential: credential ?? undefined },
+          );
+          if (!outcome.applied) {
+            throw new Error(
+              `Firewall policy was not applied during persistent resume: ${outcome.reason}`,
+            );
+          }
+        } else {
+          await applyFirewallPolicyToSandbox(
+            sandbox,
+            latest,
+            freshApiKey,
+            requiredControlPlaneDomains(latest, origin),
+          );
+        }
+        await assertSandboxGenerationOwnership(
+          initialSandbox,
+          bundleMode && sandboxIsBundleCandidate,
+        );
+        await assertGatewayReplacementSessionCurrent(initialSandbox);
+      } catch (err) {
+        const firewallError = err instanceof Error ? err.message : String(err);
+        logWarn("sandbox.create.persistent_resume.firewall_sync_failed", ctx({
+          sandboxId: sandbox.sandboxId,
+          mode: latest.firewall.mode,
+          error: firewallError,
+        }));
+        if (latest.firewall.mode === "enforcing") {
+          await progress.failSetupProgress(
+            `Firewall sync failed during persistent resume: ${firewallError}`,
+          );
+          const [failedMeta, failClosedSuspension] = await Promise.all([
+            getInitializedMeta(),
+            readHostSuspensionState(),
+          ]);
+          const failClosedRevision = failClosedSuspension
+            ? parseFirewallFailClosedReason(failClosedSuspension.reason)
+            : null;
+          const failCloseOwned =
+            failedMeta.status === "error"
+            && failedMeta.lastError === FIREWALL_FAIL_CLOSED_LAST_ERROR
+            && failedMeta.sandboxId === initialSandbox.sandboxId
+            && failedMeta.lifecycleAttemptId === attemptId
+            && failClosedSuspension?.ingressFenced === true
+            && failClosedSuspension.sandboxId === initialSandbox.sandboxId
+            && failClosedSuspension.lifecycleAttemptId === attemptId
+            && failClosedRevision?.revisionId
+              === failedMeta.firewall.failClosedPolicyRevisionId
+            && failClosedRevision?.policyHash
+              === failedMeta.firewall.failClosedPolicyHash;
+          const replacementFailCloseOwned =
+            failedMeta.status === "error"
+            && failedMeta.lastError === FIREWALL_FAIL_CLOSED_LAST_ERROR
+            && failedMeta.sandboxId === initialSandbox.sandboxId
+            && failedMeta.lifecycleAttemptId === attemptId
+            && failClosedSuspension?.phase === "replacement-starting"
+            && failClosedSuspension.ingressFenced
+            && failClosedSuspension.sandboxId === initialSandbox.sandboxId
+            && failClosedSuspension.lifecycleAttemptId === attemptId;
+          if (replacementFailCloseOwned && failClosedSuspension) {
+            const failed = await markHostSuspensionGatewayReplacementFailed(
+              failClosedSuspension,
+              new ApiError(
+                502,
+                "FIREWALL_SYNC_FAILED",
+                firewallError,
+              ),
+            );
+            if (!failed) throw new LifecycleLockOwnershipLostError();
+            activeGatewayReplacement = failed;
+            return failedMeta;
+          }
+          if (failCloseOwned) return failedMeta;
+          throw new Error(
+            `Firewall sync failed during persistent resume: ${firewallError}`,
+          );
+        }
+      }
+      const firewallSyncMs = Date.now() - firewallStart;
+
+      progress.setPhase("starting-gateway", "Running fast restore script");
+
+      const startScriptStart = Date.now();
       await assertLifecycleGuardCurrent(options?.lifecycleGuard);
-      const startupScriptMs = Date.now() - fastRestoreStart;
+      await assertSandboxGenerationOwnership(
+        initialSandbox,
+        bundleMode && sandboxIsBundleCandidate,
+      );
+      await assertGatewayReplacementSessionCurrent(initialSandbox);
+      if (activeGatewayReplacement) {
+        activeGatewayReplacement =
+          await markHostSuspensionGatewayReplacementLaunching(
+            activeGatewayReplacement,
+          );
+      }
+      const restoreResult = await runFastRestore("start");
+      await assertLifecycleGuardCurrent(options?.lifecycleGuard);
+      await assertGatewayReplacementSessionCurrent(initialSandbox);
+      const startupScriptMs = killScriptMs + Date.now() - startScriptStart;
 
       if (restoreResult.exitCode !== 0) {
         const output = await restoreResult.output("both");
@@ -6745,7 +7392,7 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
         bundleMode && sandboxIsBundleCandidate,
       );
       if (
-        !retiredGatewaySuspension
+        !activeGatewayReplacement
         && !await thawHostSuspensionIfNeeded({
           sandbox,
           lifecycleAttemptId: attemptId,
@@ -6803,6 +7450,16 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       // The verified sandbox receipt and host identity are committed by the
       // running-state CAS. Later deadline/progress failures must not delete it.
       bundleCandidateCommitted = !bundleMode || resumedMeta.bundleIdentity !== null;
+      if (activeGatewayReplacement) {
+        await assertGatewayReplacementSessionCurrent(initialSandbox);
+        await clearCommittedGatewayReplacement(
+          initialSandbox,
+          resumedMeta,
+          activeGatewayReplacement,
+        );
+        activeGatewayReplacement = null;
+        activeGatewayReplacementSession = null;
+      }
       await armSandboxDeadline(resumedMeta, undefined, {
         nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
       });
@@ -7163,6 +7820,22 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
   } catch (error) {
     if (error instanceof LifecycleLockOwnershipLostError) {
       throw error;
+    }
+    if (activeGatewayReplacement?.phase === "replacement-starting") {
+      try {
+        const failed = await markHostSuspensionGatewayReplacementFailed(
+          activeGatewayReplacement,
+          error,
+        );
+        if (failed) activeGatewayReplacement = failed;
+      } catch (replacementFailureError) {
+        logWarn("sandbox.gateway_replacement_failure_record_failed", {
+          sandboxId: activeGatewayReplacement.sandboxId,
+          error: replacementFailureError instanceof Error
+            ? replacementFailureError.message
+            : String(replacementFailureError),
+        });
+      }
     }
     let terminalError: unknown = error;
     if (

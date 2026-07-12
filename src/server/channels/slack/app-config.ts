@@ -66,7 +66,6 @@ export async function createSlackInstallToken(): Promise<string> {
   const token = randomBytes(INSTALL_TOKEN_BYTES).toString("base64url");
   const store = getStore();
   const key = slackInstallTokenKey(token);
-  const tokenPrefix = token.slice(0, 6);
 
   await store.setValue(
     key,
@@ -77,8 +76,6 @@ export async function createSlackInstallToken(): Promise<string> {
   const persisted = await store.getValue<{ issuedAt?: number }>(key);
   if (!persisted || typeof persisted.issuedAt !== "number") {
     logWarn("slack_install_token.persistence_failed", {
-      tokenPrefix,
-      key,
       ttl: INSTALL_TOKEN_TTL_SECONDS,
       persistedType: persisted === null ? "null" : typeof persisted,
     });
@@ -90,8 +87,6 @@ export async function createSlackInstallToken(): Promise<string> {
   }
 
   logInfo("slack_install_token.created", {
-    tokenPrefix,
-    key,
     ttl: INSTALL_TOKEN_TTL_SECONDS,
     issuedAt: persisted.issuedAt,
   });
@@ -109,21 +104,31 @@ export async function consumeSlackInstallToken(token: string): Promise<boolean> 
   }
   const store = getStore();
   const key = slackInstallTokenKey(token);
-  const tokenPrefix = token.slice(0, 6);
-  const record = await store.getValue<{ issuedAt?: number }>(key);
-  if (!record) {
+  const state = await store.getValueState<{ issuedAt?: number }>(key);
+  if (state.status === "absent") {
     logWarn("slack_install_token.consume_miss", {
       reason: "not-found-in-store",
-      tokenPrefix,
-      key,
     });
     return false;
   }
-  await store.deleteValue(key);
-  logInfo("slack_install_token.consumed", {
-    tokenPrefix,
+
+  // The value token fences the delete against a concurrent consumer. Both
+  // requests may read the record, but only one can atomically remove it.
+  const consumed = await store.deleteValuesIfValueToken(
     key,
-    ageMs: record.issuedAt ? Date.now() - record.issuedAt : null,
+    state.token,
+    [key],
+  );
+  if (!consumed) {
+    logWarn("slack_install_token.consume_miss", {
+      reason: "already-consumed",
+    });
+    return false;
+  }
+
+  const record = state.value;
+  logInfo("slack_install_token.consumed", {
+    ageMs: record?.issuedAt ? Date.now() - record.issuedAt : null,
   });
   return true;
 }

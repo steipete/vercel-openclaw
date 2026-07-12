@@ -1,11 +1,11 @@
 ---
 name: whatsapp-delivery
-description: "WhatsApp channel specialist workflow: debug Meta webhook verification/signatures, link-state projection, /whatsapp-webhook fast path, boot messages, and adapter delivery."
+description: "WhatsApp hosted fail-closed and legacy-cleanup verification workflow."
 ---
 
-# WhatsApp Delivery
+# WhatsApp Hosted Cleanup
 
-Use after `channel-debug-core` for WhatsApp issues.
+Use after `channel-debug-core` to prove hosted setup/delivery remains disabled or to debug legacy credential cleanup. Use local/upstream OpenClaw for real WhatsApp delivery.
 
 ## Files
 
@@ -18,23 +18,19 @@ Use after `channel-debug-core` for WhatsApp issues.
 ## Runtime Path
 
 ```text
-Meta webhook verification GET OR message POST -> app route -> x-hub-signature-256 validation -> dedup -> fast path to port 3000 /whatsapp-webhook OR workflow -> WhatsApp adapter/API reply
+Hosted setup/message ingress -> explicit fail-closed response; legacy DELETE -> credential cleanup
 ```
 
 ## Parallel Lane Inputs To Consume
 
-Before proposing a WhatsApp fix, consume:
+Before proposing a hosted WhatsApp cleanup fix, consume:
 
-- Vercel/app logs lane: GET verification vs POST delivery, signature result, requestId/deliveryId/Meta message ID, and project targeting proof.
-- Sandbox runtime lane: port 3000 listener and `/whatsapp-webhook` behavior, sanitized config has `channels.whatsapp`.
-- Workflow lane: workflow start/run/forward state when fast path skipped or failed, with verified project targeting when `.vercel/project.json` differs from the incident target.
-- Prior-fix comparison: linkState projection mistaken as delivery, status-only skip, boot message send/delete, handler non-OK classification.
+- Vercel/app logs lane: fail-closed response or cleanup attempt and project targeting proof.
+- State lane: retained legacy credential/config and cleanup result without exposing secret values.
+- Upstream lane: local/persistent linked-device transport when the report is about actual WhatsApp delivery.
 
 ## Special Checks
 
-- GET verification and POST delivery are different paths.
-- `linkState` is not the same as user-visible reply.
-- Meta signature validation depends on raw body.
-- Handler non-OK may still prove handler receipt; classify precisely.
-- Boot message send/delete behavior affects user-visible state.
-- `lastForward` must reflect fast-path failure as well as success.
+- Do not present hosted WhatsApp as connectable or delivery-ready.
+- Cleanup failures must retain enough credential state for a safe retry.
+- `linkState` is legacy projection evidence, not hosted delivery proof.

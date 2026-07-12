@@ -17,7 +17,6 @@ import {
   channelProcessingKey,
   channelQueueKey,
   channelSessionHistoryKey,
-  channelUserMessageDedupKey,
   cronJobsKey,
   cronNextWakeKey,
   cronProjectionKey,
@@ -28,6 +27,7 @@ import {
   lifecycleLockKey,
   metaKey,
   setupProgressKey,
+  slackInstallTokenKey,
   smokeChannelConfigLockKey,
   smokeDiscordKeyPairKey,
   startLockKey,
@@ -100,6 +100,18 @@ test("keyspace: default instance id preserves existing keys", () => {
   });
 });
 
+test("keyspace: Slack install token keys never contain the bearer", () => {
+  withInstanceId("install-key-test", () => {
+    const bearer = "install-capability-that-must-not-appear-in-redis";
+    const key = slackInstallTokenKey(bearer);
+    assert.equal(key.includes(bearer), false);
+    assert.match(
+      key,
+      /^install-key-test:slack:install-token:[a-f0-9]{64}$/,
+    );
+  });
+});
+
 test("keyspace: custom instance id updates all key prefixes lazily", () => {
   withInstanceId("fork-a", () => {
     assert.equal(getOpenclawInstanceId(), "fork-a");
@@ -147,10 +159,6 @@ test("keyspace: custom instance id updates all key prefixes lazily", () => {
       assert.equal(
         channelDedupKey(channel, "dedup-1"),
         `fork-a:channels:${channel}:dedup:dedup-1`,
-      );
-      assert.equal(
-        channelUserMessageDedupKey(channel, "C123", "1234.5"),
-        `fork-a:channels:${channel}:user-message-dedup:C123:1234.5`,
       );
     }
     assert.equal(channelFailedIndexKey(), "fork-a:channels:failed:index");

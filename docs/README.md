@@ -24,7 +24,7 @@ Start here if you want to understand how the app works in practice.
 4. **Sandbox Lifecycle and Restore** — the operational source of truth for Sandbox v2 persistent create, resume, stop, prepare, and cron wake behavior
 5. **Vercel Sandbox API Audit** — historical SDK inventory plus remaining risk and hardening notes
 6. **Preflight and Launch Verification** — how config readiness and runtime readiness are checked
-7. **Channels and Webhooks** — how Slack, Telegram, Discord, hosted WhatsApp limitations, readiness, and protection behavior fit together
+7. **Channels and Webhooks** — Slack/Telegram delivery, Discord/WhatsApp hosted limitations, readiness, and protection behavior
 8. **Environment Variables** — every variable the app reads and when each one matters
 9. **Deployment Protection** — how Vercel Deployment Protection interacts with channel webhooks
 10. **API Reference** — request and response shapes for the admin and automation surfaces

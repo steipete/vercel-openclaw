@@ -58,18 +58,19 @@ The dashboard authenticates before proxying HTML, manages the sandbox lifecycle,
 
 ```mermaid
 flowchart LR
-  Platform[Slack/Telegram/Discord] --> Webhook[Dashboard webhook route]
-  Webhook --> FastPath{Sandbox running?}
-  FastPath -->|yes| Native[Native OpenClaw handler]
-  FastPath -->|no| Workflow[Vercel Workflow wake path]
-  Workflow --> Sandbox[Ensure sandbox running]
-  Sandbox --> Native
+  Platform[Slack/Telegram] --> Webhook[Dashboard webhook route]
+  Webhook --> Workflow[Durable Vercel Workflow handoff]
+  Workflow --> SandboxState{Sandbox running?}
+  SandboxState -->|yes| Reuse[Reuse running sandbox]
+  SandboxState -->|no| Wake[Resume or create sandbox]
+  Reuse --> Native[Native OpenClaw handler]
+  Wake --> Native
   Native --> Reply[Platform reply]
 ```
 
 Channel incidents are layered. Separate these states in reports and code: OAuth/config complete, credentials saved, config sync applied, handler registered, route ready, native forward accepted, and user-visible reply.
 
-The Workflow wake path forwards the original platform payload to OpenClaw's native channel handler after the sandbox is ready. Do not treat it as a generic chat-completions fallback when debugging delivery.
+Both running and stopped sandboxes use the durable Workflow handoff. The Workflow reuses an already-running sandbox or resumes or creates one, waits for the native handler to be ready, and then forwards the original platform payload. Do not treat this path as a generic chat-completions fallback when debugging delivery.
 
 For stuck delivery, start from live evidence: `GET /api/admin/why-not-ready`, `GET /api/channels/summary`, `GET /api/admin/sandbox-diag`, and `GET /api/admin/logs`. Use [Channels and Webhooks](../channels-and-webhooks.md) and the channel-debug instructions in `CLAUDE.md`/`AGENTS.md` before proposing fixes.
 
@@ -77,6 +78,6 @@ For stuck delivery, start from live evidence: `GET /api/admin/why-not-ready`, `G
 
 - A deployed dashboard URL does not prove the sandbox can boot or complete chat.
 - Preflight passing does not prove channel-ready delivery.
-- Destructive launch verification proves runtime channel readiness, not external platform delivery. A real Slack, Telegram, or Discord test message is still required after channel setup.
+- Destructive launch verification proves runtime channel readiness, not external platform delivery. A real Slack or Telegram test message is still required after channel setup. Hosted Discord is unsupported and has no delivery test path.
 - `lastForward.ok:true` proves native acceptance, not necessarily a human-visible reply.
 - Passing CI does not prove a protected deployment can receive external webhooks.

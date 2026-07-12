@@ -13,6 +13,7 @@ import test from "node:test";
 
 import {
   createScenarioHarness,
+  FakeSandboxHandle,
   type ScenarioHarness,
 } from "@/test-utils/harness";
 import {
@@ -32,6 +33,8 @@ import {
   ensureSandboxRunning,
   probeGatewayReady,
 } from "@/server/sandbox/lifecycle";
+import type { HostSuspensionState } from "@/server/sandbox/host-suspension";
+import { hostSuspensionOperationKey } from "@/server/store/keyspace";
 
 // ---------------------------------------------------------------------------
 // Patch next/server before route modules are loaded
@@ -79,6 +82,57 @@ async function driveToRunning(h: ScenarioHarness): Promise<void> {
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+function retainedGatewayReplacementState(input: {
+  sandboxId: string;
+  lifecycleAttemptId: string;
+  replacementSessionId: string;
+}): HostSuspensionState {
+  const now = Date.now();
+  return {
+    version: 2,
+    operationId: "operation-retained-gateway-replacement",
+    requestId: "request-retained-gateway-replacement",
+    sandboxId: input.sandboxId,
+    lifecycleAttemptId: input.lifecycleAttemptId,
+    intent: "stop",
+    reason: "gateway-replacement-clear-retry",
+    phase: "replacement-starting",
+    ingressFenced: true,
+    suspensionId: null,
+    leaseExpiresAtMs: null,
+    stopRequestDeadlineAtMs: null,
+    monitorHeartbeatAtMs: now,
+    startedAtMs: now - 1_000,
+    updatedAtMs: now,
+    stoppedAtMs: now - 500,
+    resumedAtMs: null,
+    lastError: null,
+    lastErrorCode: null,
+    lastErrorClass: null,
+    replacementSessionId: input.replacementSessionId,
+    replacementStage: "launching",
+  };
+}
+
+function stoppingHostSuspensionState(
+  replacement: HostSuspensionState,
+): HostSuspensionState {
+  const {
+    replacementSessionId: _replacementSessionId,
+    replacementStage: _replacementStage,
+    ...base
+  } = replacement;
+  return {
+    ...base,
+    version: 1,
+    phase: "stopping",
+    suspensionId: `suspension-${replacement.sandboxId}`,
+    leaseExpiresAtMs: Date.now() + 60_000,
+    stoppedAtMs: null,
+    updatedAtMs: Date.now(),
+  };
 }
 
 // ===========================================================================
@@ -309,6 +363,200 @@ test("Admin: POST /api/admin/ensure returns running state when sandbox is runnin
     assert.equal(body.state, "running");
     assert.equal(body.status, "running");
     assert.ok(body.sandboxId, "sandboxId should be set");
+  } finally {
+    h.teardown();
+  }
+});
+
+test("Admin: POST /api/admin/ensure finalizes an exact retained Gateway replacement fence", async () => {
+  const h = createScenarioHarness();
+  try {
+    const sandboxId = "sbx-route-retained-replacement";
+    const lifecycleAttemptId = "attempt-route-retained-replacement";
+    const handle = new FakeSandboxHandle(sandboxId, h.controller.events);
+    h.controller.handlesByIds.set(sandboxId, handle);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = null;
+    });
+    await h.getStore().setValue(
+      hostSuspensionOperationKey(),
+      retainedGatewayReplacementState({
+        sandboxId,
+        lifecycleAttemptId,
+        replacementSessionId: handle.currentSessionId,
+      }),
+    );
+
+    const result = await callAdminPost(
+      adminEnsureRoute.POST,
+      "/api/admin/ensure",
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal((result.json as { state?: unknown }).state, "running");
+    assert.equal(
+      await h.getStore().getValue(hostSuspensionOperationKey()),
+      null,
+    );
+    assert.equal(handle.commands.length, 0);
+    assert.equal(handle.writtenFiles.length, 0);
+  } finally {
+    h.teardown();
+  }
+});
+
+test("Admin: POST /api/admin/ensure rejects a replaced Gateway session without side effects", async () => {
+  const h = createScenarioHarness();
+  try {
+    const sandboxId = "sbx-route-replaced-session";
+    const lifecycleAttemptId = "attempt-route-replaced-session";
+    const handle = new FakeSandboxHandle(sandboxId, h.controller.events);
+    h.controller.handlesByIds.set(sandboxId, handle);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = null;
+    });
+    const retained = retainedGatewayReplacementState({
+      sandboxId,
+      lifecycleAttemptId,
+      replacementSessionId: "different-replacement-session",
+    });
+    await h.getStore().setValue(hostSuspensionOperationKey(), retained);
+    const metaBefore = await h.getMeta();
+
+    const result = await callAdminPost(
+      adminEnsureRoute.POST,
+      "/api/admin/ensure",
+    );
+
+    assert.equal(result.status, 503);
+    assert.equal(
+      (result.json as { error?: unknown }).error,
+      "HOST_INGRESS_FENCED",
+    );
+    assert.deepEqual(await h.getMeta(), metaBefore);
+    assert.deepEqual(
+      await h.getStore().getValue(hostSuspensionOperationKey()),
+      retained,
+    );
+    assert.equal(handle.commands.length, 0);
+    assert.equal(handle.writtenFiles.length, 0);
+  } finally {
+    h.teardown();
+  }
+});
+
+test("Admin: POST /api/admin/ensure returns the durable fence when finalizer clear is unavailable", async () => {
+  const h = createScenarioHarness();
+  try {
+    const sandboxId = "sbx-route-finalizer-clear-unavailable";
+    const lifecycleAttemptId = "attempt-route-finalizer-clear-unavailable";
+    const handle = new FakeSandboxHandle(sandboxId, h.controller.events);
+    h.controller.handlesByIds.set(sandboxId, handle);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = null;
+    });
+    const retained = retainedGatewayReplacementState({
+      sandboxId,
+      lifecycleAttemptId,
+      replacementSessionId: handle.currentSessionId,
+    });
+    const store = h.getStore();
+    await store.setValue(hostSuspensionOperationKey(), retained);
+    const deleteValue = store.deleteValue.bind(store);
+    let clearAttempts = 0;
+    store.deleteValue = async (key) => {
+      if (key === hostSuspensionOperationKey()) {
+        clearAttempts += 1;
+        throw new Error("injected Redis DEL failure before execution");
+      }
+      await deleteValue(key);
+    };
+
+    try {
+      const result = await callAdminPost(
+        adminEnsureRoute.POST,
+        "/api/admin/ensure",
+      );
+
+      assert.equal(result.status, 503);
+      assert.equal(
+        (result.json as { error?: unknown }).error,
+        "HOST_INGRESS_FENCED",
+      );
+      assert.equal(clearAttempts, 2);
+      assert.deepEqual(
+        await store.getValue(hostSuspensionOperationKey()),
+        retained,
+      );
+      assert.equal((await h.getMeta()).status, "running");
+    } finally {
+      store.deleteValue = deleteValue;
+    }
+  } finally {
+    h.teardown();
+  }
+});
+
+test("Admin: POST /api/admin/ensure rejects a fence phase change after auth", async () => {
+  const h = createScenarioHarness();
+  try {
+    const sandboxId = "sbx-route-auth-phase-change";
+    const lifecycleAttemptId = "attempt-route-auth-phase-change";
+    const handle = new FakeSandboxHandle(sandboxId, h.controller.events);
+    h.controller.handlesByIds.set(sandboxId, handle);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = null;
+    });
+    const replacement = retainedGatewayReplacementState({
+      sandboxId,
+      lifecycleAttemptId,
+      replacementSessionId: handle.currentSessionId,
+    });
+    const advanced = stoppingHostSuspensionState(replacement);
+    const store = h.getStore();
+    await store.setValue(hostSuspensionOperationKey(), replacement);
+    const getValueState = store.getValueState.bind(store);
+    let suspensionReads = 0;
+    store.getValueState = async <T>(key: string) => {
+      const state = await getValueState<T>(key);
+      if (key === hostSuspensionOperationKey() && suspensionReads++ === 0) {
+        await store.setValue(hostSuspensionOperationKey(), advanced);
+      }
+      return state;
+    };
+
+    try {
+      const result = await callAdminPost(
+        adminEnsureRoute.POST,
+        "/api/admin/ensure",
+      );
+
+      assert.equal(result.status, 503);
+      assert.equal(
+        (result.json as { error?: unknown }).error,
+        "HOST_INGRESS_FENCED",
+      );
+      assert.deepEqual(
+        await store.getValue(hostSuspensionOperationKey()),
+        advanced,
+      );
+      assert.equal(handle.commands.length, 0);
+      assert.equal(handle.writtenFiles.length, 0);
+    } finally {
+      store.getValueState = getValueState;
+    }
   } finally {
     h.teardown();
   }

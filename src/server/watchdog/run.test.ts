@@ -125,6 +125,7 @@ function makeDeps(overrides: Partial<WatchdogDeps> = {}): WatchdogDeps {
       reason: "meta-ttl-sufficient",
       credential: { token: "redacted", source: "oidc", expiresAt: 1778250156 },
     }),
+    reconcileFirewallPolicy: async () => null,
     runRestoreOracle: async () => oracleResult({
       executed: false,
       blockedReason: "already-ready",
@@ -468,6 +469,46 @@ test("watchdog reports token refresh failure", async () => {
   const check = findCheck(report, "token.refresh");
   assert.equal(check?.status, "fail");
   assert.equal(check?.data?.retryAfterMs, 30_000);
+});
+
+test("watchdog reports a blocked token refresh as a failure", async () => {
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      refreshGatewayToken: async () => ({
+        refreshed: false,
+        reason: "circuit-breaker-open",
+        retryAfterMs: 30_000,
+      }),
+    }),
+  );
+
+  assert.equal(report.status, "failed");
+  assert.equal(
+    report.lastError,
+    "AI Gateway token refresh failed: circuit-breaker-open",
+  );
+  assert.equal(findCheck(report, "token.refresh")?.status, "fail");
+});
+
+test("watchdog repairs an interrupted firewall policy revision", async () => {
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      reconcileFirewallPolicy: async () => ({
+        timestamp: 100,
+        durationMs: 25,
+        allowlistCount: 1,
+        policyHash: "a".repeat(64),
+        applied: true,
+        reason: "policy-applied",
+      }),
+    }),
+  );
+
+  assert.equal(report.status, "repairing");
+  assert.equal(report.triggeredRepair, true);
+  assert.equal(findCheck(report, "firewall.policy")?.status, "pass");
 });
 
 test("watchdog reports fail-closed generation after token refresh", async () => {

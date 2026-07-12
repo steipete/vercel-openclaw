@@ -106,6 +106,22 @@ type WorkflowRunLossEvidence = {
   status: "pending" | "running" | "lost";
 } | null;
 
+function workflowRunLossEvidence(
+  runId: string,
+  status: CronWorkflowRunStatus,
+): NonNullable<WorkflowRunLossEvidence> {
+  return {
+    runId,
+    status:
+      status === "missing" ||
+        status === "completed" ||
+        status === "failed" ||
+        status === "cancelled"
+        ? "lost"
+        : status,
+  };
+}
+
 function resolveCronWakeAtMs(runAtMs: number, now: number): number {
   return Math.max(now, runAtMs - CRON_PREWAKE_MAX_LEAD_MS);
 }
@@ -198,6 +214,63 @@ async function rearmStaleDispatch(
   return rearmed;
 }
 
+async function releaseLostExecutionHandoff(
+  record: CronProjectionRecordV1,
+  now: number,
+  executionWorkflowRunId: string,
+): Promise<CronProjectionRecordV1> {
+  if (
+    (record.dispatch.status !== "scheduled" &&
+      record.dispatch.status !== "running") ||
+    record.dispatch.executionWorkflowRunId !== executionWorkflowRunId ||
+    record.dispatch.workflowRunId === executionWorkflowRunId
+  ) {
+    return record;
+  }
+  const dispatchToken = record.dispatch.token;
+  const parentWorkflowRunId = record.dispatch.workflowRunId;
+  const released = await mutateCronProjection((latest) => {
+    if (
+      latest.projectionRevision !== record.projectionRevision ||
+      (latest.dispatch.status !== "scheduled" &&
+        latest.dispatch.status !== "running") ||
+      latest.dispatch.token !== dispatchToken ||
+      latest.dispatch.workflowRunId !== parentWorkflowRunId ||
+      latest.dispatch.executionWorkflowRunId !== executionWorkflowRunId
+    ) {
+      return null;
+    }
+    // The timer parent remains the single recovery owner. Clear only the
+    // definitively terminal child so that parent can token-safely hand off again.
+    latest.dispatch = {
+      status: "scheduled",
+      token: latest.dispatch.token,
+      runAtMs: latest.dispatch.runAtMs,
+      wakeAtMs: latest.dispatch.wakeAtMs,
+      attempt: latest.dispatch.attempt,
+      workflowRunId: latest.dispatch.workflowRunId,
+      executionWorkflowRunId: null,
+      scheduledAtMs: now,
+    };
+    return latest;
+  });
+  const repaired =
+    released?.projectionRevision === record.projectionRevision &&
+    released.dispatch.status === "scheduled" &&
+    released.dispatch.token === dispatchToken &&
+    released.dispatch.workflowRunId === parentWorkflowRunId &&
+    released.dispatch.executionWorkflowRunId === null;
+  if (repaired) {
+    logWarn("cron.projection_execution_workflow_lost", {
+      projectionRevision: record.projectionRevision,
+      workflowRunId: parentWorkflowRunId,
+      executionWorkflowRunId,
+    });
+    return released;
+  }
+  return released ?? record;
+}
+
 async function claimDispatchStart(
   record: CronProjectionRecordV1,
   now: number,
@@ -260,6 +333,7 @@ export async function startCronProjectionDispatch(options: {
     };
   }
   let workflowRunLoss: WorkflowRunLossEvidence = null;
+  let executionWorkflowRunLoss: WorkflowRunLossEvidence = null;
   if (
     (record.dispatch.status === "scheduled" ||
       record.dispatch.status === "running" ||
@@ -269,22 +343,36 @@ export async function startCronProjectionDispatch(options: {
     try {
       const runId = record.dispatch.workflowRunId;
       const runStatus = await options.getWorkflowRunStatus(runId);
-      workflowRunLoss = {
-        runId,
-        status:
-          runStatus === "missing" ||
-          runStatus === "completed" ||
-          runStatus === "failed" ||
-            runStatus === "cancelled"
-            ? "lost"
-            : runStatus,
-      };
+      workflowRunLoss = workflowRunLossEvidence(runId, runStatus);
     } catch {
       workflowRunLoss = null;
     }
   }
+  if (
+    workflowRunLoss !== null &&
+    workflowRunLoss.status !== "lost" &&
+    (record.dispatch.status === "scheduled" ||
+      record.dispatch.status === "running") &&
+    record.dispatch.executionWorkflowRunId !== null &&
+    record.dispatch.executionWorkflowRunId !== record.dispatch.workflowRunId &&
+    options.getWorkflowRunStatus
+  ) {
+    try {
+      const runId = record.dispatch.executionWorkflowRunId;
+      const runStatus = await options.getWorkflowRunStatus(runId);
+      executionWorkflowRunLoss = workflowRunLossEvidence(runId, runStatus);
+    } catch {
+      executionWorkflowRunLoss = null;
+    }
+  }
   if (shouldRearm(record.dispatch, now, workflowRunLoss)) {
     record = await rearmStaleDispatch(record, now, workflowRunLoss);
+  } else if (executionWorkflowRunLoss?.status === "lost") {
+    record = await releaseLostExecutionHandoff(
+      record,
+      now,
+      executionWorkflowRunLoss.runId,
+    );
   }
   if (record.dispatch.status === "none" || record.dispatch.status === "completed") {
     const completedWorkflowRunId =

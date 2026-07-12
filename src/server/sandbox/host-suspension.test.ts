@@ -6,6 +6,11 @@ import { firewallFailClosedReason } from "@/server/firewall/fail-close";
 import type { SandboxHandle } from "@/server/sandbox/controller";
 import {
   HostSuspensionBusyError,
+  adoptHostSuspensionForGatewayReplacement,
+  adoptHostSuspensionGatewayReplacement,
+  beginHostSuspensionGatewayReplacement,
+  canonicalizeStoppedHostSuspensionGatewayReplacement,
+  clearHostSuspensionAfterGatewayReplacement,
   clearHostSuspensionAfterDelete,
   enqueueHostStopOperation,
   getHostIngressFence,
@@ -14,8 +19,12 @@ import {
   markHostSuspensionStopRequesting,
   markHostSuspensionStopped,
   markHostSuspensionStopping,
+  markHostSuspensionGatewayReplacementFailed,
+  markHostSuspensionGatewayReplacementLaunching,
+  markHostSuspensionGatewayReplacementPreparing,
   PLATFORM_STOP_CONFIRMED_REASON,
   prepareHostSuspension,
+  readPersistedHostSuspensionState,
   readHostSuspensionState,
   recordPlatformStoppedHostSuspension,
   renewHostSuspension,
@@ -77,16 +86,236 @@ test("platform stop confirmation advances an exact prepared stop", async () => {
     lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
     reason: "platform-confirmed-during-stop",
   }, h.deps);
-  const stopping = await markHostSuspensionStopping(prepared, h.deps);
-
   const stopped = await recordPlatformStoppedHostSuspension({
-    sandboxId: stopping.sandboxId,
-    lifecycleAttemptId: stopping.lifecycleAttemptId,
+    sandboxId: prepared.sandboxId,
+    lifecycleAttemptId: prepared.lifecycleAttemptId,
   }, h.deps);
 
   assert.equal(stopped.phase, "stopped");
   assert.equal(stopped.suspensionId, "suspension-platform-confirmed");
   assert.equal(stopped.ingressFenced, true);
+});
+
+test("platform stop confirmation turns an unleased pre-stop fence into a synthetic stop", async () => {
+  const h = harness(async <T>() => ({}) as T);
+  await h.deps.write({
+    version: 1,
+    operationId: "operation-preparing",
+    requestId: "operation-preparing",
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    intent: "stop",
+    reason: "sandbox.stop",
+    phase: "preparing",
+    ingressFenced: true,
+    suspensionId: null,
+    leaseExpiresAtMs: null,
+    stopRequestDeadlineAtMs: null,
+    monitorHeartbeatAtMs: null,
+    startedAtMs: 1,
+    updatedAtMs: 1,
+    stoppedAtMs: null,
+    resumedAtMs: null,
+    lastError: null,
+    lastErrorCode: null,
+    lastErrorClass: null,
+  });
+
+  const stopped = await recordPlatformStoppedHostSuspension({
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps);
+
+  assert.equal(stopped.phase, "stopped");
+  assert.equal(stopped.reason, PLATFORM_STOP_CONFIRMED_REASON);
+});
+
+test("platform stop confirmation keeps reset fenced for destructive adoption", async () => {
+  const h = harness(async <T>() => ({
+    status: "ready",
+    suspensionId: "suspension-reset",
+    expiresAtMs: 10_000,
+  }) as T);
+  const prepared = await prepareHostSuspension({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    intent: "reset",
+    reason: "sandbox.reset",
+  }, h.deps);
+
+  const stopping = await recordPlatformStoppedHostSuspension({
+    sandboxId: prepared.sandboxId,
+    lifecycleAttemptId: prepared.lifecycleAttemptId,
+  }, h.deps);
+
+  assert.equal(stopping.intent, "reset");
+  assert.equal(stopping.phase, "stopping");
+  assert.equal(stopping.ingressFenced, true);
+});
+
+test("confirmed Gateway kill becomes a strict replacement owner until commit", async () => {
+  const h = harness(async <T>() => ({}) as T);
+  const stopped = await recordPlatformStoppedHostSuspension({
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps);
+  const replacementAttemptId = "replacement-attempt-1";
+  h.setCurrentGeneration({
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: replacementAttemptId,
+  });
+  const adopted = await adoptHostSuspensionForGatewayReplacement({
+    expected: stopped,
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: replacementAttemptId,
+    allowMissingSandboxId: false,
+  }, h.deps);
+  const replacement = await beginHostSuspensionGatewayReplacement({
+    expected: adopted,
+    sandboxId: adopted.sandboxId,
+    lifecycleAttemptId: replacementAttemptId,
+    sessionId: "sandbox-session-1",
+  }, h.deps);
+
+  assert.equal(replacement.version, 2);
+  assert.equal(replacement.phase, "replacement-starting");
+  assert.equal(replacement.replacementStage, "preparing");
+  assert.equal(replacement.replacementSessionId, "sandbox-session-1");
+  assert.equal((await getHostIngressFence(h.deps))?.phase, "replacement-starting");
+
+  const launching = await markHostSuspensionGatewayReplacementLaunching(
+    replacement,
+    h.deps,
+  );
+  assert.equal(launching.replacementStage, "launching");
+  assert.equal(await clearHostSuspensionAfterGatewayReplacement({
+    expected: launching,
+    sandboxId: launching.sandboxId,
+    lifecycleAttemptId: replacementAttemptId,
+    sessionId: "wrong-session",
+  }, h.deps), false);
+  assert.equal(h.readState()?.phase, "replacement-starting");
+  assert.equal(await clearHostSuspensionAfterGatewayReplacement({
+    expected: launching,
+    sandboxId: launching.sandboxId,
+    lifecycleAttemptId: replacementAttemptId,
+    sessionId: "sandbox-session-1",
+  }, h.deps), true);
+  assert.equal(h.readState(), null);
+});
+
+test("interrupted replacement rekeys exactly and repairs ambiguous launch", async () => {
+  const h = harness(async <T>() => ({}) as T);
+  const stopped = await recordPlatformStoppedHostSuspension({
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps);
+  const firstAttemptId = "replacement-attempt-first";
+  h.setCurrentGeneration({
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: firstAttemptId,
+  });
+  const adopted = await adoptHostSuspensionForGatewayReplacement({
+    expected: stopped,
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: firstAttemptId,
+    allowMissingSandboxId: false,
+  }, h.deps);
+  const replacement = await beginHostSuspensionGatewayReplacement({
+    expected: adopted,
+    sandboxId: adopted.sandboxId,
+    lifecycleAttemptId: firstAttemptId,
+    sessionId: "sandbox-session-stable",
+  }, h.deps);
+  const launching = await markHostSuspensionGatewayReplacementLaunching(
+    replacement,
+    h.deps,
+  );
+  const failed = await markHostSuspensionGatewayReplacementFailed(
+    launching,
+    new Error("lost start response"),
+    h.deps,
+  );
+  assert.equal(failed?.phase, "replacement-failed");
+
+  const retryAttemptId = "replacement-attempt-retry";
+  h.setCurrentGeneration({
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: retryAttemptId,
+  });
+  await assert.rejects(
+    adoptHostSuspensionGatewayReplacement({
+      expected: failed!,
+      sandboxId: stopped.sandboxId,
+      lifecycleAttemptId: retryAttemptId,
+      sessionId: "replacement-session",
+    }, h.deps),
+    (error: unknown) => {
+      assert.equal(
+        (error as { code?: unknown }).code,
+        "HOST_SUSPENSION_REPLACEMENT_ADOPTION_CONFLICT",
+      );
+      return true;
+    },
+  );
+  const retry = await adoptHostSuspensionGatewayReplacement({
+    expected: failed!,
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: retryAttemptId,
+    sessionId: "sandbox-session-stable",
+  }, h.deps);
+  assert.equal(retry.phase, "replacement-starting");
+  assert.equal(retry.replacementStage, "launching");
+  const preparing = await markHostSuspensionGatewayReplacementPreparing(
+    retry,
+    h.deps,
+  );
+  assert.equal(preparing.replacementStage, "preparing");
+  assert.equal(preparing.lifecycleAttemptId, retryAttemptId);
+});
+
+test("SDK-stopped replacement canonicalizes to an ordinary stopped fence", async () => {
+  const h = harness(async <T>() => ({}) as T);
+  const stopped = await recordPlatformStoppedHostSuspension({
+    sandboxId: fakeSandbox().sandboxId,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps);
+  const replacementAttemptId = "replacement-attempt-stopped";
+  h.setCurrentGeneration({
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: replacementAttemptId,
+  });
+  const adopted = await adoptHostSuspensionForGatewayReplacement({
+    expected: stopped,
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: replacementAttemptId,
+    allowMissingSandboxId: false,
+  }, h.deps);
+  const replacement = await beginHostSuspensionGatewayReplacement({
+    expected: adopted,
+    sandboxId: adopted.sandboxId,
+    lifecycleAttemptId: replacementAttemptId,
+    sessionId: "sandbox-session-before-stop",
+  }, h.deps);
+
+  const nextAttemptId = "replacement-attempt-after-stop";
+  h.setCurrentGeneration({
+    sandboxId: stopped.sandboxId,
+    lifecycleAttemptId: nextAttemptId,
+  });
+  const canonical = await canonicalizeStoppedHostSuspensionGatewayReplacement({
+    expected: replacement,
+    sandboxId: stopped.sandboxId,
+    expectedCurrentLifecycleAttemptId: nextAttemptId,
+  }, h.deps);
+
+  assert.equal(canonical.version, 1);
+  assert.equal(canonical.phase, "stopped");
+  assert.equal(canonical.reason, PLATFORM_STOP_CONFIRMED_REASON);
+  assert.equal(canonical.suspensionId, null);
+  assert.equal(canonical.replacementSessionId, null);
+  assert.equal(canonical.replacementStage, null);
+  assert.equal(canonical.lifecycleAttemptId, replacementAttemptId);
 });
 
 function harness(
@@ -914,6 +1143,25 @@ test("invalid durable state fails closed for ingress and mutations", async () =>
   );
 });
 
+test("present but undecodable durable state is not treated as absent", async () => {
+  await assert.rejects(
+    readPersistedHostSuspensionState({
+      getValueState: async () => ({
+        status: "present",
+        value: null,
+        token: "{malformed",
+      }),
+    }),
+    (error: unknown) => {
+      assert.equal(
+        (error as { code?: unknown }).code,
+        "HOST_SUSPENSION_STATE_CORRUPT",
+      );
+      return true;
+    },
+  );
+});
+
 test("durable state validation rejects malformed optional fields and unknown keys", async () => {
   const h = harness(async <T>() => ({
     status: "ready",
@@ -933,6 +1181,26 @@ test("durable state validation rejects malformed optional fields and unknown key
     { ...prepared, lastErrorCode: 503 },
     { ...prepared, unexpected: true },
     { ...prepared, phase: "stop-requesting", stopRequestDeadlineAtMs: null },
+    {
+      ...prepared,
+      version: 1,
+      phase: "replacement-starting",
+      replacementSessionId: "session-1",
+      replacementStage: "preparing",
+    },
+    {
+      ...prepared,
+      version: 2,
+      phase: "replacement-starting",
+      replacementSessionId: null,
+      replacementStage: "preparing",
+    },
+    {
+      ...prepared,
+      version: 2,
+      replacementSessionId: "session-1",
+      replacementStage: "preparing",
+    },
   ];
 
   for (const malformed of malformedStates) {

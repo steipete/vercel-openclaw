@@ -7,7 +7,7 @@ import {
   cronProjectionRouteRuntime,
 } from "@/app/api/internal/cron-projection/route";
 import {
-  CRON_PROJECTION_CAPABILITY,
+  CRON_PROJECTION_V1_CAPABILITY,
 } from "@/server/cron/compatibility";
 import {
   _resetBundleIdentityForTesting,
@@ -33,7 +33,7 @@ const bundleIdentity = {
   forkSha: "a".repeat(40),
   upstreamSha: "b".repeat(40),
   canonicalSha256: "c".repeat(64),
-  capabilities: [CRON_PROJECTION_CAPABILITY],
+  capabilities: [CRON_PROJECTION_V1_CAPABILITY],
   verified: true as const,
 };
 const bundleReleaseUrl =

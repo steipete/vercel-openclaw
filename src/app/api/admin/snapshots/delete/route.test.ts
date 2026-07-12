@@ -11,8 +11,14 @@ import {
 } from "@/app/api/admin/snapshots/delete/route";
 import {
   _resetStoreForTesting,
+  getInitializedMeta,
+  getStore,
   mutateMeta,
 } from "@/server/store/store";
+import {
+  hostSuspensionOperationKey,
+  lifecycleLockKey,
+} from "@/server/store/keyspace";
 import {
   callRoute,
   buildPostRequest,
@@ -172,5 +178,154 @@ test("POST /api/admin/snapshots/delete: removes non-current snapshot from histor
     assert.equal(body.ok, true);
     assert.equal(body.snapshots.length, 1);
     assert.equal(body.snapshots[0].snapshotId, "snap-current");
+  });
+});
+
+test("POST /api/admin/snapshots/delete: rejects a superseded lifecycle generation", async () => {
+  await withTestEnv(async () => {
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-delete-old";
+      meta.lifecycleAttemptId = "attempt-delete-old";
+      meta.snapshotId = "snap-current";
+      meta.snapshotHistory = [
+        {
+          id: "id-current",
+          snapshotId: "snap-current",
+          timestamp: Date.now(),
+          reason: "manual",
+        },
+        {
+          id: "id-old",
+          snapshotId: "snap-old",
+          timestamp: Date.now() - 1_000,
+          reason: "manual",
+        },
+      ];
+    });
+
+    const result = await callRoute(
+      (request) => postAdminSnapshotsDelete(request, {
+        deleteSnapshot: async () => {
+          await mutateMeta((meta) => {
+            meta.sandboxId = "sbx-delete-replacement";
+            meta.lifecycleAttemptId = "attempt-delete-replacement";
+          });
+        },
+      }),
+      buildAuthPostRequest(
+        "/api/admin/snapshots/delete",
+        JSON.stringify({ snapshotId: "snap-old" }),
+      ),
+    );
+
+    assert.equal(result.status, 409);
+    assert.equal(
+      (result.json as { error: string }).error,
+      "SNAPSHOT_DELETE_SUPERSEDED",
+    );
+  });
+});
+
+test("POST /api/admin/snapshots/delete: rejects a fence published while waiting for lifecycle ownership", async () => {
+  await withTestEnv(async () => {
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-delete-fence-race";
+      meta.lifecycleAttemptId = "attempt-delete-fence-race";
+      meta.snapshotId = "snap-current";
+      meta.snapshotHistory = [
+        {
+          id: "id-current",
+          snapshotId: "snap-current",
+          timestamp: Date.now(),
+          reason: "manual",
+        },
+        {
+          id: "id-old",
+          snapshotId: "snap-old",
+          timestamp: Date.now() - 1_000,
+          reason: "manual",
+        },
+      ];
+    });
+
+    const store = getStore();
+    const acquireLock = store.acquireLock.bind(store);
+    let releaseLifecycleWait!: () => void;
+    const lifecycleWait = new Promise<void>((resolve) => {
+      releaseLifecycleWait = resolve;
+    });
+    let signalLifecycleWait!: () => void;
+    const lifecycleAcquireStarted = new Promise<void>((resolve) => {
+      signalLifecycleWait = resolve;
+    });
+    let gateLifecycleAcquire = true;
+    store.acquireLock = async (key, ttlSeconds) => {
+      if (key === lifecycleLockKey() && gateLifecycleAcquire) {
+        gateLifecycleAcquire = false;
+        signalLifecycleWait();
+        await lifecycleWait;
+      }
+      return acquireLock(key, ttlSeconds);
+    };
+
+    let deleteCalls = 0;
+    try {
+      const resultPromise = callRoute(
+        (request) => postAdminSnapshotsDelete(request, {
+          deleteSnapshot: async () => {
+            deleteCalls += 1;
+          },
+        }),
+        buildAuthPostRequest(
+          "/api/admin/snapshots/delete",
+          JSON.stringify({ snapshotId: "snap-old" }),
+        ),
+      );
+      await lifecycleAcquireStarted;
+
+      const now = Date.now();
+      await store.setValue(hostSuspensionOperationKey(), {
+        version: 1,
+        operationId: "operation-delete-fence-race",
+        requestId: "request-delete-fence-race",
+        sandboxId: "sbx-delete-fence-race",
+        lifecycleAttemptId: "attempt-delete-fence-race",
+        intent: "stop",
+        reason: "test-stop-won-race",
+        phase: "stopping",
+        ingressFenced: true,
+        suspensionId: "suspension-delete-fence-race",
+        leaseExpiresAtMs: now + 60_000,
+        stopRequestDeadlineAtMs: null,
+        monitorHeartbeatAtMs: now,
+        startedAtMs: now - 1_000,
+        updatedAtMs: now,
+        stoppedAtMs: null,
+        resumedAtMs: null,
+        lastError: null,
+        lastErrorCode: null,
+        lastErrorClass: null,
+      });
+      releaseLifecycleWait();
+
+      const result = await resultPromise;
+      assert.equal(result.status, 503);
+      assert.equal(
+        (result.json as { error: string }).error,
+        "HOST_INGRESS_FENCED",
+      );
+      assert.equal(deleteCalls, 0);
+      assert.deepEqual(
+        (await getInitializedMeta()).snapshotHistory.map(
+          (snapshot) => snapshot.snapshotId,
+        ),
+        ["snap-current", "snap-old"],
+      );
+    } finally {
+      releaseLifecycleWait();
+      store.acquireLock = acquireLock;
+    }
   });
 });

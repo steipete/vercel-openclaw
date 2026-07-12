@@ -112,7 +112,7 @@ function makeStatus(): StatusPayload {
         currentEndpointUrl: null,
         endpointDrift: false,
         canRepairEndpoint: false,
-        nextSafeAction: "paste-token",
+        nextSafeAction: "use-local-openclaw",
         applicationId: null,
         publicKey: null,
         configuredAt: null,
@@ -210,15 +210,16 @@ test("ChannelsPanel only offers connect actions for hosted delivery channels", (
 
   assert.ok(html.includes("Connect Slack"), "Slack shows connect title");
   assert.ok(html.includes("Connect Telegram"), "Telegram shows connect title");
-  assert.ok(html.includes("Connect Discord"), "Discord shows connect title");
+  assert.ok(html.includes("Discord (not supported)"), "Discord shows unsupported title");
+  assert.ok(!html.includes("Connect Discord"), "Discord does not offer hosted setup");
   assert.ok(html.includes("WhatsApp (unavailable)"), "WhatsApp shows unavailable title");
   assert.ok(!html.includes("Connect WhatsApp"), "WhatsApp does not offer hosted setup");
 
   const connectButtons = html.match(/>Connect<\/button>/g) ?? [];
   assert.equal(
     connectButtons.length,
-    3,
-    `expected exactly 3 Connect buttons, found ${connectButtons.length}`,
+    2,
+    `expected exactly 2 Connect buttons, found ${connectButtons.length}`,
   );
 
   // Legacy "Save Credentials" label must not appear anywhere

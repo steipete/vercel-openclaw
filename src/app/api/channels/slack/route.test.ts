@@ -6,9 +6,16 @@ import {
   buildChannelConnectBlockedResponse,
 } from "@/server/channels/connectability";
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
+import {
+  getSlackAppConfig,
+  setSlackAppConfig,
+} from "@/server/channels/slack/app-config";
+import { setSlackChannelConfig } from "@/server/channels/state";
+import { getInitializedMeta } from "@/server/store/store";
 import { withHarness } from "@/test-utils/harness";
 import {
   buildAuthPutRequest,
+  buildAuthDeleteRequest,
   callRoute,
   getSlackChannelRoute,
 } from "@/test-utils/route-caller";
@@ -93,5 +100,34 @@ test("slack PUT through route factory returns 409 when not connectable", async (
     assert.equal(body.error.code, "CHANNEL_CONNECT_BLOCKED");
     assert.equal(body.connectability.channel, "slack");
     assert.equal(body.connectability.canConnect, false);
+  });
+});
+
+test("slack DELETE removes app credentials after disconnect applies", async () => {
+  await withHarness(async () => {
+    await setSlackChannelConfig({
+      signingSecret: "signing-secret",
+      botToken: "xoxb-connected",
+      configuredAt: 1,
+    });
+    await setSlackAppConfig({
+      appId: "A123",
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      signingSecret: "app-signing-secret",
+      configToken: "config-token",
+      refreshToken: "refresh-token",
+      createdAt: 1,
+    });
+
+    const route = getSlackChannelRoute();
+    const result = await callRoute(
+      route.DELETE!,
+      buildAuthDeleteRequest("/api/channels/slack", "{}"),
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal((await getInitializedMeta()).channels.slack, null);
+    assert.equal(await getSlackAppConfig(), null);
   });
 });

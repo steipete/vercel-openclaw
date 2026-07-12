@@ -11,16 +11,6 @@ import { getStore } from "@/server/store/store";
  */
 export const CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS = 30;
 
-/**
- * TTL for Slack's secondary user-message dedup lock, keyed on
- * channel+ts instead of event_id. This one guards against Slack's
- * dual-event delivery (app_mention + message.channels emitted for the
- * same user post with distinct event_ids). Kept at 24 hours because
- * the collapse window for that dual delivery is practically the full
- * conversation day, not the platform retry SLA.
- */
-export const SLACK_USER_MESSAGE_DEDUP_LOCK_TTL_SECONDS = 24 * 60 * 60;
-
 export type ChannelDedupLock = {
   key: string;
   token: string;

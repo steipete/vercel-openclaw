@@ -246,7 +246,7 @@ export function SlackPanel({
     const ok = await confirm({
       title: "Disconnect Slack?",
       description:
-        "This will remove the Slack credentials and stop processing messages from this workspace.",
+        "This removes the connected bot and stored Slack app credentials after the live config change is applied. It does not delete the app from Slack.",
       confirmLabel: "Disconnect",
       variant: "danger",
     });
@@ -369,7 +369,7 @@ export function SlackPanel({
           placeholder="xoxe.xoxp-..."
           shown={showConfigToken}
           onToggleShown={() => setShowConfigToken((v) => !v)}
-          help="Used once to call apps.manifest.create. Not stored."
+          help="Stored with the Slack app credentials until you disconnect Slack."
         />
         <ChannelSecretField
           label="Refresh Token (optional)"
@@ -378,7 +378,7 @@ export function SlackPanel({
           placeholder="xoxe-1-..."
           shown={showRefreshToken}
           onToggleShown={() => setShowRefreshToken((v) => !v)}
-          help="Lets us auto-rotate the config token if it's expired."
+          help="Stored until disconnect so an expired config token can be rotated."
         />
         <div className="stack">
           <span className="field-label">App name (optional)</span>

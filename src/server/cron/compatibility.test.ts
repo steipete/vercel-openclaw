@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  CRON_PROJECTION_CAPABILITY,
+  CRON_PROJECTION_V1_CAPABILITY,
+  CRON_PROJECTION_V2_CAPABILITY,
+  getCronProjectionBaselineMode,
   supportsCronProjectionBundleIdentity,
   type CronProjectionBundleIdentity,
 } from "@/server/cron/compatibility";
@@ -13,7 +15,7 @@ const identity: CronProjectionBundleIdentity = {
   forkSha: "a".repeat(40),
   upstreamSha: "b".repeat(40),
   canonicalSha256: "c".repeat(64),
-  capabilities: [CRON_PROJECTION_CAPABILITY],
+  capabilities: [CRON_PROJECTION_V1_CAPABILITY],
   verified: true,
 };
 
@@ -54,5 +56,31 @@ test("cron projection requires an exact verified capable bundle identity", () =>
       identity.packageSpec,
     ),
     false,
+  );
+});
+
+test("cron projection selects one baseline contract by capability", () => {
+  assert.equal(
+    getCronProjectionBaselineMode([CRON_PROJECTION_V1_CAPABILITY]),
+    "gateway-start",
+  );
+  assert.equal(
+    getCronProjectionBaselineMode([CRON_PROJECTION_V2_CAPABILITY]),
+    "cron-reconciled",
+  );
+  assert.equal(
+    getCronProjectionBaselineMode([
+      CRON_PROJECTION_V1_CAPABILITY,
+      CRON_PROJECTION_V2_CAPABILITY,
+    ]),
+    "cron-reconciled",
+  );
+  assert.equal(getCronProjectionBaselineMode([]), null);
+  assert.equal(
+    supportsCronProjectionBundleIdentity({
+      ...identity,
+      capabilities: [CRON_PROJECTION_V2_CAPABILITY],
+    }),
+    true,
   );
 });

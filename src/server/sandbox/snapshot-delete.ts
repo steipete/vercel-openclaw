@@ -7,11 +7,18 @@ type SnapshotValidationOverride = (
 ) => Promise<{ status: "created" | "deleted" | "failed"; expiresAt?: Date }>;
 
 let snapshotValidationOverride: SnapshotValidationOverride | null = null;
+let snapshotDeletionOverride: ((snapshotId: string) => Promise<void>) | null = null;
 
 export function _setSnapshotValidationOverrideForTesting(
   override: SnapshotValidationOverride | null,
 ): void {
   snapshotValidationOverride = override;
+}
+
+export function _setSnapshotDeletionOverrideForTesting(
+  override: ((snapshotId: string) => Promise<void>) | null,
+): void {
+  snapshotDeletionOverride = override;
 }
 
 export async function assertVercelSnapshotReady(
@@ -64,6 +71,10 @@ function assertSnapshotReady(
 }
 
 export async function deleteVercelSnapshot(snapshotId: string): Promise<void> {
+  if (snapshotDeletionOverride) {
+    await snapshotDeletionOverride(snapshotId);
+    return;
+  }
   const { Snapshot } = await import("@vercel/sandbox");
   const snap = await Snapshot.get({ snapshotId });
   await snap.delete();

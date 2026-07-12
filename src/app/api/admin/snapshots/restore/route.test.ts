@@ -112,7 +112,7 @@ test("admin/snapshots/restore POST: restores known snapshot", async () => {
   });
 });
 
-test("admin/snapshots/restore POST: restores snapshot from history", async () => {
+test("admin/snapshots/restore POST: rejects historical snapshots without mutating", async () => {
   await withHarness(async (h) => {
     await h.mutateMeta((meta) => {
       meta.status = "stopped";
@@ -134,14 +134,18 @@ test("admin/snapshots/restore POST: restores snapshot from history", async () =>
       JSON.stringify({ snapshotId: "snap-from-history" }),
     );
 
-    assert.ok(result.status === 200 || result.status === 202);
-    const body = result.json as { snapshotId: string; state: string };
-    assert.equal(body.snapshotId, "snap-from-history");
-    await drainAfterCallbacks();
+    assert.equal(result.status, 409);
+    assert.equal(
+      (result.json as { error: string }).error,
+      "HISTORICAL_SNAPSHOT_RESTORE_UNSUPPORTED",
+    );
+    const after = await h.getMeta();
+    assert.equal(after.snapshotId, "snap-current");
+    assert.equal(after.status, "stopped");
   });
 });
 
-test("admin/snapshots/restore POST: retires a running generation before selecting history", async () => {
+test("admin/snapshots/restore POST: preserves a running generation for historical requests", async () => {
   await withHarness(async (h) => {
     await h.driveToRunning();
     const running = await h.getMeta();
@@ -168,19 +172,19 @@ test("admin/snapshots/restore POST: retires a running generation before selectin
       JSON.stringify({ snapshotId: "snap-old" }),
     );
 
-    assert.ok(result.status === 200 || result.status === 202);
+    assert.equal(result.status, 409);
     assert.equal(
       runningHandle.deleteCalled,
-      true,
-      "the previous Gateway must be retired before the restore is scheduled",
+      false,
+      "unsupported restore must not delete the snapshot-owning sandbox",
     );
-    const prepared = await h.getMeta();
-    assert.notEqual(prepared.sandboxId, running.sandboxId);
-    await drainAfterCallbacks();
+    const after = await h.getMeta();
+    assert.equal(after.sandboxId, running.sandboxId);
+    assert.equal(after.snapshotId, "snap-current");
   });
 });
 
-test("admin/snapshots/restore POST: retires an orphaned named sandbox", async () => {
+test("admin/snapshots/restore POST: preserves an orphaned named sandbox for historical requests", async () => {
   await withHarness(async (h) => {
     await h.driveToRunning();
     const running = await h.getMeta();
@@ -209,14 +213,13 @@ test("admin/snapshots/restore POST: retires an orphaned named sandbox", async ()
       JSON.stringify({ snapshotId: "snap-orphaned-restore" }),
     );
 
-    assert.ok(result.status === 200 || result.status === 202);
-    assert.equal(runningHandle.deleteCalled, true);
-    assert.equal((await h.getMeta()).snapshotId, "snap-orphaned-restore");
-    await drainAfterCallbacks();
+    assert.equal(result.status, 409);
+    assert.equal(runningHandle.deleteCalled, false);
+    assert.equal((await h.getMeta()).snapshotId, "snap-current");
   });
 });
 
-test("admin/snapshots/restore POST: validates provider snapshot before retiring running state", async () => {
+test("admin/snapshots/restore POST: fails closed before provider access", async () => {
   await withHarness(async (h) => {
     await h.driveToRunning();
     const running = await h.getMeta();
@@ -233,10 +236,11 @@ test("admin/snapshots/restore POST: validates provider snapshot before retiring 
         },
       ];
     });
-    _setSnapshotValidationOverrideForTesting(async () => ({
-      status: "created",
-      expiresAt: new Date(Date.now() - 1),
-    }));
+    let providerReads = 0;
+    _setSnapshotValidationOverrideForTesting(async () => {
+      providerReads += 1;
+      throw new Error("provider must not be called");
+    });
 
     try {
       const result = await callAdminPost(
@@ -244,8 +248,12 @@ test("admin/snapshots/restore POST: validates provider snapshot before retiring 
         "/api/admin/snapshots/restore",
         JSON.stringify({ snapshotId: "snap-expired" }),
       );
-      assert.equal(result.status, 410);
-      assert.equal((result.json as { error: string }).error, "SNAPSHOT_EXPIRED");
+      assert.equal(result.status, 409);
+      assert.equal(
+        (result.json as { error: string }).error,
+        "HISTORICAL_SNAPSHOT_RESTORE_UNSUPPORTED",
+      );
+      assert.equal(providerReads, 0);
       assert.equal(runningHandle.deleteCalled, false);
       assert.equal((await h.getMeta()).sandboxId, running.sandboxId);
     } finally {

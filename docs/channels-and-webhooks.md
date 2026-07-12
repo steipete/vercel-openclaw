@@ -107,9 +107,9 @@ Slack delivery URLs may include the protection bypass parameter (`x-vercel-prote
 When a Slack message arrives at the webhook:
 
 1. The route validates the Slack signature.
-2. If the sandbox is running, the message is forwarded directly to the OpenClaw gateway's `/slack/events` endpoint on port 3000 inside the sandbox (the fast path).
-3. If the sandbox is stopped, the route may send a boot message, then starts a durable Workflow that resumes the sandbox and forwards the original payload to the OpenClaw gateway's `/slack/events` handler.
-4. Slack uses threaded replies for responses.
+2. The route durably hands the event to Vercel Workflow. Production does not dispatch directly from the request because native admission and Workflow ownership are not atomic.
+3. The Workflow reuses the running sandbox or resumes it, then forwards the original signed payload to OpenClaw's `/slack/events` handler on port 3000.
+4. A stopped sandbox may get one Workflow-owned wake placeholder. Native acceptance transfers that placeholder to cleanup-only ownership; Slack uses threaded replies for responses.
 
 ## Telegram
 
@@ -126,9 +126,9 @@ Telegram validates webhooks via the `x-telegram-bot-api-secret-token` header. Re
 When a Telegram update arrives at the webhook:
 
 1. The route validates the webhook secret header.
-2. If the sandbox is running, the raw update is forwarded to OpenClaw's native Telegram handler on port 8787 inside the sandbox (the fast path). This preserves full native Telegram features — slash commands, media, inline keyboards, etc.
-3. OpenClaw confirms durable native acceptance with `x-openclaw-delivery-accepted: durable`. The wrapper trusts that marker only when the installed, manifest-verified bundle identity declares `telegram-durable-ack-v1`. A missing identity, missing capability, or unmarked `2xx` is recorded as `visibility-unknown` and is not blindly replayed.
-4. If the sandbox is stopped, the route sends a boot message to the user, then starts a durable Workflow that resumes the sandbox, forwards the raw update to the native Telegram handler, and lets that handler own the reply behavior.
+2. The route durably hands the update to Vercel Workflow. The Workflow forwards the raw update to OpenClaw's native Telegram handler on port 8787, preserving slash commands, media, inline keyboards, and other native behavior.
+3. OpenClaw confirms durable native acceptance with `x-openclaw-delivery-accepted: durable`. The wrapper trusts that marker only when the installed, manifest-verified bundle identity declares `telegram-durable-ack-v1`. A missing identity, missing capability, unmarked `2xx`, or generic `5xx` is recorded as `visibility-unknown` and is not blindly replayed; even a direct-local `5xx` can occur after the spool commit.
+4. If the sandbox is stopped, the Workflow resumes it before forwarding. The wrapper does not create a new Telegram wake placeholder because Bot API sends have no idempotency key; an ambiguous send could otherwise orphan or duplicate the notice.
 5. A suspension-admission `503` with OpenClaw code `gateway_unavailable` is treated as a pre-admission rejection only when the verified bundle declares `gateway-suspend-v1`; otherwise the outcome remains unknown and is not replayed.
 
 ## WhatsApp
@@ -145,33 +145,23 @@ Use local/upstream OpenClaw for Discord. The hosted DELETE route exists only to 
 
 ## Protected deployments
 
-Supported webhook channels (Slack, Telegram, and Discord) use bypass-capable delivery URLs on protected deployments when `VERCEL_AUTOMATION_BYPASS_SECRET` is configured. The app auto-detects active Deployment Protection at runtime and hard-blocks channel connections when protection is on but bypass is not configured.
+Supported webhook channels (Slack and Telegram) use bypass-capable delivery URLs on protected deployments when `VERCEL_AUTOMATION_BYPASS_SECRET` is configured. The app auto-detects active Deployment Protection at runtime and hard-blocks channel connections when protection is on but bypass is not configured.
 
 Admin-visible URLs — in the admin panel, preflight payload, status responses, and docs examples — must stay display-safe and never expose the bypass secret. The app enforces this by using `buildPublicDisplayUrl()` for all operator-visible surfaces and reserving `buildPublicUrl()` for outbound delivery only.
 
-## What happens when the sandbox is already running
+## Durable delivery for running and stopped sandboxes
 
-When the sandbox is running and a channel message arrives, Slack and Telegram take a fast path:
+Slack and Telegram production ingress always starts the shared Vercel Workflow path. A running sandbox makes the readiness phase short, but it does not bypass durable handoff. The direct native dispatch code is test-only until the host has an atomic queued-owner and native-idempotency contract.
 
-- **Slack** forwards the validated payload directly to `/slack/events` on the gateway (port 3000).
-- **Telegram** forwards the raw update directly to the native Telegram handler (port 8787).
-
-The wrapper treats `gateway_unavailable` as a definite pre-admission rejection only when the verified bundle declares `gateway-suspend-v1`; an unverified response remains delivery-unknown and is not replayed.
-
-No Workflow is started. No boot message is sent. The response comes back as quickly as the gateway can process it.
-
-## What happens when the sandbox is stopped
-
-When the sandbox is stopped and a channel message arrives, the webhook route starts a shared durable delivery path powered by Vercel Workflow:
-
-1. Slack and Telegram may send a short boot message so the user gets immediate feedback.
-2. The Workflow resumes or creates the sandbox and waits for the relevant handler to become reachable.
+1. Slack may create one Workflow-owned wake placeholder when the sandbox is cold. Telegram deliberately does not create a new placeholder because Bot API sends cannot be made idempotent.
+2. The Workflow reuses, resumes, or creates the sandbox and waits for the relevant handler to become reachable.
 3. The original webhook payload is forwarded to OpenClaw's native channel handler:
    - Slack: `/slack/events` on port 3000.
    - Telegram: `/telegram-webhook` on port 8787.
-   - Discord: `/discord-webhook` on port 3000.
 4. The native handler owns channel-specific processing and reply behavior.
 5. Native acceptance does not prove a visible reply. The wake placeholder is cleared after native acceptance, while reply visibility remains a separate summary signal. Terminal failure or uncertain acceptance updates the notice instead.
+
+The wrapper treats `gateway_unavailable` as a definite pre-admission rejection only when the verified bundle declares `gateway-suspend-v1`; an unverified response remains delivery-unknown and is not replayed.
 
 The Workflow-based path is a native-forward wake path, not a generic `POST /v1/chat/completions` fallback.
 
@@ -189,7 +179,7 @@ This means config looks good, but the current deployment has not yet proven the 
 
 ### Channel webhooks fail on a protected deployment
 
-Channel webhooks are hitting Vercel's Deployment Protection. Enable Protection Bypass for Automation in your Vercel project settings and set `VERCEL_AUTOMATION_BYPASS_SECRET`. Supported hosted channels (Slack, Telegram, Discord) include the bypass parameter in their delivery URLs when configured. The app detects active protection at runtime — if the admin panel shows a "Deployment Protection is blocking webhook delivery" banner, follow the instructions there.
+Channel webhooks are hitting Vercel's Deployment Protection. Enable Protection Bypass for Automation in your Vercel project settings and set `VERCEL_AUTOMATION_BYPASS_SECRET`. Supported hosted channels (Slack and Telegram) include the bypass parameter in their delivery URLs when configured. The app detects active protection at runtime — if the admin panel shows a "Deployment Protection is blocking webhook delivery" banner, follow the instructions there.
 
 ### Launch verification phases look mostly healthy but overall result is false
 

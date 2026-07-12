@@ -329,10 +329,131 @@ test("stopSandbox transitions to snapshotting and preserves sandboxId", async ()
     // Verify the fake was called with blocking:false
     assert.equal(fake.retrieved.length, 1);
     assert.equal(fake.retrieved[0], "sbx-running-1");
+    assert.deepEqual(fake.getCalls[0], {
+      sandboxId: "sbx-running-1",
+      resume: false,
+    });
     const handle = fake.getHandle("sbx-running-1");
     assert.ok(handle, "handle should exist");
     assert.equal(handle.stopCalled, true);
     assert.equal(handle.lastStopOptions?.blocking, false);
+  });
+});
+
+test("stopSandbox observes and records a platform-stopped sandbox without waking it", async () => {
+  const fake = new FakeSandboxController();
+  const sandboxId = "sbx-platform-stopped-before-stop";
+  const handle = new FakeSandboxHandle(sandboxId, fake.events);
+  handle.setStatus("stopped");
+  fake.handlesByIds.set(sandboxId, handle);
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.portUrls = { "3000": `https://${sandboxId}.example` };
+    });
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume !== false) handle.setStatus("running");
+      return result;
+    };
+
+    const result = await stopSandbox();
+
+    assert.deepEqual(fake.getCalls, [{ sandboxId, resume: false }]);
+    assert.equal(result.status, "stopped");
+    assert.equal(result.sandboxId, sandboxId);
+    assert.equal(result.portUrls, null);
+    assert.equal(handle.status, "stopped");
+    assert.equal(handle.stopCalled, false);
+    const suspension = await readHostSuspensionState();
+    assert.equal(suspension?.phase, "stopped");
+    assert.equal(suspension?.reason, PLATFORM_STOP_CONFIRMED_REASON);
+  });
+});
+
+test("stopSandbox normalizes and re-arms a stopped reset fence", async () => {
+  const fake = new FakeSandboxController();
+  const sandboxId = "sbx-platform-stopped-reset";
+  const lifecycleAttemptId = "reset-platform-stopped-attempt";
+  const handle = new FakeSandboxHandle(sandboxId, fake.events);
+  handle.setStatus("stopped");
+  fake.handlesByIds.set(sandboxId, handle);
+  const terminalMonitorHeartbeatAtMs = Date.now();
+  const startedOperations: string[] = [];
+  const starter = (async (...input: unknown[]) => {
+    const args = input[1] as unknown[];
+    startedOperations.push(args[0] as string);
+    return { runId: "reset-monitor-rearmed" } as never;
+  }) as NonNullable<Parameters<
+    typeof _setHostStopWorkflowStarterForTesting
+  >[0]>;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        operationId: "reset-platform-stopped-operation",
+        requestId: "reset-platform-stopped-operation",
+        lifecycleAttemptId,
+        intent: "reset",
+        reason: "sandbox.reset",
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        monitorHeartbeatAtMs: terminalMonitorHeartbeatAtMs,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    _setHostStopWorkflowStarterForTesting(starter);
+
+    try {
+      const result = await stopSandbox();
+
+      assert.equal(result.status, "running");
+      assert.equal(result.sandboxId, sandboxId);
+      assert.equal(handle.stopCalled, false);
+      assert.deepEqual(startedOperations, ["reset-platform-stopped-operation"]);
+      const suspension = await readHostSuspensionState();
+      assert.equal(suspension?.intent, "reset");
+      assert.equal(suspension?.phase, "stopping");
+      assert.equal(suspension?.operationId, "reset-platform-stopped-operation");
+      assert.ok(suspension?.monitorHeartbeatAtMs);
+      assert.ok(
+        suspension.monitorHeartbeatAtMs >= terminalMonitorHeartbeatAtMs,
+      );
+    } finally {
+      _setHostStopWorkflowStarterForTesting(null);
+    }
+  });
+});
+
+test("stopSandbox records a failed terminal sandbox without issuing stop work", async () => {
+  const fake = new FakeSandboxController();
+  const sandboxId = "sbx-failed-before-stop";
+  const handle = new FakeSandboxHandle(sandboxId, fake.events);
+  handle.setStatus("failed");
+  fake.handlesByIds.set(sandboxId, handle);
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+    });
+
+    const result = await stopSandbox();
+
+    assert.deepEqual(fake.getCalls, [{ sandboxId, resume: false }]);
+    assert.equal(result.status, "error");
+    assert.equal(result.lastError, "sandbox failed");
+    assert.equal(handle.stopCalled, false);
+    assert.equal(await readHostSuspensionState(), null);
   });
 });
 
@@ -1327,6 +1448,25 @@ function configureBundleLifecycleTest(): void {
   _setBundleAdmissionForTesting(BUNDLE_ADMISSION);
 }
 
+function respondWithVerifiedBundleIdentity(handle: FakeSandboxHandle): void {
+  handle.responders.push((cmd, args) => {
+    if (
+      cmd === "bash"
+      && args?.[0] === "-c"
+      && args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH)
+    ) {
+      return {
+        exitCode: 0,
+        output: async (stream?: "stdout" | "stderr" | "both") => {
+          if (stream === "stderr") return "";
+          return `${JSON.stringify(BUNDLE_ADMISSION.identity)}\n`;
+        },
+      };
+    }
+    return undefined;
+  });
+}
+
 async function runScheduledEnsure(reason: string): Promise<void> {
   let scheduled: (() => Promise<void> | void) | null = null;
   await ensureSandboxRunning({
@@ -1377,6 +1517,34 @@ function preRegisterResumeHandle(fake: FakeSandboxController): FakeSandboxHandle
   return handle;
 }
 
+async function preRegisterFencedStoppedResumeHandle(
+  fake: FakeSandboxController,
+): Promise<FakeSandboxHandle> {
+  const handle = preRegisterResumeHandle(fake);
+  handle.setStatus("stopped");
+  if (!await readHostSuspensionState()) {
+    const meta = await getInitializedMeta();
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: meta.lifecycleAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+  }
+  const originalGet = fake.get.bind(fake);
+  fake.get = async (input) => {
+    const result = await originalGet(input);
+    if (input.resume === true && result === handle) {
+      handle.setStatus("running");
+    }
+    return result;
+  };
+  return handle;
+}
+
 /**
  * Helper: exercises the persistent-resume restore path via
  * `ensureSandboxRunning` with a stopped+snapshotId meta, captures the
@@ -1392,7 +1560,7 @@ async function triggerRestore(
   _setAiGatewayTokenOverrideForTesting(opts?.tokenOverride ?? undefined);
 
   // Pre-register a "resumed" persistent sandbox handle so get() finds it.
-  const resumeHandle = preRegisterResumeHandle(fake);
+  const resumeHandle = await preRegisterFencedStoppedResumeHandle(fake);
 
   try {
     let scheduledCallback: (() => Promise<void> | void) | null = null;
@@ -1417,6 +1585,20 @@ async function triggerRestore(
   } finally {
     _setAiGatewayTokenOverrideForTesting(null);
   }
+}
+
+async function writePreFenceStoppedMeta(input?: {
+  lifecycleAttemptId?: string | null;
+}): Promise<void> {
+  const legacy = structuredClone(await getInitializedMeta());
+  legacy._schemaVersion = 3;
+  legacy.status = "stopped";
+  legacy.sandboxId = LIFECYCLE_SANDBOX_NAME;
+  legacy.snapshotId = "snap-legacy-stopped";
+  legacy.gatewayToken = "test-gw-token";
+  legacy.lifecycleAttemptId = input?.lifecycleAttemptId ?? null;
+  delete (legacy as Partial<SingleMeta>).legacyStoppedFenceMigration;
+  await getStore().setMeta(legacy);
 }
 
 test("persistent resume requests explicit SDK resume", async () => {
@@ -1458,7 +1640,269 @@ test("persistent resume requests explicit SDK resume", async () => {
   });
 });
 
-test("persistent resume backfills a fence without restoring an older snapshot", async () => {
+test("persistent resume migrates an exact pre-fence stopped generation once", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  await withTestEnv(fake, async () => {
+    const sourceLifecycleAttemptId = "legacy-stopped-attempt";
+    await writePreFenceStoppedMeta({ lifecycleAttemptId: sourceLifecycleAttemptId });
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("legacy-stopped-fence-migration");
+
+      assert.deepEqual(fake.getCalls.slice(0, 2), [
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: true },
+      ]);
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.deepEqual(meta.legacyStoppedFenceMigration, {
+        version: 1,
+        state: "complete",
+        sandboxId: LIFECYCLE_SANDBOX_NAME,
+        sourceLifecycleAttemptId,
+        targetLifecycleAttemptId: meta.lifecycleAttemptId,
+      });
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent resume completes an interrupted legacy fence claim idempotently", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  await withTestEnv(fake, async () => {
+    const sourceLifecycleAttemptId = "legacy-claim-source";
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.snapshotId = "snap-legacy-claim";
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = "interrupted-migration-attempt";
+      meta.legacyStoppedFenceMigration = {
+        version: 1,
+        state: "claimed",
+        sandboxId: LIFECYCLE_SANDBOX_NAME,
+        sourceLifecycleAttemptId,
+        targetLifecycleAttemptId: "interrupted-migration-attempt",
+      };
+    });
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("legacy-stopped-claim-replay");
+
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.legacyStoppedFenceMigration.state, "complete");
+      assert.equal(
+        meta.legacyStoppedFenceMigration.state === "complete"
+          ? meta.legacyStoppedFenceMigration.sourceLifecycleAttemptId
+          : null,
+        sourceLifecycleAttemptId,
+      );
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("completed legacy stopped migration never recreates a consumed fence", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.snapshotId = "snap-completed-legacy-migration";
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = "completed-migration-attempt";
+      meta.legacyStoppedFenceMigration = {
+        version: 1,
+        state: "complete",
+        sandboxId: LIFECYCLE_SANDBOX_NAME,
+        sourceLifecycleAttemptId: "legacy-completed-source",
+        targetLifecycleAttemptId: "completed-migration-attempt",
+      };
+    });
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("completed-legacy-migration-no-replay");
+
+      assert.deepEqual(fake.getCalls, [
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
+      ]);
+      assert.equal(await readHostSuspensionState(), null);
+      assert.equal(
+        (await getInitializedMeta()).legacyStoppedFenceMigration.state,
+        "complete",
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("legacy fence migration refuses an SDK-running sandbox", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    await writePreFenceStoppedMeta({ lifecycleAttemptId: "legacy-running-source" });
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("running");
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("legacy-marker-running-sdk");
+
+      assert.deepEqual(fake.getCalls, [
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
+      ]);
+      assert.equal(await readHostSuspensionState(), null);
+      assert.equal(
+        (await getInitializedMeta()).legacyStoppedFenceMigration.state,
+        "legacy-eligible",
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("legacy fence migration never consumes a stopped reset fence", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sourceLifecycleAttemptId = "legacy-reset-source";
+    await writePreFenceStoppedMeta({ lifecycleAttemptId: sourceLifecycleAttemptId });
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: sourceLifecycleAttemptId,
+        intent: "reset",
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("legacy-reset-fence-conflict");
+
+      assert.deepEqual(fake.getCalls, [
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
+      ]);
+      const suspension = await readHostSuspensionState();
+      assert.equal(suspension?.intent, "reset");
+      assert.equal(suspension?.ingressFenced, true);
+      assert.equal(
+        (await getInitializedMeta()).legacyStoppedFenceMigration.state,
+        "claimed",
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("malformed stopped-fence migration metadata fails before SDK inspection", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const malformed = structuredClone(
+      await getInitializedMeta(),
+    ) as unknown as Record<string, unknown>;
+    malformed.status = "stopped";
+    malformed.sandboxId = LIFECYCLE_SANDBOX_NAME;
+    malformed.legacyStoppedFenceMigration = {
+      version: 1,
+      state: "claimed",
+      sandboxId: LIFECYCLE_SANDBOX_NAME,
+    };
+    await getStore().setMeta(malformed as unknown as SingleMeta);
+
+    await assert.rejects(
+      ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "malformed-legacy-migration",
+      }),
+      /invalid stopped-fence migration marker/,
+    );
+    assert.equal(fake.getCalls.length, 0);
+    assert.equal(await readHostSuspensionState(), null);
+  });
+});
+
+test("legacy stopped migration loses closed on a competing meta generation", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    await writePreFenceStoppedMeta({ lifecycleAttemptId: "legacy-cas-source" });
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const store = getStore();
+    const compareAndSetMeta = store.compareAndSetMeta.bind(store);
+    let injected = false;
+    store.compareAndSetMeta = async (version, next) => {
+      if (
+        !injected
+        && next.legacyStoppedFenceMigration.state === "claimed"
+      ) {
+        injected = true;
+        const competing = structuredClone(await store.getMeta());
+        assert.ok(competing);
+        competing.version += 1;
+        competing.lifecycleAttemptId = "competing-generation";
+        await store.setMeta(competing);
+        return false;
+      }
+      return compareAndSetMeta(version, next);
+    };
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("legacy-stopped-cas-conflict");
+
+      assert.equal(injected, true);
+      assert.deepEqual(fake.getCalls, [
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
+      ]);
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      store.compareAndSetMeta = compareAndSetMeta;
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("persistent resume rejects a missing stopped fence without restoring an older snapshot", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
     await mutateMeta((meta) => {
@@ -1479,14 +1923,16 @@ test("persistent resume backfills a fence without restoring an older snapshot", 
       _setAiGatewayTokenOverrideForTesting("test-ai-key");
       await runScheduledEnsure("unfenced-resume");
 
-      assert.deepEqual(fake.getCalls.slice(0, 2), [
+      assert.deepEqual(fake.getCalls, [
         { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
-        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: true },
       ]);
       assert.equal(handle.deleteCalled, false);
       assert.equal(fake.createCalls.length, 0);
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
       const meta = await getInitializedMeta();
-      assert.equal(meta.status, "running");
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /SANDBOX_RESUME_UNFENCED/);
       assert.equal(meta.snapshotId, "snap-unfenced-resume");
       assert.equal(await readHostSuspensionState(), null);
     } finally {
@@ -1495,7 +1941,7 @@ test("persistent resume backfills a fence without restoring an older snapshot", 
   });
 });
 
-test("persistent resume backfills a fence without a snapshot source", async () => {
+test("persistent resume rejects a missing stopped fence without a snapshot source", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
     await mutateMeta((meta) => {
@@ -1516,14 +1962,16 @@ test("persistent resume backfills a fence without a snapshot source", async () =
       _setAiGatewayTokenOverrideForTesting("test-ai-key");
       await runScheduledEnsure("unfenced-no-snapshot");
 
-      assert.deepEqual(fake.getCalls.slice(0, 2), [
+      assert.deepEqual(fake.getCalls, [
         { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
-        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: true },
       ]);
       assert.equal(handle.deleteCalled, false);
       assert.equal(fake.createCalls.length, 0);
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
       const meta = await getInitializedMeta();
-      assert.equal(meta.status, "running");
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /SANDBOX_RESUME_UNFENCED/);
       assert.equal(meta.snapshotId, null);
       assert.equal(await readHostSuspensionState(), null);
     } finally {
@@ -1708,7 +2156,7 @@ test("rollback-pending recovery retires a deleted generation before scheduling r
   });
 });
 
-test("suspended persistent resume retires the durable lease before starting a replacement Gateway", async () => {
+test("suspended persistent resume keeps its durable fence through replacement start", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
 
@@ -1727,6 +2175,13 @@ test("suspended persistent resume retires the durable lease before starting a re
       }),
     );
     const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
     const originalRunCommand = handle.runCommand.bind(handle);
     handle.runCommand = async (commandOrOpts, args, opts) => {
       const commandArgs = typeof commandOrOpts === "string"
@@ -1737,11 +2192,10 @@ test("suspended persistent resume retires the durable lease before starting a re
         && commandArgs?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
         && commandArgs[2] === "start"
       ) {
-        assert.equal(
-          await getStore().getValue(hostSuspensionOperationKey()),
-          null,
-          "the old process lease must be durably retired before replacement start",
-        );
+        const replacement = await readHostSuspensionState();
+        assert.equal(replacement?.phase, "replacement-starting");
+        assert.equal(replacement?.replacementStage, "launching");
+        assert.equal(replacement?.replacementSessionId, handle.currentSessionId);
       }
       return originalRunCommand(commandOrOpts as never, args, opts);
     };
@@ -1751,14 +2205,969 @@ test("suspended persistent resume retires the durable lease before starting a re
     try {
       _setAiGatewayTokenOverrideForTesting("test-ai-key");
       await runScheduledEnsure("suspended-resume-ordering");
+      const hostGatewayKillIndex = fake.events.findIndex(
+        (event) =>
+          event.sandboxId === handle.sandboxId
+          && event.kind === "command"
+          && Array.isArray(event.detail?.args)
+          && event.detail.args[0] === "-lc"
+          && typeof event.detail.args[1] === "string"
+          && event.detail.args[1].includes("_gw_pids=")
+          && event.detail.args[1].includes("ps -eo pid,comm,args"),
+      );
+      const restoreAssetWriteIndex = fake.events.findIndex(
+        (event) =>
+          event.sandboxId === handle.sandboxId
+          && event.kind === "write_files"
+          && Array.isArray(event.detail?.paths)
+          && event.detail.paths.includes(OPENCLAW_FAST_RESTORE_SCRIPT_PATH),
+      );
+      assert.ok(
+        hostGatewayKillIndex >= 0,
+        "resume must use the host-owned kill",
+      );
+      assert.ok(restoreAssetWriteIndex >= 0, "resume must refresh restore assets");
+      assert.ok(
+        hostGatewayKillIndex < restoreAssetWriteIndex,
+        "Gateway must be killed before persisted restore assets are read or rewritten",
+      );
       const phases = handle.commands
         .filter((command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH)
         .map((command) => command.args?.[2]);
-      assert.deepEqual(phases, ["kill", "start"]);
+      assert.deepEqual(phases, ["start"]);
+      assert.equal(await readHostSuspensionState(), null);
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+test("persistent resume waits for confirmed Gateway exit before restore work", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-delayed-gateway-exit";
+      meta.gatewayToken = "test-gw-token";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
+    let releaseKillConfirmation!: () => void;
+    const killConfirmation = new Promise<void>((resolve) => {
+      releaseKillConfirmation = resolve;
+    });
+    let observeKillStart!: () => void;
+    const killStarted = new Promise<void>((resolve) => {
+      observeKillStart = resolve;
+    });
+    const originalRunCommand = handle.runCommand.bind(handle);
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const command = typeof commandOrOpts === "string"
+        ? commandOrOpts
+        : commandOrOpts.cmd;
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      if (
+        command === "bash"
+        && commandArgs?.[0] === "-lc"
+        && commandArgs[1]?.includes("gateway_kill.unconfirmed")
+      ) {
+        observeKillStart();
+        await killConfirmation;
+      }
+      return originalRunCommand(commandOrOpts as never, args, opts);
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      const restore = runScheduledEnsure("delayed-gateway-exit");
+      await killStarted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
+      assert.deepEqual(
+        handle.commands.filter(
+          (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+        ),
+        [],
+      );
+
+      releaseKillConfirmation();
+      await restore;
+      assert.ok(handle.writtenFiles.length > 0);
+      assert.ok(handle.networkPolicies.length > 0);
+      assert.deepEqual(
+        handle.commands
+          .filter(
+            (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+          )
+          .map((command) => command.args?.[2]),
+        ["start"],
+      );
+    } finally {
+      releaseKillConfirmation();
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent resume retry confirms a running fenced Gateway before restore assets", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.snapshotId = "snap-running-resume-retry";
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = "interrupted-resume-attempt";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: "interrupted-resume-attempt",
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = preRegisterResumeHandle(fake);
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("running-resume-retry");
+
+      assert.deepEqual(fake.getCalls[0], {
+        sandboxId: LIFECYCLE_SANDBOX_NAME,
+        resume: false,
+      });
+      assert.equal(
+        fake.getCalls.some((call) => call.resume === true),
+        false,
+        "an already-running retry must not issue a second resume",
+      );
+      const hostKills = handle.commands.filter(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-lc"
+          && command.args[1]?.includes("gateway_kill.unconfirmed"),
+      );
+      assert.equal(hostKills.length, 1);
+      const hostKillIndex = fake.events.findIndex(
+        (event) =>
+          event.kind === "command"
+          && Array.isArray(event.detail?.args)
+          && event.detail.args[0] === "-lc"
+          && typeof event.detail.args[1] === "string"
+          && event.detail.args[1].includes("gateway_kill.unconfirmed"),
+      );
+      const restoreAssetWriteIndex = fake.events.findIndex(
+        (event) =>
+          event.kind === "write_files"
+          && Array.isArray(event.detail?.paths)
+          && event.detail.paths.includes(OPENCLAW_FAST_RESTORE_SCRIPT_PATH),
+      );
+      assert.ok(hostKillIndex >= 0);
+      assert.ok(restoreAssetWriteIndex > hostKillIndex);
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("replacement-starting retry resumes without repeating the confirmed old Gateway kill", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    const priorAttemptId = "replacement-before-assets-attempt";
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.snapshotId = "snap-replacement-before-assets";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = priorAttemptId;
+    });
+    const handle = preRegisterResumeHandle(fake);
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        version: 2,
+        lifecycleAttemptId: priorAttemptId,
+        phase: "replacement-starting",
+        replacementSessionId: handle.currentSessionId,
+        replacementStage: "preparing",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("replacement-before-assets-retry");
+
+      assert.equal(
+        handle.commands.filter(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ).length,
+        0,
+      );
+      assert.deepEqual(
+        handle.commands
+          .filter(
+            (command) =>
+              command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+          )
+          .map((command) => command.args?.[2]),
+        ["start"],
+      );
+      assert.equal((await getInitializedMeta()).status, "running");
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("replacement asset-sync failure stays fenced and retries without another old kill", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  let failAssetSync = true;
+  fake.onWriteFiles = () => {
+    if (!failAssetSync) return;
+    failAssetSync = false;
+    throw new Error("injected asset sync crash");
+  };
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-asset-sync-crash";
+      meta.gatewayToken = "test-gw-token";
+    });
+    const handle = await preRegisterFencedStoppedResumeHandle(fake);
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("replacement-asset-sync-crash");
+      const failed = await readHostSuspensionState();
+      assert.equal(failed?.phase, "replacement-failed");
+      assert.equal(failed?.replacementStage, "preparing");
+      assert.equal(failed?.ingressFenced, true);
+      assert.equal((await getInitializedMeta()).status, "error");
+
+      await runScheduledEnsure("replacement-asset-sync-retry");
+      assert.equal(
+        handle.commands.filter(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ).length,
+        1,
+        "retry must reuse the confirmed exact-session kill",
+      );
+      assert.equal((await getInitializedMeta()).status, "running");
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("ambiguous replacement launch re-confirms only its exact session on retry", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-start-crash";
+      meta.gatewayToken = "test-gw-token";
+    });
+    const handle = await preRegisterFencedStoppedResumeHandle(fake);
+    const originalRunCommand = handle.runCommand.bind(handle);
+    let failStart = true;
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const command = typeof commandOrOpts === "string"
+        ? commandOrOpts
+        : commandOrOpts.cmd;
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      if (
+        failStart
+        && command === "bash"
+        && commandArgs?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
+        && commandArgs[2] === "start"
+      ) {
+        failStart = false;
+        return {
+          exitCode: 70,
+          output: async () => "injected ambiguous start failure",
+        };
+      }
+      return originalRunCommand(commandOrOpts as never, args, opts);
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("replacement-start-crash");
+      const failed = await readHostSuspensionState();
+      assert.equal(failed?.phase, "replacement-failed");
+      assert.equal(failed?.replacementStage, "launching");
+      assert.equal(failed?.replacementSessionId, handle.currentSessionId);
+
+      await runScheduledEnsure("replacement-start-retry");
+      assert.equal(
+        handle.commands.filter(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ).length,
+        2,
+        "retry must re-confirm the same session after an ambiguous launch",
+      );
+      assert.equal((await getInitializedMeta()).status, "running");
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("replacement retry with a changed session stays fenced without side effects", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    const priorAttemptId = "replacement-session-owner-attempt";
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.snapshotId = "snap-session-owner";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = priorAttemptId;
+    });
+    const handle = preRegisterResumeHandle(fake);
+    const replacementSessionId = handle.currentSessionId;
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        version: 2,
+        lifecycleAttemptId: priorAttemptId,
+        phase: "replacement-starting",
+        replacementSessionId,
+        replacementStage: "launching",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    handle.replaceCurrentSessionForTesting();
+
+    await runScheduledEnsure("replacement-session-mismatch");
+
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(handle.networkPolicies.length, 0);
+    assert.equal(
+      handle.commands.some(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-lc"
+          && command.args[1]?.includes("gateway_kill.unconfirmed"),
+      ),
+      false,
+    );
+    const replacement = await readHostSuspensionState();
+    assert.equal(replacement?.phase, "replacement-starting");
+    assert.equal(replacement?.replacementSessionId, replacementSessionId);
+    assert.equal(replacement?.ingressFenced, true);
+  });
+});
+
+test("session rollover during replacement asset sync prevents Gateway start and clear", async () => {
+  const fake = new FakeSandboxController();
+  let handle: FakeSandboxHandle;
+  let rollSession = true;
+  fake.onWriteFiles = () => {
+    if (!rollSession) return;
+    rollSession = false;
+    handle.replaceCurrentSessionForTesting();
+  };
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-asset-session-rollover";
+      meta.gatewayToken = "test-gw-token";
+    });
+    handle = await preRegisterFencedStoppedResumeHandle(fake);
+
+    await runScheduledEnsure("replacement-asset-session-rollover");
+
+    assert.equal(
+      handle.commands.some(
+        (command) =>
+          command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
+          && command.args[2] === "start",
+      ),
+      false,
+    );
+    const replacement = await readHostSuspensionState();
+    assert.equal(replacement?.phase, "replacement-starting");
+    assert.equal(replacement?.replacementStage, "preparing");
+    assert.notEqual(replacement?.replacementSessionId, handle.currentSessionId);
+  });
+});
+
+test("session rollover during replacement start cannot clear the recorded session", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-start-session-rollover";
+      meta.gatewayToken = "test-gw-token";
+    });
+    const handle = await preRegisterFencedStoppedResumeHandle(fake);
+    const originalRunCommand = handle.runCommand.bind(handle);
+    let rollSession = true;
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const command = typeof commandOrOpts === "string"
+        ? commandOrOpts
+        : commandOrOpts.cmd;
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      if (
+        rollSession
+        && command === "bash"
+        && commandArgs?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
+        && commandArgs[2] === "start"
+      ) {
+        rollSession = false;
+        handle.replaceCurrentSessionForTesting();
+      }
+      return originalRunCommand(commandOrOpts as never, args, opts);
+    };
+
+    await runScheduledEnsure("replacement-start-session-rollover");
+
+    const replacement = await readHostSuspensionState();
+    assert.equal(replacement?.phase, "replacement-starting");
+    assert.equal(replacement?.replacementStage, "launching");
+    assert.notEqual(replacement?.replacementSessionId, handle.currentSessionId);
+    assert.equal(replacement?.ingressFenced, true);
+  });
+});
+
+test("running metadata finalizes only its exact committed replacement session", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    const lifecycleAttemptId = "replacement-committed-attempt";
+    const handle = preRegisterResumeHandle(fake);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.snapshotId = "snap-replacement-committed";
+      meta.sandboxId = handle.sandboxId;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        version: 2,
+        lifecycleAttemptId,
+        phase: "replacement-starting",
+        replacementSessionId: handle.currentSessionId,
+        replacementStage: "launching",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+
+    const result = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "replacement-commit-finalize",
+    });
+
+    assert.equal(result.state, "running");
+    assert.equal(result.meta.status, "running");
+    assert.equal(await readHostSuspensionState(), null);
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(
+      handle.commands.some(
+        (command) => command.args?.[1]?.includes("gateway_kill.unconfirmed"),
+      ),
+      false,
+    );
+  });
+});
+
+test("running metadata finalizer tolerates a lost Redis delete response", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    const lifecycleAttemptId = "replacement-finalizer-del-response-lost";
+    const handle = preRegisterResumeHandle(fake);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.snapshotId = "snap-replacement-finalizer-del-response-lost";
+      meta.sandboxId = handle.sandboxId;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        version: 2,
+        lifecycleAttemptId,
+        phase: "replacement-starting",
+        replacementSessionId: handle.currentSessionId,
+        replacementStage: "launching",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const store = getStore();
+    const deleteValue = store.deleteValue.bind(store);
+    let lostResponse = false;
+    store.deleteValue = async (key) => {
+      if (key === hostSuspensionOperationKey() && !lostResponse) {
+        lostResponse = true;
+        await deleteValue(key);
+        throw new Error("injected Redis response loss after finalizer DEL");
+      }
+      await deleteValue(key);
+    };
+
+    try {
+      const result = await ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "replacement-finalizer-del-response-lost",
+      });
+
+      assert.equal(lostResponse, true);
+      assert.equal(result.state, "running");
+      assert.equal(result.meta.status, "running");
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      store.deleteValue = deleteValue;
+    }
+  });
+});
+
+test("lost Redis delete response preserves committed running replacement", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-clear-response-lost";
+      meta.gatewayToken = "test-gw-token";
+    });
+    await preRegisterFencedStoppedResumeHandle(fake);
+    const store = getStore();
+    const deleteValue = store.deleteValue.bind(store);
+    let lostResponse = false;
+    store.deleteValue = async (key) => {
+      if (key === hostSuspensionOperationKey() && !lostResponse) {
+        lostResponse = true;
+        await deleteValue(key);
+        throw new Error("injected Redis response loss after DEL");
+      }
+      await deleteValue(key);
+    };
+
+    try {
+      await runScheduledEnsure("replacement-clear-response-lost");
+      assert.equal(lostResponse, true);
+      const committed = await getInitializedMeta();
+      assert.equal(committed.status, "running");
+      assert.equal(committed.lastError, null);
+      assert.equal(await readHostSuspensionState(), null);
+
+      const status = await ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "replacement-clear-response-lost-status",
+      });
+      assert.equal(status.state, "running");
+      assert.equal(status.meta.status, "running");
+    } finally {
+      store.deleteValue = deleteValue;
+    }
+  });
+});
+
+test("failed Redis delete retains a recoverable committed replacement fence", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-clear-not-executed";
+      meta.gatewayToken = "test-gw-token";
+    });
+    await preRegisterFencedStoppedResumeHandle(fake);
+    const store = getStore();
+    const deleteValue = store.deleteValue.bind(store);
+    store.deleteValue = async (key) => {
+      if (key === hostSuspensionOperationKey()) {
+        throw new Error("injected Redis DEL failure before execution");
+      }
+      await deleteValue(key);
+    };
+
+    try {
+      await runScheduledEnsure("replacement-clear-not-executed");
+      const committed = await getInitializedMeta();
+      assert.equal(committed.status, "running");
+      assert.equal(committed.lastError, null);
+      const retained = await readHostSuspensionState();
+      assert.equal(retained?.phase, "replacement-starting");
+      assert.equal(retained?.replacementStage, "launching");
+    } finally {
+      store.deleteValue = deleteValue;
+    }
+
+    const recovered = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "replacement-clear-not-executed-retry",
+    });
+    assert.equal(recovered.state, "running");
+    assert.equal(recovered.meta.status, "running");
+    assert.equal(await readHostSuspensionState(), null);
+  });
+});
+
+test("concurrent replacement during lost clear response remains fail closed", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-clear-concurrent-replacement";
+      meta.gatewayToken = "test-gw-token";
+    });
+    await preRegisterFencedStoppedResumeHandle(fake);
+    const store = getStore();
+    const deleteValue = store.deleteValue.bind(store);
+    let replacementWritten = false;
+    store.deleteValue = async (key) => {
+      if (key === hostSuspensionOperationKey() && !replacementWritten) {
+        replacementWritten = true;
+        const current = await store.getValue<HostSuspensionState>(key);
+        assert.ok(current);
+        await store.setValue(key, {
+          ...current,
+          operationId: "concurrent-replacement-operation",
+          requestId: "concurrent-replacement-operation",
+          replacementSessionId: "concurrent-replacement-session",
+          updatedAtMs: Date.now(),
+        });
+        throw new Error("injected concurrent replacement after DEL request");
+      }
+      await deleteValue(key);
+    };
+
+    try {
+      await runScheduledEnsure("replacement-clear-concurrent");
+    } finally {
+      store.deleteValue = deleteValue;
+    }
+
+    const committed = await getInitializedMeta();
+    assert.equal(committed.status, "running");
+    assert.equal(committed.lastError, null);
+    const concurrent = await readHostSuspensionState();
+    assert.equal(concurrent?.operationId, "concurrent-replacement-operation");
+    assert.equal(concurrent?.ingressFenced, true);
+    const status = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "replacement-clear-concurrent-status",
+    });
+    assert.equal(status.state, "waiting");
+    assert.equal(
+      (await readHostSuspensionState())?.operationId,
+      "concurrent-replacement-operation",
+    );
+  });
+});
+
+test("persistent running-resume retry fails closed when Gateway exit is unconfirmed", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.snapshotId = "snap-stubborn-gateway";
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = "interrupted-resume-attempt";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: "interrupted-resume-attempt",
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = preRegisterResumeHandle(fake);
+    const originalRunCommand = handle.runCommand.bind(handle);
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const command = typeof commandOrOpts === "string"
+        ? commandOrOpts
+        : commandOrOpts.cmd;
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      if (
+        command === "bash"
+        && commandArgs?.[0] === "-lc"
+        && commandArgs[1]?.includes("gateway_kill.unconfirmed")
+      ) {
+        return {
+          exitCode: 70,
+          output: async (stream?: "stdout" | "stderr" | "both") =>
+            stream === "stdout"
+              ? ""
+              : '{"event":"gateway_kill.unconfirmed","port":3000}',
+        };
+      }
+      return originalRunCommand(commandOrOpts as never, args, opts);
+    };
+
+    await runScheduledEnsure("stubborn-gateway-exit");
+
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(handle.networkPolicies.length, 0);
+    assert.equal(handle.deleteCalled, false);
+    assert.equal(fake.createCalls.length, 0);
+    assert.equal(
+      fake.getCalls.some((call) => call.resume === true),
+      false,
+    );
+    assert.deepEqual(
+      handle.commands.filter(
+        (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+      ),
+      [],
+    );
+    const meta = await getInitializedMeta();
+    assert.equal(meta.status, "error");
+    assert.match(meta.lastError ?? "", /host-defined-gateway-kill/);
+    const suspension = await readHostSuspensionState();
+    assert.equal(suspension?.ingressFenced, true);
+  });
+});
+
+for (const fenceCase of ["absent", "other-sandbox", "stale-attempt"] as const) {
+  test(`persistent resume rejects a running handle with ${fenceCase} fence`, async () => {
+    const fake = new FakeSandboxController();
+
+    await withTestEnv(fake, async () => {
+      await mutateMeta((meta) => {
+        meta.status = "error";
+        meta.snapshotId = `snap-running-${fenceCase}`;
+        meta.gatewayToken = "test-gw-token";
+        meta.lifecycleAttemptId = "interrupted-resume-attempt";
+      });
+      if (fenceCase !== "absent") {
+        await getStore().setValue(
+          hostSuspensionOperationKey(),
+          hostSuspensionState(
+            fenceCase === "other-sandbox"
+              ? "sbx-other-generation"
+              : LIFECYCLE_SANDBOX_NAME,
+            {
+              lifecycleAttemptId: fenceCase === "stale-attempt"
+                ? "stale-resume-attempt"
+                : "interrupted-resume-attempt",
+              phase: "stopped",
+              stopRequestDeadlineAtMs: null,
+              stoppedAtMs: Date.now(),
+            },
+          ),
+        );
+      }
+      const handle = preRegisterResumeHandle(fake);
+
+      await runScheduledEnsure(`running-${fenceCase}-fence`);
+
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
+      assert.equal(fake.createCalls.length, 0);
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ),
+        false,
+      );
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /SANDBOX_RESUME_UNFENCED/);
+    });
+  });
+}
+
+test("create 409 recovery confirms the exact running fence before restore assets", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.snapshotId = "snap-409-running-recovery";
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = "interrupted-resume-attempt";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: "interrupted-resume-attempt",
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = preRegisterResumeHandle(fake);
+    fake.handlesByIds.delete(LIFECYCLE_SANDBOX_NAME);
+    fake.create = async (params) => {
+      fake.createCalls.push(params);
+      fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+      throw Object.assign(new Error("create conflict"), {
+        response: { status: 409 },
+      });
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("409-running-recovery");
+
+      assert.equal(fake.createCalls.length, 1);
+      const hostKillIndex = fake.events.findIndex(
+        (event) =>
+          event.kind === "command"
+          && Array.isArray(event.detail?.args)
+          && event.detail.args[0] === "-lc"
+          && typeof event.detail.args[1] === "string"
+          && event.detail.args[1].includes("gateway_kill.unconfirmed"),
+      );
+      const restoreAssetWriteIndex = fake.events.findIndex(
+        (event) =>
+          event.kind === "write_files"
+          && Array.isArray(event.detail?.paths)
+          && event.detail.paths.includes(OPENCLAW_FAST_RESTORE_SCRIPT_PATH),
+      );
+      assert.ok(hostKillIndex >= 0);
+      assert.ok(restoreAssetWriteIndex > hostKillIndex);
+      assert.equal(
+        handle.commands.filter(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ).length,
+        1,
+      );
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("create 409 recovery rejects a running handle with a stale fence", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.snapshotId = "snap-409-stale-fence";
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = "interrupted-resume-attempt";
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: "stale-resume-attempt",
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = preRegisterResumeHandle(fake);
+    fake.handlesByIds.delete(LIFECYCLE_SANDBOX_NAME);
+    fake.create = async (params) => {
+      fake.createCalls.push(params);
+      fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+      throw Object.assign(new Error("create conflict"), {
+        response: { status: 409 },
+      });
+    };
+
+    await runScheduledEnsure("409-stale-fence");
+
+    assert.equal(fake.createCalls.length, 1);
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(handle.networkPolicies.length, 0);
+    assert.equal(
+      handle.commands.some(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-lc"
+          && command.args[1]?.includes("gateway_kill.unconfirmed"),
+      ),
+      false,
+    );
+    const meta = await getInitializedMeta();
+    assert.equal(meta.status, "error");
+    assert.match(meta.lastError ?? "", /SANDBOX_RESUME_UNFENCED/);
   });
 });
 
@@ -1772,7 +3181,22 @@ test("persistent resume does not launch Gateway after lifecycle lease loss durin
       meta.snapshotId = "snap-resume-lease-loss";
       meta.gatewayToken = "test-gw-token";
     });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
     const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
     const store = getStore();
     const renewLock = store.renewLock.bind(store);
     let loseLifecycleLease = false;
@@ -1788,8 +3212,8 @@ test("persistent resume does not launch Gateway after lifecycle lease loss durin
       const result = await originalRunCommand(commandOrOpts as never, args, opts);
       if (
         (typeof commandOrOpts === "string" ? commandOrOpts : commandOrOpts.cmd) === "bash"
-        && commandArgs?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
-        && commandArgs[2] === "kill"
+        && commandArgs?.[0] === "-lc"
+        && commandArgs[1]?.includes("gateway_kill.unconfirmed")
       ) {
         loseLifecycleLease = true;
       }
@@ -1804,7 +3228,8 @@ test("persistent resume does not launch Gateway after lifecycle lease loss durin
       const phases = handle.commands
         .filter((command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH)
         .map((command) => command.args?.[2]);
-      assert.deepEqual(phases, ["kill"]);
+      assert.deepEqual(phases, []);
+      assert.equal((await readHostSuspensionState())?.phase, "stopped");
     } finally {
       store.renewLock = renewLock;
       _setAiGatewayTokenOverrideForTesting(null);
@@ -1826,7 +3251,7 @@ test("persistent resume does not kill Gateway after lifecycle lease loss during 
     const handle = preRegisterResumeHandle(fake);
     const store = getStore();
     const renewLock = store.renewLock.bind(store);
-    const getValue = store.getValue.bind(store);
+    const getValueState = store.getValueState.bind(store);
     const originalRunCommand = handle.runCommand.bind(handle);
     let loseLifecycleLease = false;
     let armSuspensionRead = false;
@@ -1835,8 +3260,8 @@ test("persistent resume does not kill Gateway after lifecycle lease loss during 
       key === lifecycleLockKey() && loseLifecycleLease
         ? false
         : renewLock(key, token, ttlSeconds);
-    store.getValue = async <T>(key: string): Promise<T | null> => {
-      const value = await getValue<T>(key);
+    store.getValueState = async <T>(key: string) => {
+      const value = await getValueState<T>(key);
       if (key === hostSuspensionOperationKey() && armSuspensionRead) {
         armSuspensionRead = false;
         loseLifecycleLease = true;
@@ -1870,14 +3295,14 @@ test("persistent resume does not kill Gateway after lifecycle lease loss during 
       assert.deepEqual(phases, []);
     } finally {
       store.renewLock = renewLock;
-      store.getValue = getValue;
+      store.getValueState = getValueState;
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
     }
   });
 });
 
-test("persistent resume never starts a replacement Gateway when the lease CAS fails after kill", async () => {
+test("persistent resume writes no assets when its fence is superseded after kill", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
 
@@ -1896,6 +3321,13 @@ test("persistent resume never starts a replacement Gateway when the lease CAS fa
       }),
     );
     const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
     const originalRunCommand = handle.runCommand.bind(handle);
     handle.runCommand = async (commandOrOpts, args, opts) => {
       const commandArgs = typeof commandOrOpts === "string"
@@ -1904,8 +3336,8 @@ test("persistent resume never starts a replacement Gateway when the lease CAS fa
       const result = await originalRunCommand(commandOrOpts as never, args, opts);
       if (
         (typeof commandOrOpts === "string" ? commandOrOpts : commandOrOpts.cmd) === "bash"
-        && commandArgs?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH
-        && commandArgs[2] === "kill"
+        && commandArgs?.[0] === "-lc"
+        && commandArgs[1]?.includes("gateway_kill.unconfirmed")
       ) {
         await getStore().setValue(
           hostSuspensionOperationKey(),
@@ -1929,12 +3361,9 @@ test("persistent resume never starts a replacement Gateway when the lease CAS fa
       const phases = handle.commands
         .filter((command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH)
         .map((command) => command.args?.[2]);
-      assert.deepEqual(phases, ["kill"]);
-      assert.equal((await getInitializedMeta()).status, "setup");
-      assert.equal(
-        (await readHostSuspensionState())?.operationId,
-        "replacement-operation",
-      );
+      assert.deepEqual(phases, []);
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
@@ -1948,12 +3377,27 @@ test("guarded cron readiness preserves a stopped snapshot restore", async () => 
 
   await withTestEnv(fake, async () => {
     const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
     await mutateMeta((meta) => {
       meta.status = "stopped";
       meta.snapshotId = "snap-cron-restore";
       meta.snapshotConfigHash = "snapshot-config";
       meta.gatewayToken = "gw-cron";
     });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
     _setAiGatewayTokenOverrideForTesting("test-ai-key");
@@ -2189,22 +3633,7 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
     const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
     handle.setStatus("stopped");
     handle.responders.push(...fake.defaultResponders);
-    handle.responders.push((cmd, args) => {
-      if (
-        cmd === "bash" &&
-        args?.[0] === "-c" &&
-        args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH)
-      ) {
-        return {
-          exitCode: 0,
-          output: async (stream?: "stdout" | "stderr" | "both") => {
-            if (stream === "stderr") return "";
-            return `${JSON.stringify(BUNDLE_ADMISSION.identity)}\n`;
-          },
-        };
-      }
-      return undefined;
-    });
+    respondWithVerifiedBundleIdentity(handle);
     fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
     await getStore().setValue(
       hostSuspensionOperationKey(),
@@ -2279,6 +3708,499 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
     }
   });
 });
+
+test("persistent bundle retry kills an already-running fenced Gateway before restore writes", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  const priorAttemptId = "interrupted-bundle-resume-attempt";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.snapshotId = null;
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = priorAttemptId;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.responders.push(...fake.defaultResponders);
+    respondWithVerifiedBundleIdentity(handle);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+    let clearedFenceChecks = 0;
+    const originalRunCommand = handle.runCommand.bind(handle);
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const command = typeof commandOrOpts === "string"
+        ? commandOrOpts
+        : commandOrOpts.cmd;
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      const script = commandArgs?.[1] ?? "";
+      if (
+        command === "bash"
+        && commandArgs?.[0] === "-c"
+        && (
+          script.includes(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH)
+          || script.includes(`${OPENCLAW_BUNDLE_IDENTITY_PATH}.tmp`)
+        )
+      ) {
+        const replacement = await readHostSuspensionState();
+        assert.equal(replacement?.phase, "replacement-starting");
+        assert.equal(replacement?.replacementStage, "preparing");
+        clearedFenceChecks += 1;
+      }
+      return originalRunCommand(commandOrOpts as never, args, opts);
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("running-bundle-resume-retry");
+
+      assert.deepEqual(fake.getCalls[0], {
+        sandboxId: LIFECYCLE_SANDBOX_NAME,
+        resume: false,
+      });
+      assert.equal(
+        fake.getCalls.some((call) => call.resume === true),
+        false,
+        "an already-running bundle retry must not issue a second resume",
+      );
+      const hostKillIndex = fake.events.findIndex(
+        (event) =>
+          event.kind === "command"
+          && Array.isArray(event.detail?.args)
+          && event.detail.args[0] === "-lc"
+          && typeof event.detail.args[1] === "string"
+          && event.detail.args[1].includes("gateway_kill.unconfirmed"),
+      );
+      const restoreAssetWriteIndex = fake.events.findIndex(
+        (event) =>
+          event.kind === "write_files"
+          && Array.isArray(event.detail?.paths)
+          && event.detail.paths.includes(OPENCLAW_FAST_RESTORE_SCRIPT_PATH),
+      );
+      const bundleVerificationIndex = fake.events.findIndex(
+        (event) =>
+          event.kind === "command"
+          && Array.isArray(event.detail?.args)
+          && event.detail.args[0] === "-c"
+          && typeof event.detail.args[1] === "string"
+          && event.detail.args[1].includes(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH),
+      );
+      assert.ok(hostKillIndex >= 0, "bundle retry must use the host-owned kill");
+      assert.ok(
+        bundleVerificationIndex > hostKillIndex,
+        "bundle verification and receipt refresh must follow the confirmed kill",
+      );
+      assert.ok(restoreAssetWriteIndex > hostKillIndex);
+      assert.equal(
+        handle.commands.filter(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ).length,
+        1,
+      );
+      assert.equal(clearedFenceChecks, 2);
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent bundle resume fails closed when lifecycle lease is lost during SDK resume", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.setStatus("stopped");
+    handle.responders.push(...fake.defaultResponders);
+    respondWithVerifiedBundleIdentity(handle);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+    const store = getStore();
+    const renewLock = store.renewLock.bind(store);
+    let loseLifecycleLease = false;
+    store.renewLock = async (key, token, ttlSeconds) =>
+      key === lifecycleLockKey() && loseLifecycleLease
+        ? false
+        : renewLock(key, token, ttlSeconds);
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) {
+        handle.setStatus("running");
+        loseLifecycleLease = true;
+      }
+      return result;
+    };
+
+    try {
+      await runScheduledEnsure("bundle-resume-lease-loss");
+
+      assert.deepEqual(
+        fake.getCalls.slice(0, 2).map((call) => call.resume),
+        [false, true],
+      );
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ),
+        false,
+      );
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-c"
+            && command.args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH),
+        ),
+        false,
+        "lease loss after resume must stop before the marker probe",
+      );
+      assert.equal((await readHostSuspensionState())?.ingressFenced, true);
+    } finally {
+      store.renewLock = renewLock;
+    }
+  });
+});
+
+test("persistent bundle retry does not kill after the adopted fence is replaced", async () => {
+  const fake = new FakeSandboxController();
+  const priorAttemptId = "interrupted-bundle-fence-race-attempt";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = priorAttemptId;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.responders.push(...fake.defaultResponders);
+    respondWithVerifiedBundleIdentity(handle);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+
+    const store = getStore();
+    const getValueState = store.getValueState.bind(store);
+    let replacedFenceBeforeKill = false;
+    store.getValueState = async <T>(key: string) => {
+      const state = await getValueState<T>(key);
+      if (
+        key === hostSuspensionOperationKey()
+        && !replacedFenceBeforeKill
+        && state.status === "present"
+      ) {
+        const suspension = state.value as HostSuspensionState | null;
+        if (
+          suspension?.operationId === "operation-test"
+          && suspension.lifecycleAttemptId !== priorAttemptId
+        ) {
+          replacedFenceBeforeKill = true;
+          await store.setValue(
+            hostSuspensionOperationKey(),
+            hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+              operationId: "replacement-bundle-fence-operation",
+              requestId: "replacement-bundle-fence-operation",
+              lifecycleAttemptId: suspension.lifecycleAttemptId,
+              phase: "stopped",
+              stopRequestDeadlineAtMs: null,
+              stoppedAtMs: Date.now(),
+            }),
+          );
+          return getValueState<T>(key);
+        }
+      }
+      return state;
+    };
+
+    try {
+      await runScheduledEnsure("running-bundle-fence-replaced-before-kill");
+
+      assert.equal(replacedFenceBeforeKill, true);
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ),
+        false,
+      );
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-c"
+            && command.args[1]?.includes(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH),
+        ),
+        false,
+      );
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
+      assert.deepEqual(
+        handle.commands.filter(
+          (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+        ),
+        [],
+      );
+    } finally {
+      store.getValueState = getValueState;
+    }
+  });
+});
+
+test("persistent bundle retry kills only the captured sandbox session", async () => {
+  const fake = new FakeSandboxController();
+  const priorAttemptId = "interrupted-bundle-session-race-attempt";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = priorAttemptId;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.responders.push(...fake.defaultResponders);
+    respondWithVerifiedBundleIdentity(handle);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+
+    const store = getStore();
+    const getValueState = store.getValueState.bind(store);
+    let replacedSessionBeforeKill = false;
+    store.getValueState = async <T>(key: string) => {
+      const state = await getValueState<T>(key);
+      if (
+        key === hostSuspensionOperationKey()
+        && !replacedSessionBeforeKill
+        && state.status === "present"
+      ) {
+        const suspension = state.value as HostSuspensionState | null;
+        if (
+          suspension?.operationId === "operation-test"
+          && suspension.lifecycleAttemptId !== priorAttemptId
+        ) {
+          replacedSessionBeforeKill = true;
+          handle.replaceCurrentSessionForTesting();
+        }
+      }
+      return state;
+    };
+
+    try {
+      await runScheduledEnsure("running-bundle-session-replaced-before-kill");
+
+      assert.equal(replacedSessionBeforeKill, true);
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ),
+        false,
+        "the kill must not fall through to the replacement session",
+      );
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
+      assert.deepEqual(
+        handle.commands.filter(
+          (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+        ),
+        [],
+      );
+    } finally {
+      store.getValueState = getValueState;
+    }
+  });
+});
+
+test("persistent bundle retry fails closed when the running Gateway kill is unconfirmed", async () => {
+  const fake = new FakeSandboxController();
+  const priorAttemptId = "interrupted-bundle-kill-attempt";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = priorAttemptId;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.responders.push(...fake.defaultResponders);
+    respondWithVerifiedBundleIdentity(handle);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+    let hostKillAttempted = false;
+    const originalRunCommand = handle.runCommand.bind(handle);
+    handle.runCommand = async (commandOrOpts, args, opts) => {
+      const command = typeof commandOrOpts === "string"
+        ? commandOrOpts
+        : commandOrOpts.cmd;
+      const commandArgs = typeof commandOrOpts === "string"
+        ? args
+        : commandOrOpts.args;
+      if (
+        command === "bash"
+        && commandArgs?.[0] === "-lc"
+        && commandArgs[1]?.includes("gateway_kill.unconfirmed")
+      ) {
+        hostKillAttempted = true;
+        return {
+          exitCode: 70,
+          output: async (stream?: "stdout" | "stderr" | "both") =>
+            stream === "stdout"
+              ? ""
+              : '{"event":"gateway_kill.unconfirmed","port":3000}',
+        };
+      }
+      return originalRunCommand(commandOrOpts as never, args, opts);
+    };
+
+    await runScheduledEnsure("running-bundle-kill-unconfirmed");
+
+    assert.equal(hostKillAttempted, true);
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(handle.networkPolicies.length, 0);
+    assert.equal(fake.createCalls.length, 0);
+    assert.deepEqual(
+      handle.commands.filter(
+        (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+      ),
+      [],
+    );
+    const meta = await getInitializedMeta();
+    assert.equal(meta.status, "error");
+    assert.match(meta.lastError ?? "", /host-defined-gateway-kill/);
+    const suspension = await readHostSuspensionState();
+    assert.equal(suspension?.ingressFenced, true);
+  });
+});
+
+for (const fenceCase of ["absent", "other-sandbox", "stale-attempt"] as const) {
+  test(`persistent bundle retry rejects a running handle with ${fenceCase} fence`, async () => {
+    const fake = new FakeSandboxController();
+
+    await withTestEnv(fake, async () => {
+      configureBundleLifecycleTest();
+      await mutateMeta((meta) => {
+        meta.status = "error";
+        meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+        meta.gatewayToken = "test-gw-token";
+        meta.lifecycleAttemptId = "interrupted-bundle-resume-attempt";
+        meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+      });
+      if (fenceCase !== "absent") {
+        await getStore().setValue(
+          hostSuspensionOperationKey(),
+          hostSuspensionState(
+            fenceCase === "other-sandbox"
+              ? "other-bundle-sandbox"
+              : LIFECYCLE_SANDBOX_NAME,
+            {
+              lifecycleAttemptId: fenceCase === "stale-attempt"
+                ? "stale-bundle-resume-attempt"
+                : "interrupted-bundle-resume-attempt",
+              phase: "stopped",
+              stopRequestDeadlineAtMs: null,
+              stoppedAtMs: Date.now(),
+            },
+          ),
+        );
+      }
+      const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+      handle.responders.push(...fake.defaultResponders);
+      respondWithVerifiedBundleIdentity(handle);
+      fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+
+      await runScheduledEnsure(`running-bundle-${fenceCase}-fence`);
+
+      assert.equal(handle.writtenFiles.length, 0);
+      assert.equal(handle.networkPolicies.length, 0);
+      assert.equal(fake.createCalls.length, 0);
+      assert.equal(
+        handle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ),
+        false,
+      );
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /SANDBOX_RESUME_UNFENCED/);
+    });
+  });
+}
 
 test("persistent bundle corruption fails before fast restore launches Gateway", async () => {
   const fake = new FakeSandboxController();
@@ -2461,6 +4383,139 @@ test("removing bundle mode fences the running bundle generation", async () => {
   });
 });
 
+test("bundle-to-npm retry adopts the prior fence before migration quiesce", async () => {
+  const fake = new FakeSandboxController();
+  const priorAttemptId = "interrupted-bundle-to-npm-attempt";
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "gw-test";
+      meta.lifecycleAttemptId = priorAttemptId;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        operationId: "prior-bundle-to-npm-operation",
+        requestId: "prior-bundle-to-npm-operation",
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.responders.push(...fake.defaultResponders);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+
+    await runScheduledEnsure("bundle-to-npm-fenced-retry");
+
+    assert.equal(handle.stopCalled, true);
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(handle.networkPolicies.length, 0);
+    assert.equal(
+      handle.commands.some(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-lc"
+          && command.args[1]?.includes("gateway_kill.unconfirmed"),
+      ),
+      false,
+    );
+    assert.deepEqual(
+      handle.commands.filter(
+        (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+      ),
+      [],
+    );
+    const meta = await getInitializedMeta();
+    assert.equal(meta.status, "error");
+    assert.match(meta.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+    const suspension = await readHostSuspensionState();
+    assert.ok(suspension);
+    assert.equal(suspension.sandboxId, LIFECYCLE_SANDBOX_NAME);
+    assert.equal(suspension.reason, "sandbox.bundle_migration_required");
+    assert.equal(suspension.phase, "stopped");
+    assert.equal(suspension.ingressFenced, true);
+    assert.notEqual(suspension.operationId, "prior-bundle-to-npm-operation");
+    assert.equal(meta.lifecycleAttemptId, suspension.lifecycleAttemptId);
+  });
+});
+
+test("configured-bundle migration adopts the prior fence before quiesce", async () => {
+  const fake = new FakeSandboxController();
+  const priorAttemptId = "interrupted-configured-bundle-migration-attempt";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "gw-test";
+      meta.lifecycleAttemptId = priorAttemptId;
+      meta.bundleIdentity = {
+        ...structuredClone(BUNDLE_ADMISSION.identity),
+        canonicalSha256: "9".repeat(64),
+      };
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        operationId: "prior-configured-bundle-operation",
+        requestId: "prior-configured-bundle-operation",
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.responders.push(...fake.defaultResponders);
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+
+    await runScheduledEnsure("configured-bundle-fenced-migration");
+
+    assert.equal(handle.stopCalled, true);
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(handle.networkPolicies.length, 0);
+    assert.equal(
+      handle.commands.some(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-lc"
+          && command.args[1]?.includes("gateway_kill.unconfirmed"),
+      ),
+      false,
+    );
+    assert.equal(
+      handle.commands.some(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-c"
+          && command.args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH),
+      ),
+      false,
+      "configured admission mismatch must migrate before marker verification",
+    );
+    assert.deepEqual(
+      handle.commands.filter(
+        (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+      ),
+      [],
+    );
+    const meta = await getInitializedMeta();
+    assert.equal(meta.status, "error");
+    assert.match(meta.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+    const suspension = await readHostSuspensionState();
+    assert.ok(suspension);
+    assert.equal(suspension.reason, "sandbox.bundle_migration_required");
+    assert.equal(suspension.phase, "stopped");
+    assert.equal(meta.lifecycleAttemptId, suspension.lifecycleAttemptId);
+  });
+});
+
 test("bundle lifecycle never promotes the alternate-name hot-spare prototype", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
@@ -2512,6 +4567,7 @@ test("persistent bundle identity mismatch quiesces and requires explicit migrati
       meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
     });
     const staleHandle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    staleHandle.setStatus("stopped");
     staleHandle.responders.push(...fake.defaultResponders);
     staleHandle.responders.push((cmd, args) => {
       if (
@@ -2533,6 +4589,20 @@ test("persistent bundle identity mismatch quiesces and requires explicit migrati
       return undefined;
     });
     fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, staleHandle);
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) staleHandle.setStatus("running");
+      return result;
+    };
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
 
@@ -2551,6 +4621,21 @@ test("persistent bundle identity mismatch quiesces and requires explicit migrati
 
       assert.equal(staleHandle.deleteCalled, false, "existing state must never be deleted");
       assert.equal(staleHandle.stopCalled, true, "existing runtime must be quiesced");
+      assert.deepEqual(
+        fake.getCalls.slice(0, 2).map((call) => call.resume),
+        [false, true],
+        "a stopped mismatch must resume only under its adopted fence",
+      );
+      assert.equal(
+        staleHandle.commands.some(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === "-lc"
+            && command.args[1]?.includes("gateway_kill.unconfirmed"),
+        ),
+        false,
+        "marker mismatch must quiesce the live Gateway instead of killing it",
+      );
       assert.equal(
         staleHandle.commands.some(
           (command) =>
@@ -2585,10 +4670,103 @@ test("persistent bundle identity mismatch quiesces and requires explicit migrati
   });
 });
 
+test("running bundle mismatch adopts the prior fence before RPC migration quiesce", async () => {
+  const fake = new FakeSandboxController();
+  const priorAttemptId = "interrupted-bundle-mismatch-attempt";
+
+  await withTestEnv(fake, async () => {
+    configureBundleLifecycleTest();
+    await mutateMeta((meta) => {
+      meta.status = "error";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
+      meta.gatewayToken = "gw-test";
+      meta.lifecycleAttemptId = priorAttemptId;
+      meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        operationId: "prior-bundle-mismatch-operation",
+        requestId: "prior-bundle-mismatch-operation",
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const handle = new FakeSandboxHandle(LIFECYCLE_SANDBOX_NAME, fake.events);
+    handle.responders.push(...fake.defaultResponders);
+    handle.responders.push((cmd, args) => {
+      if (
+        cmd === "bash"
+        && args?.[0] === "-c"
+        && args[1]?.includes(OPENCLAW_BUNDLE_IDENTITY_PATH)
+      ) {
+        return {
+          exitCode: 0,
+          output: async (stream?: "stdout" | "stderr" | "both") =>
+            stream === "stderr"
+              ? ""
+              : `${JSON.stringify({
+                  ...BUNDLE_ADMISSION.identity,
+                  canonicalSha256: "9".repeat(64),
+                })}\n`,
+        };
+      }
+      return undefined;
+    });
+    fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+
+    await runScheduledEnsure("running-bundle-mismatch-fenced-retry");
+
+    assert.equal(handle.stopCalled, true);
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(handle.networkPolicies.length, 0);
+    assert.equal(
+      handle.commands.some(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-lc"
+          && command.args[1]?.includes("gateway_kill.unconfirmed"),
+      ),
+      false,
+    );
+    assert.equal(
+      handle.commands.some(
+        (command) =>
+          command.cmd === "bash"
+          && command.args?.[0] === "-c"
+          && command.args[1]?.includes(OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH),
+      ),
+      false,
+    );
+    assert.deepEqual(
+      handle.commands.filter(
+        (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+      ),
+      [],
+    );
+    const meta = await getInitializedMeta();
+    assert.equal(meta.status, "error");
+    assert.match(meta.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
+    const suspension = await readHostSuspensionState();
+    assert.ok(suspension);
+    assert.equal(suspension.sandboxId, LIFECYCLE_SANDBOX_NAME);
+    assert.equal(suspension.reason, "sandbox.bundle_migration_required");
+    assert.equal(suspension.phase, "stopped");
+    assert.equal(suspension.ingressFenced, true);
+    assert.notEqual(suspension.operationId, "prior-bundle-mismatch-operation");
+    assert.ok(suspension.lifecycleAttemptId);
+    assert.notEqual(suspension.lifecycleAttemptId, priorAttemptId);
+    assert.equal(meta.lifecycleAttemptId, suspension.lifecycleAttemptId);
+  });
+});
+
 test("bundle migration retains the discovered sandbox ID for reset", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
   const discoveredSandboxId = "sbx-discovered-existing";
+  const priorAttemptId = "bundle-discovered-mismatch-attempt";
 
   await withTestEnv(fake, async () => {
     configureBundleLifecycleTest();
@@ -2596,6 +4774,7 @@ test("bundle migration retains the discovered sandbox ID for reset", async () =>
       meta.status = "stopped";
       meta.sandboxId = null;
       meta.gatewayToken = "gw-token";
+      meta.lifecycleAttemptId = priorAttemptId;
       meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
     });
     const staleHandle = new FakeSandboxHandle(discoveredSandboxId, fake.events);
@@ -2621,6 +4800,15 @@ test("bundle migration retains the discovered sandbox ID for reset", async () =>
     });
     fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, staleHandle);
     fake.handlesByIds.set(discoveredSandboxId, staleHandle);
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(discoveredSandboxId, {
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
 
@@ -2630,6 +4818,7 @@ test("bundle migration retains the discovered sandbox ID for reset", async () =>
       const failed = await getInitializedMeta();
       assert.equal(failed.status, "error");
       assert.equal(failed.sandboxId, discoveredSandboxId);
+      assert.match(failed.lastError ?? "", /^OPENCLAW_BUNDLE_MIGRATION_REQUIRED:/);
 
       await resetSandbox({
         origin: "https://test.example.com",
@@ -2646,6 +4835,7 @@ test("bundle migration retains the discovered sandbox ID for reset", async () =>
 test("bundle migration parks durable stop state before the platform request", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
+  const priorAttemptId = "bundle-durable-stop-attempt";
 
   await withTestEnv(fake, async () => {
     configureBundleLifecycleTest();
@@ -2653,6 +4843,7 @@ test("bundle migration parks durable stop state before the platform request", as
       meta.status = "stopped";
       meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
       meta.gatewayToken = "gw-token";
+      meta.lifecycleAttemptId = priorAttemptId;
       meta.bundleIdentity = structuredClone(BUNDLE_ADMISSION.identity);
     });
 
@@ -2694,6 +4885,15 @@ test("bundle migration parks durable stop state before the platform request", as
       throw new Error("connection lost after stop acceptance");
     };
     fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, staleHandle);
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: priorAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
 
@@ -3452,11 +5652,12 @@ test("restoreSandboxFromSnapshot records successful firewall sync before running
         policy.allow["test.example.com"],
         "should include the cron projection control plane",
       );
-      // v2: resume path applies firewall but doesn't record detailed sync outcome
       assert.ok(
         (meta.lastRestoreMetrics?.firewallSyncMs ?? 0) >= 0,
         "firewallSyncMs should be recorded",
       );
+      assert.equal(meta.firewall.lastSyncOutcome?.applied, true);
+      assert.equal(meta.firewall.lastSyncReason, "policy-applied");
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -3484,18 +5685,99 @@ test("restoreSandboxFromSnapshot fails closed when enforcing firewall sync fails
       new Response('<div id="openclaw-app"></div>', { status: 200 });
 
     try {
-      const { handle: _handle, meta } = await triggerRestore(fake, {
+      const { handle, meta } = await triggerRestore(fake, {
         tokenOverride: "test-ai-key",
       });
 
       assert.equal(meta.status, "error");
-      // v2: resume path error message says "persistent resume", not "restore"
-      assert.ok(
-        meta.lastError?.includes("Firewall sync failed"),
-        `expected firewall error, got: ${meta.lastError}`,
+      assert.equal(meta.lastError, FIREWALL_FAIL_CLOSED_LAST_ERROR);
+      assert.equal(handle.stopCalled, true);
+      assert.equal(handle.lastStopOptions?.blocking, true);
+      const restoreAssetWriteIndex = fake.events.findIndex(
+        (event) =>
+          event.sandboxId === handle.sandboxId
+          && event.kind === "write_files"
+          && Array.isArray(event.detail?.paths)
+          && event.detail.paths.includes(OPENCLAW_FAST_RESTORE_SCRIPT_PATH),
       );
+      const gatewayKillIndex = fake.events.findIndex(
+        (event) =>
+          event.sandboxId === handle.sandboxId
+          && event.kind === "command"
+          && Array.isArray(event.detail?.args)
+          && event.detail.args[0] === "-lc"
+          && typeof event.detail.args[1] === "string"
+          && event.detail.args[1].includes("gateway_kill.unconfirmed"),
+      );
+      assert.ok(restoreAssetWriteIndex >= 0, "current restore script must be installed");
+      assert.ok(
+        gatewayKillIndex >= 0 && gatewayKillIndex < restoreAssetWriteIndex,
+        "captured-session Gateway kill must precede all restore asset writes",
+      );
+      const suspension = await readHostSuspensionState();
+      assert.equal(suspension?.phase, "replacement-failed");
+      assert.equal(suspension?.replacementStage, "preparing");
+      assert.equal(suspension?.ingressFenced, true);
+      const fastRestorePhases = handle.commands
+        .filter(
+          (command) =>
+            command.cmd === "bash"
+            && command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+        )
+        .map((command) => command.args?.[2]);
+      assert.deepEqual(
+        fastRestorePhases,
+        [],
+        "The captured-session kill owns replacement; fail-close must not restart it",
+      );
+
+      handle.networkPolicyHandler = undefined;
+      await runScheduledEnsure("firewall-fail-close-retry");
+      const recovered = await getInitializedMeta();
+      assert.equal(recovered.status, "running");
+      assert.equal(await readHostSuspensionState(), null);
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent enforcing resume does not strand booting on firewall-owner contention", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-firewall-lock-busy";
+      meta.gatewayToken = "test-gw-token";
+      meta.firewall.mode = "enforcing";
+      meta.firewall.allowlist = ["api.openai.com"];
+    });
+    const lockToken = await getStore().acquireLock(
+      firewallPolicyApplyLockKey(),
+      330,
+    );
+    assert.ok(lockToken);
+
+    try {
+      const { handle, meta } = await triggerRestore(fake, {
+        tokenOverride: "test-ai-key",
+      });
+
+      assert.equal(meta.status, "error");
+      assert.notEqual(meta.status, "booting");
+      assert.match(meta.lastError ?? "", /firewall policy application/i);
+      const phases = handle.commands
+        .filter(
+          (command) => command.args?.[0] === OPENCLAW_FAST_RESTORE_SCRIPT_PATH,
+        )
+        .map((command) => command.args?.[2]);
+      assert.deepEqual(phases, []);
+      const suspension = await readHostSuspensionState();
+      assert.equal(suspension?.phase, "replacement-failed");
+      assert.equal(suspension?.ingressFenced, true);
+    } finally {
+      await getStore().releaseLock(firewallPolicyApplyLockKey(), lockToken);
     }
   });
 });
@@ -3726,12 +6008,9 @@ test("persistent resume passes restore env to fast-restore script", async () => 
   await withTestEnv(fake, async () => {
     await mutateMeta((meta) => {
       meta.status = "stopped";
-      meta.sandboxId = "sbx-persistent";
+      meta.sandboxId = LIFECYCLE_SANDBOX_NAME;
       meta.gatewayToken = "test-gw-token";
     });
-
-    // Pre-register a resumed handle so the fast-restore path is taken
-    const _resumeHandle = preRegisterResumeHandle(fake);
 
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
@@ -3881,8 +6160,8 @@ test("restoreSandboxFromSnapshot with fast-restore script exit code != 0 throws 
       meta.gatewayToken = "test-gw-token";
     });
 
-    // Pre-register a resumed handle so get() succeeds and resume path is taken
-    preRegisterResumeHandle(fake);
+    // Model the canonical stopped generation that the resume path may adopt.
+    await preRegisterFencedStoppedResumeHandle(fake);
 
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
@@ -5742,8 +8021,8 @@ test("[failure] restore failure from stopped state (fast-restore script fails)",
       meta.gatewayToken = "test-gw-token";
     });
 
-    // Pre-register a resumed handle so the fast-restore path is taken
-    preRegisterResumeHandle(fake);
+    // Model the canonical stopped generation that the resume path may adopt.
+    await preRegisterFencedStoppedResumeHandle(fake);
 
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
@@ -5793,8 +8072,8 @@ test("[failure] credential writeFiles failure does not block restore (env-based 
       meta.gatewayToken = "test-gw-token";
     });
 
-    // Pre-register a resumed handle so the fast-restore path is taken
-    preRegisterResumeHandle(fake);
+    // Model the canonical stopped generation that the resume path may adopt.
+    await preRegisterFencedStoppedResumeHandle(fake);
 
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
@@ -6528,7 +8807,24 @@ test("concurrent ensureSandboxRunning with op context: exactly one restore, rest
 
     // Execute the resume
     // Pre-register a handle for the persistent sandbox name so get() succeeds
-    preRegisterResumeHandle(fake);
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const scheduledMeta = await getInitializedMeta();
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        lifecycleAttemptId: scheduledMeta.lifecycleAttemptId,
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
     await callbacks[0]();
 
     const meta = await getInitializedMeta();
@@ -7633,6 +9929,43 @@ test("resetSandbox deletes first and clears corrupt durable suspension state", a
   });
 });
 
+test("resetSandbox rejects incomplete provider snapshot cleanup and retains failed history", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    await mutateMeta((meta) => {
+      meta.snapshotId = "snap-current-reset-failure";
+      meta.snapshotHistory = [
+        {
+          id: "history-reset-failure",
+          snapshotId: "snap-current-reset-failure",
+          timestamp: Date.now(),
+          reason: "manual",
+        },
+      ];
+    });
+
+    await assert.rejects(
+      resetSandbox(
+        { origin: "https://app.example.com", reason: "partial-reset-test" },
+        { deleteSnapshot: async () => { throw new Error("provider unavailable"); } },
+      ),
+      (error: unknown) =>
+        error instanceof ApiError
+        && error.status === 502
+        && error.code === "SANDBOX_RESET_INCOMPLETE",
+    );
+
+    const after = await getInitializedMeta();
+    assert.equal(after.status, "error");
+    assert.equal(after.sandboxId, null);
+    assert.equal(after.snapshotId, "snap-current-reset-failure");
+    assert.deepEqual(
+      after.snapshotHistory.map((record) => record.snapshotId),
+      ["snap-current-reset-failure"],
+    );
+  });
+});
+
 test("resetSandbox rotates cron generation when metadata has no sandbox", async () => {
   await withHarness(async () => {
     const before = await getInitializedMeta();
@@ -7756,6 +10089,96 @@ test("resetSandbox clears metadata and suspension when deadline cleanup fails af
     assert.equal(after.status, "error");
     assert.match(after.lastError ?? "", /deadline cleanup unavailable/);
     assert.equal(await store.getValue(hostSuspensionOperationKey()), null);
+  });
+});
+
+test("resetSandbox retries fence cleanup after terminal metadata already committed", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await getInitializedMeta();
+    assert.ok(before.sandboxId);
+    const handle = h.controller.getHandle(before.sandboxId);
+    assert.ok(handle);
+    const store = getStore();
+    const deleteValue = store.deleteValue.bind(store);
+    let cleanupAttempts = 0;
+    store.deleteValue = async (key) => {
+      if (key === hostSuspensionOperationKey()) {
+        cleanupAttempts += 1;
+        if (cleanupAttempts === 1) {
+          throw new Error("suspension cleanup unavailable");
+        }
+      }
+      return deleteValue(key);
+    };
+
+    try {
+      await assert.rejects(
+        resetSandbox({
+          origin: "https://app.example.com",
+          reason: "post-commit-suspension-cleanup-retry-test",
+        }),
+        /suspension cleanup unavailable/,
+      );
+    } finally {
+      store.deleteValue = deleteValue;
+    }
+
+    const after = await getInitializedMeta();
+    assert.equal(handle.deleteCalled, true);
+    assert.equal(after.status, "uninitialized");
+    assert.equal(after.sandboxId, null);
+    assert.equal(after.lifecycleAttemptId, null);
+    assert.equal(cleanupAttempts, 2);
+    assert.equal(await readHostSuspensionState(), null);
+  });
+});
+
+test("resetSandbox keeps ingress fenced when deleted-state metadata cannot commit", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const before = await getInitializedMeta();
+    assert.ok(before.sandboxId);
+    const handle = h.controller.getHandle(before.sandboxId);
+    assert.ok(handle);
+    const store = getStore();
+    const deleteValue = store.deleteValue.bind(store);
+    const compareAndSetMeta = store.compareAndSetMeta.bind(store);
+    let sandboxDeleted = false;
+    handle.deleteHook = () => {
+      sandboxDeleted = true;
+    };
+    store.deleteValue = async (key) => {
+      if (key === sandboxDeadlineV2Key()) {
+        throw new Error("deadline cleanup unavailable");
+      }
+      return deleteValue(key);
+    };
+    store.compareAndSetMeta = async (version, next) => {
+      if (sandboxDeleted) throw new Error("metadata unavailable");
+      return compareAndSetMeta(version, next);
+    };
+
+    try {
+      await assert.rejects(
+        resetSandbox({
+          origin: "https://app.example.com",
+          reason: "post-delete-meta-failure-test",
+        }),
+        /deadline cleanup unavailable/,
+      );
+    } finally {
+      store.deleteValue = deleteValue;
+      store.compareAndSetMeta = compareAndSetMeta;
+    }
+
+    assert.equal(handle.deleteCalled, true);
+    const staleMeta = await getInitializedMeta();
+    assert.equal(staleMeta.sandboxId, before.sandboxId);
+    assert.equal(staleMeta.status, "running");
+    const suspension = await readHostSuspensionState();
+    assert.equal(suspension?.sandboxId, before.sandboxId);
+    assert.equal(suspension?.ingressFenced, true);
   });
 });
 
@@ -8066,17 +10489,16 @@ test("[lifecycle] touchRunningSandbox liveness runCommand throws -> NOT marked u
 });
 
 // ---------------------------------------------------------------------------
-// Q4: Resume failure via unhealthy handle falls back to create and clears snapshot
+// Q4: Ambiguous persisted generations fail closed instead of deleting user state
 // ---------------------------------------------------------------------------
 
-test("[lifecycle] ensureSandboxRunning resume unhealthy handle restores its selected snapshot", async () => {
+test("[lifecycle] ensureSandboxRunning refuses an unfenced unhealthy persistent handle", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
 
   await withTestEnv(fake, async () => {
-    // Pre-register an "oc-*" handle that reports an unhealthy status so the
-    // resume path at createAndBootstrapSandboxWithinLifecycleLock treats it
-    // as dead and falls through to create().
+    // A failed handle is still persistent user state. Without an exact fence,
+    // neither resuming nor deleting it is authorized.
     const sandboxName = `oc-${"openclaw-single".replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`;
     const unhealthy = new FakeSandboxHandle(sandboxName, fake.events, 60_000);
     unhealthy.setStatus("failed");
@@ -8125,28 +10547,20 @@ test("[lifecycle] ensureSandboxRunning resume unhealthy handle restores its sele
       await (scheduledCallback as () => Promise<void>)();
 
       const meta = await getInitializedMeta();
-      assert.equal(meta.status, "running", "Should reach running after fallback");
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /SANDBOX_RESUME_UNFENCED/);
       assert.equal(meta.snapshotId, "snap-resume-fail");
       assert.equal(meta.snapshotConfigHash, "hash-existing");
       assert.equal(meta.snapshotDynamicConfigHash, "dynhash-existing");
       assert.equal(meta.snapshotAssetSha256, "assetsha-existing");
       assert.equal(meta.restorePreparedStatus, "ready");
       assert.equal(meta.restorePreparedReason, null);
-      assert.deepEqual(fake.createCalls.at(-1)?.source, {
-        type: "snapshot",
-        snapshotId: "snap-resume-fail",
-      });
-      // snapshotHistory is NOT wiped by the fallback path — it remains for
-      // diagnostics / future prepare cycles. Asserted so the invariant is
-      // explicit and any future behavior change is caught.
+      assert.equal(fake.createCalls.length, 0);
       assert.ok(
         meta.snapshotHistory.length >= 2,
-        `snapshotHistory should be retained on fallback, got length=${meta.snapshotHistory.length}`,
+        `snapshotHistory should be retained, got length=${meta.snapshotHistory.length}`,
       );
-      assert.ok(
-        unhealthy.deleteCalled,
-        "Unhealthy handle should have been deleted before create fallback",
-      );
+      assert.equal(unhealthy.deleteCalled, false);
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
@@ -8154,7 +10568,7 @@ test("[lifecycle] ensureSandboxRunning resume unhealthy handle restores its sele
   });
 });
 
-test("[lifecycle] ensureSandboxRunning resume stopped handle after explicit resume -> falls back to create", async () => {
+test("[lifecycle] ensureSandboxRunning fails closed when explicit resume stays stopped", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
 
@@ -8201,15 +10615,14 @@ test("[lifecycle] ensureSandboxRunning resume stopped handle after explicit resu
       await (scheduledCallback as () => Promise<void>)();
 
       const meta = await getInitializedMeta();
-      assert.equal(meta.status, "running", "Should reach running after fallback");
+      assert.equal(meta.status, "error");
+      assert.match(meta.lastError ?? "", /GATEWAY_TERMINATION_UNCONFIRMED/);
       assert.equal(meta.snapshotId, "snap-resume-stopped");
       assert.equal(meta.restorePreparedStatus, "ready");
       assert.equal(meta.restorePreparedReason, null);
-      assert.deepEqual(fake.createCalls.at(-1)?.source, {
-        type: "snapshot",
-        snapshotId: "snap-resume-stopped",
-      });
-      assert.ok(stopped.deleteCalled, "Stopped handle should be deleted before create fallback");
+      assert.equal(fake.createCalls.length, 0);
+      assert.equal(stopped.deleteCalled, false);
+      assert.equal((await readHostSuspensionState())?.ingressFenced, true);
       assert.deepEqual(fake.getCalls.slice(0, 2), [
         { sandboxId: sandboxName, resume: false },
         { sandboxId: sandboxName, resume: true },
@@ -8491,6 +10904,50 @@ test("snapshotting reconciliation completes a committed platform-stop fence", as
     assert.equal(reconciled.status, "stopped");
     assert.equal(reconciled.portUrls, null);
     assert.equal((await readHostSuspensionState())?.ingressFenced, true);
+  });
+});
+
+test("ensureSandboxRunning heals a committed platform-stop fence before scheduling wake", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-platform-stop-ensure-crash";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    handle.setStatus("stopped");
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.snapshotId = "snap-platform-stop-ensure";
+      meta.lifecycleAttemptId = "attempt-platform-stop-ensure";
+      meta.portUrls = { "3000": "https://stale.invalid" };
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        lifecycleAttemptId: "attempt-platform-stop-ensure",
+        reason: PLATFORM_STOP_CONFIRMED_REASON,
+        phase: "stopped",
+        suspensionId: null,
+        leaseExpiresAtMs: null,
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+    const scheduled: Array<() => Promise<void> | void> = [];
+
+    const result = await ensureSandboxRunning({
+      origin: "https://app.example.com",
+      reason: "platform-stop-crash-wake",
+      schedule(callback) {
+        scheduled.push(callback);
+      },
+    });
+
+    assert.equal(result.state, "waiting");
+    assert.equal(scheduled.length, 1);
+    const after = await getInitializedMeta();
+    assert.equal(after.status, "restoring");
+    assert.equal(after.portUrls, null);
   });
 });
 

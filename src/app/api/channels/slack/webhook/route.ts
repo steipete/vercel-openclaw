@@ -2,7 +2,6 @@ import * as workflowApi from "workflow/api";
 
 import {
   CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS,
-  SLACK_USER_MESSAGE_DEDUP_LOCK_TTL_SECONDS,
   tryAcquireChannelDedupLock,
   type ChannelDedupLock,
 } from "@/server/channels/dedup";
@@ -30,10 +29,7 @@ import {
   OPENCLAW_GATEWAY_SUSPEND_CAPABILITY,
 } from "@/server/channels/native-response-contract";
 import { getPublicOrigin } from "@/server/public-url";
-import {
-  channelDedupKey,
-  channelUserMessageDedupKey,
-} from "@/server/channels/keys";
+import { channelDedupKey } from "@/server/channels/keys";
 import {
   drainChannelWorkflow,
   type DrainChannelWorkflowEnvelopeV1,
@@ -360,9 +356,15 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   let dedupLock: SlackWebhookDedupLock | null = null;
-  const handoffDeliveryId = dedupId
-    ? `slack:${dedupId}`
-    : `slack:request:${requestId ?? receivedAtMs}`;
+  // Slack may emit app_mention and message events with different event_ids
+  // for one user post. The durable handoff identity collapses that pair
+  // without a long-lived pre-handoff lock that could strand work on crash.
+  const handoffDeliveryId =
+    eventInfo.channel && eventInfo.ts
+      ? `slack:user-message:${eventInfo.channel}:${eventInfo.ts}`
+      : dedupId
+        ? `slack:${dedupId}`
+        : `slack:request:${requestId ?? receivedAtMs}`;
   if (dedupId) {
     const dedupKey = channelDedupKey("slack", dedupId);
     const dedupResult = await tryAcquireChannelDedupLock({
@@ -929,51 +931,6 @@ export async function POST(request: Request): Promise<Response> {
     }));
   }
 
-  // Wake-path only: collapse Slack's dual-event delivery (app_mention +
-  // message.channels for the same user post). Both have distinct event_ids
-  // so the event-id dedup above lets both through; this second lock keyed on
-  // the user message's channel+ts ensures only ONE wake/workflow per user
-  // post. The fast path above intentionally forwards BOTH events to the
-  // native Bolt handler, which has its own dedup.
-  let userMessageDedupLock: SlackWebhookDedupLock | null = null;
-  const userMessageTs =
-    typeof (payload as { event?: { ts?: unknown } } | null)?.event?.ts === "string"
-      ? (payload as { event: { ts: string } }).event.ts
-      : null;
-  if (eventInfo.channel && userMessageTs) {
-    const userMessageKey = channelUserMessageDedupKey(
-      "slack",
-      eventInfo.channel,
-      userMessageTs,
-    );
-    const userMessageResult = await tryAcquireChannelDedupLock({
-      channel: "slack",
-      key: userMessageKey,
-      ttlSeconds: SLACK_USER_MESSAGE_DEDUP_LOCK_TTL_SECONDS,
-      requestId: requestId ?? null,
-      dedupId: userMessageTs,
-      lockKind: "user-message",
-    });
-    if (userMessageResult.kind === "duplicate") {
-      logInfo(
-        "channels.slack_webhook_user_message_dedup_skip",
-        withOperationContext(op, {
-          channel: eventInfo.channel,
-          ts: userMessageTs,
-          eventType: eventInfo.eventType,
-          eventSubtype: eventInfo.eventSubtype,
-          dedupId,
-        }),
-      );
-      return Response.json({ ok: true });
-    }
-    if (userMessageResult.kind === "acquired") {
-      userMessageDedupLock = userMessageResult.lock;
-    }
-    // degraded: continue without user-message dedup. The helper already
-    // emitted channels.dedup_lock_acquire_failed_degraded.
-  }
-
   // External placeholder creation belongs to the durable Workflow step. The
   // webhook route only hands off the target, so process death or a hung start
   // cannot strand a message with no durable cleanup owner.
@@ -1063,11 +1020,8 @@ export async function POST(request: Request): Promise<Response> {
         error,
       }).catch(() => {});
     }
-    const [dedupRelease, userMessageRelease] =
-      await releaseSlackWebhookDedupLocksForRetry([
-        dedupLock,
-        userMessageDedupLock,
-      ]);
+    const [dedupRelease] =
+      await releaseSlackWebhookDedupLocksForRetry([dedupLock]);
     logWarn("channels.slack_workflow_start_failed", withOperationContext(op, {
       error: error instanceof Error ? error.message : String(error),
       attemptedAction: "start_drain_channel_workflow",
@@ -1075,10 +1029,6 @@ export async function POST(request: Request): Promise<Response> {
       dedupLockReleaseAttempted: dedupRelease.attempted,
       dedupLockReleased: dedupRelease.released,
       dedupLockReleaseError: dedupRelease.releaseError,
-      userMessageDedupLockKey: userMessageDedupLock?.key ?? null,
-      userMessageDedupLockReleaseAttempted: userMessageRelease.attempted,
-      userMessageDedupLockReleased: userMessageRelease.released,
-      userMessageDedupLockReleaseError: userMessageRelease.releaseError,
       bootMessageCleanupAttempted: false,
       bootMessageCleanupSucceeded: null,
       retryable: true,
@@ -1099,7 +1049,6 @@ export async function POST(request: Request): Promise<Response> {
         dedupId,
         bootMessageDeferredToWorkflow: slackBootTarget !== null,
         dedupLockReleased: dedupRelease.released,
-        userMessageDedupLockReleased: userMessageRelease.released,
         eventInfo,
       },
     });

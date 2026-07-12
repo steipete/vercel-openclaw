@@ -8,6 +8,10 @@ import {
   ensureSandboxRunning,
   probeGatewayReady,
 } from "@/server/sandbox/lifecycle";
+import {
+  buildHostIngressFencedResponse,
+  getHostMutationFence,
+} from "@/server/sandbox/host-suspension";
 import { jsonError } from "@/shared/http";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
@@ -41,6 +45,48 @@ export async function POST(request: Request): Promise<Response> {
     const origin = getPublicOrigin(request);
     const wait = parseWaitFlag(request);
     const startedAtMs = Date.now();
+
+    const admittedFence = await getHostMutationFence();
+    const gatewayReplacementRecovery = admittedFence
+      && (
+        admittedFence.phase === "replacement-starting"
+        || admittedFence.phase === "replacement-failed"
+      );
+    if (
+      admittedFence
+      && !gatewayReplacementRecovery
+      && admittedFence.phase !== "stopped"
+    ) {
+      return buildHostIngressFencedResponse(admittedFence);
+    }
+    if (gatewayReplacementRecovery) {
+      const recovered = await ensureSandboxRunning({
+        origin,
+        reason: "admin.ensure.gateway-replacement-recovery",
+        schedule: after,
+      });
+      const remainingFence = await getHostMutationFence();
+      if (remainingFence) {
+        return buildHostIngressFencedResponse(remainingFence);
+      }
+      if (!wait) {
+        const response = Response.json(
+          {
+            mode: "async",
+            state: recovered.state,
+            ready: recovered.state === "running",
+            status: recovered.meta.status,
+            sandboxId: recovered.meta.sandboxId ?? null,
+            waitedMs: 0,
+          },
+          { status: recovered.state === "running" ? 200 : 202 },
+        );
+        if (auth.setCookieHeader) {
+          response.headers.append("Set-Cookie", auth.setCookieHeader);
+        }
+        return response;
+      }
+    }
 
     if (wait) {
       const meta = await ensureSandboxReady({

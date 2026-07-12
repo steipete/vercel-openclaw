@@ -1,6 +1,6 @@
 ---
 name: slack-delivery
-description: "Slack channel specialist workflow: debug Slack OAuth vs delivery-ready, /slack/events fast path, raw-body signatures, route repair, boot-message cleanup, and lastForward."
+description: "Slack channel specialist workflow: debug OAuth, durable Workflow handoff, /slack/events signatures, cleanup, and lastForward."
 ---
 
 # Slack Delivery
@@ -18,16 +18,16 @@ Use after `channel-debug-core` for Slack issues.
 ## Runtime Path
 
 ```text
-Slack event -> /api/channels/slack/webhook -> Slack signature validation over raw body -> event/bot/subtype/user-message dedup -> fast path to port 3000 /slack/events OR workflow -> Bolt signature re-verification -> threaded Slack reply
+Slack event -> /api/channels/slack/webhook -> Slack signature validation over raw body -> durable Workflow handoff -> port 3000 /slack/events -> Bolt signature re-verification -> threaded Slack reply
 ```
 
 ## Parallel Lane Inputs To Consume
 
 Before proposing a Slack fix, consume:
 
-- Vercel/app logs lane: `channels.slack_webhook_accepted`, fast-path event, fallback/workflow event, requestId/deliveryId, and project targeting proof.
+- Vercel/app logs lane: `channels.slack_webhook_accepted`, Workflow handoff, requestId/deliveryId, and project targeting proof.
 - Sandbox runtime lane: port 3000 listener, `/slack/events` probe behavior, OpenClaw plugin count, sanitized config has `channels.slack`.
-- Workflow lane: `drainChannelWorkflow` run state when fast path skipped/failed, with verified project targeting when `.vercel/project.json` differs from the incident target.
+- Workflow lane: `drainChannelWorkflow` run and native-forward state, with verified project targeting when `.vercel/project.json` differs from the incident target.
 - Prior-fix comparison: openclaw-42 zero-plugin wedge, stale sandbox URL, workflow retry exhaustion, Slack 401 raw-body/signature failure.
 
 ## Special Checks

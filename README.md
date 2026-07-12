@@ -198,7 +198,7 @@ See [Hosted Feature Support](docs/getting-started/hosted-feature-support.md) for
 - **Slack and Telegram** channels with durable delivery. Discord and WhatsApp remain available through local/upstream OpenClaw, not this hosted wrapper.
 - **Bundled OpenClaw plugins and skills only.** Arbitrary plugin, skill, ClawHub, MCP, and tool installation is a local/upstream OpenClaw path until a hosted lifecycle contract exists.
 - **Egress firewall.** Learn which domains your agent talks to, then lock it down.
-- **Auto-wake (experimental).** Verified bundles declaring `cron-projection-v1` can arm a durable, token-revalidating Workflow from a sanitized OpenClaw wake projection; the watchdog repairs stale dispatch.
+- **Auto-wake (experimental).** Verified bundles declaring `cron-projection-v1` (legacy `gateway_start` baseline) or `cron-projection-v2` (`cron_reconciled` baseline) can arm a durable, token-revalidating Workflow from a sanitized OpenClaw wake projection; the watchdog repairs stale dispatch.
 
 ## Built with
 
@@ -264,15 +264,15 @@ With `LOCAL_READ_ONLY=1`, `POST /api/admin/stop`, `/ensure`, `/reset`, `/snapsho
 
 ## Debugging channels with agents
 
-Channel delivery has several independent states: the app can be connected, the sandbox can be running, the native handler can accept a forward, and the user still might not see a reply. When Slack, Telegram, or Discord is stuck, use the repo-local Codex agents and skills to split evidence gathering by channel instead of guessing from one readiness label. Hosted WhatsApp should fail closed; use the local/upstream linked-device path instead.
+Channel delivery has several independent states: the app can be connected, the sandbox can be running, the native handler can accept a forward, and the user still might not see a reply. When Slack or Telegram is stuck, use the repo-local Codex agents and skills to split evidence gathering by channel instead of guessing from one readiness label. Hosted Discord and WhatsApp should fail closed; use their local/upstream transports instead.
 
 Codex custom agent roles live in `.codex/agents/*.toml`; shared debugging playbooks live in `.agents/skills/*/SKILL.md`. Use the channel agents for parallel triage and the skills for repeatable evidence collection:
 
 | Channel | Agent | Primary skill | Focus |
 | ------- | ----- | ------------- | ----- |
 | Telegram | `channel_telegram` | `telegram-native-8787` | Native port 8787, webhook secret flow, boot cleanup, user-visible replies |
-| Slack | `channel_slack` | `slack-delivery` | OAuth vs delivery readiness, raw-body signature forwarding, `/slack/events` fast path |
-| Discord | `channel_discord` | `discord-delivery` | Ed25519 verification, interaction deferral, token expiry, workflow forwarding |
+| Slack | `channel_slack` | `slack-delivery` | OAuth vs delivery readiness, raw-body signature Workflow forwarding, `/slack/events` acceptance |
+| Discord (hosted disabled) | `channel_discord` | `discord-delivery` | Ed25519 verification, immediate fail-closed replies, and legacy endpoint cleanup |
 | WhatsApp (hosted disabled) | `channel_whatsapp` | `whatsapp-delivery` | Fail-closed setup/webhook proof and legacy credential removal |
 
 For any channel incident, start with `$channel-debug-core`. It requires deployment-state proof, the admin readiness surfaces, a runtime path diagram, a hypothesis table, and a channel handoff before proposing a fix. Before changing webhook routes or the shared workflow, use `$channel-forward-parity` to verify every terminal path logs, updates `lastForward`, classifies failures, and refreshes stale sandbox port URLs when needed.
@@ -310,7 +310,7 @@ For cron incidents, start with `$cron-watchdog-debug` and keep these states sepa
 | [Architecture](docs/architecture.md) | System overview and subsystem map |
 | [Sandbox Lifecycle and Restore](docs/lifecycle-and-restore.md) | State transitions, persistent sandboxes, resume behavior |
 | [Preflight and Launch Verification](docs/preflight-and-launch-verification.md) | Deployment readiness and runtime verification |
-| [Channels and Webhooks](docs/channels-and-webhooks.md) | Slack, Telegram, Discord, hosted WhatsApp limitations, readiness, protection behavior |
+| [Channels and Webhooks](docs/channels-and-webhooks.md) | Slack/Telegram delivery, Discord/WhatsApp hosted limitations, readiness, protection behavior |
 | [Environment Variables](docs/environment-variables.md) | Full env var reference |
 | [API Reference](docs/api-reference.md) | Endpoint and payload reference |
 | [Deployment Protection](docs/deployment-protection.md) | Bypass secret behavior and display-safe URLs |

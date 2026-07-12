@@ -3,7 +3,6 @@ import test from "node:test";
 
 import {
   CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS,
-  SLACK_USER_MESSAGE_DEDUP_LOCK_TTL_SECONDS,
   tryAcquireChannelDedupLock,
 } from "@/server/channels/dedup";
 import { _resetLogBuffer, getServerLogs } from "@/server/log";
@@ -110,9 +109,6 @@ test("dedup: store-level failure returns 'degraded' and emits log", async () => 
   });
 });
 
-test("dedup: acquisition lease is short while Slack message collapse stays durable", () => {
+test("dedup: acquisition lease is short so a crashed ingress can recover", () => {
   assert.equal(CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS, 30);
-  // Slack user-message lock collapses dual-event app_mention + message
-  // for the full conversation day.
-  assert.equal(SLACK_USER_MESSAGE_DEDUP_LOCK_TTL_SECONDS, 24 * 60 * 60);
 });

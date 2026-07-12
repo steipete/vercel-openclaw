@@ -139,7 +139,7 @@ Full reference:
 | `REDIS_URL` | Required on Vercel | Persistent store endpoint. Provision via the Vercel Marketplace (Redis Cloud) or point at any Redis-wire-protocol endpoint. Local dev uses the in-memory store when unset. |
 | `KV_URL` | No | Legacy alias for `REDIS_URL` (set by the Vercel KV integration). The app prefers `REDIS_URL` but falls back to `KV_URL`. |
 | `ADMIN_SECRET` | Required (`admin-secret` mode) | Secret exchanged for an encrypted session cookie via `/api/auth/login`. Auto-generated locally if unset. |
-| `CRON_SECRET` | Required on Vercel | Authenticates `/api/cron/watchdog` (daily anti-entropy by default; repairs sandbox health and missing or stale cron Workflow dispatch). Missing on Vercel is a hard failure in the deployment contract. |
+| `CRON_SECRET` | Required on Vercel | Authenticates `/api/cron/watchdog` (scheduled every five minutes by `vercel.json`; requires Vercel Pro or Enterprise because Hobby cron is daily-only). The watchdog repairs sandbox health and missing or stale cron Workflow dispatch. Missing on Vercel is a hard failure in the deployment contract. |
 | `VERCEL_AUTH_MODE` | No | `admin-secret` (default) or `sign-in-with-vercel` |
 | `NEXT_PUBLIC_VERCEL_APP_CLIENT_ID` | Sign-in mode | OAuth client ID |
 | `VERCEL_APP_CLIENT_SECRET` | Sign-in mode | OAuth client secret |

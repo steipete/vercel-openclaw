@@ -219,7 +219,7 @@ For the default path (`VERCEL_AUTH_MODE=admin-secret`), the only value you must 
 - **Redis.** Provisioned by `vclaw` (or the Deploy button) via the Redis Cloud Marketplace integration, which sets `REDIS_URL`.
 - **AI Gateway auth.** Handled via Vercel OIDC on deployed environments.
 - **Cron secret.** Falls back to `ADMIN_SECRET` when `CRON_SECRET` is unset. Set `CRON_SECRET` separately on deployed environments if you want cron auth to rotate independently from admin login. `vclaw --cron-secret` sets this for you.
-- **Watchdog cron.** Runs once daily by default so Hobby-plan deploys succeed. Cron wake timing comes from Workflow; increasing the watchdog frequency only shortens repair time for failed or stale dispatch.
+- **Watchdog cron.** Runs every five minutes via `vercel.json`, which requires Vercel Pro or Enterprise; [Hobby cron is limited to once per day](https://vercel.com/docs/cron-jobs/usage-and-pricing). Cron wake timing comes from Workflow; the watchdog cadence bounds repair delay for failed or stale dispatch.
 
 Switching to `VERCEL_AUTH_MODE=sign-in-with-vercel` also requires `NEXT_PUBLIC_VERCEL_APP_CLIENT_ID`, `VERCEL_APP_CLIENT_SECRET`, and `SESSION_SECRET`.
 

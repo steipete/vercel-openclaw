@@ -320,7 +320,8 @@ function resolveRetryBudget(
   let attempt: number | null = null;
   let workflowStartedAtMs: number | null = null;
   try {
-    attempt = dependencies.getStepMetadata().attempt;
+    // Workflow metadata is a zero-based retry index; budgets count executions.
+    attempt = dependencies.getStepMetadata().attempt + 1;
   } catch {
     // Metadata is only available inside a step; calling outside throws.
   }

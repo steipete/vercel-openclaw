@@ -86,7 +86,7 @@ test("POST /api/channels/discord/register-command is unavailable", async () => {
   });
 });
 
-test("DELETE /api/channels/discord removes legacy config even if remote cleanup fails", async () => {
+test("DELETE /api/channels/discord retains legacy config when remote cleanup fails", async () => {
   await withTestEnv(async () => {
     await mutateMeta((meta) => {
       meta.channels.discord = {
@@ -99,6 +99,37 @@ test("DELETE /api/channels/discord removes legacy config even if remote cleanup 
     const fetchMock = mock.method(globalThis, "fetch", async () => {
       throw new Error("remote unavailable");
     });
+    try {
+      const response = await callRoute(
+        getDiscordChannelRoute().DELETE!,
+        buildAuthDeleteRequest("/api/channels/discord", "{}"),
+      );
+      assert.equal(response.status, 500);
+      assert.equal(
+        (await getInitializedMeta()).channels.discord?.botToken,
+        "legacy-token",
+      );
+    } finally {
+      fetchMock.mock.restore();
+    }
+  });
+});
+
+test("DELETE /api/channels/discord removes revoked legacy credentials", async () => {
+  await withTestEnv(async () => {
+    await mutateMeta((meta) => {
+      meta.channels.discord = {
+        applicationId: "legacy-app",
+        publicKey: "legacy-key",
+        botToken: "revoked-token",
+        configuredAt: Date.now(),
+      };
+    });
+    const fetchMock = mock.method(
+      globalThis,
+      "fetch",
+      async () => new Response("Unauthorized", { status: 401 }),
+    );
     try {
       const response = await callRoute(
         getDiscordChannelRoute().DELETE!,

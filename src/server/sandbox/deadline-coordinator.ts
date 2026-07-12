@@ -44,6 +44,8 @@ export type SandboxDeadlineState = {
   nativeStopDeadlineAtMs: number | null;
   desiredIdleMs: number;
   platformTimeoutMs: number;
+  /** Durable lower bound used while cron work must remain alive. */
+  protectedUntilMs?: number | null;
   workflowRunId: string | null;
   /** Fences a single durable Workflow-start intent for this generation. */
   workflowAttemptId: string | null;
@@ -500,6 +502,7 @@ export async function armSandboxDeadline(
     forceWorkflowStart?: boolean;
     activityAtMs?: number;
     nativeTimeoutRemainingMs?: number;
+    minimumDeadlineAtMs?: number;
   } = {},
 ): Promise<SandboxDeadlineState | null> {
   if (meta.status !== "running" || !meta.sandboxId) return null;
@@ -570,7 +573,24 @@ export async function armSandboxDeadline(
     const committedActivityAtMs = typeof latestMeta.lastAccessedAt === "number"
       ? latestMeta.lastAccessedAt
       : now;
-    const desiredDeadlineAtMs = committedActivityAtMs + desiredIdleMs;
+    const inheritedProtection = (current?.protectedUntilMs ?? 0) > now
+      ? current!.protectedUntilMs!
+      : null;
+    const requestedProtection =
+      options.minimumDeadlineAtMs !== undefined
+      && Number.isSafeInteger(options.minimumDeadlineAtMs)
+      && options.minimumDeadlineAtMs > now
+        ? options.minimumDeadlineAtMs
+        : null;
+    const protectedUntilMs = inheritedProtection === null
+      ? requestedProtection
+      : requestedProtection === null
+        ? inheritedProtection
+        : Math.max(inheritedProtection, requestedProtection);
+    const desiredDeadlineAtMs = Math.max(
+      committedActivityAtMs + desiredIdleMs,
+      protectedUntilMs ?? 0,
+    );
     const existingNativeStopDeadlineAtMs = current?.nativeStopDeadlineAtMs ?? null;
     const nativeStopDeadlineAtMs = options.nativeTimeoutRemainingMs === undefined
       ? existingNativeStopDeadlineAtMs
@@ -600,6 +620,9 @@ export async function armSandboxDeadline(
           platformTimeoutMs: sealedStop
             ? current.platformTimeoutMs
             : platformTimeoutMs,
+          protectedUntilMs: sealedStop
+            ? current.protectedUntilMs ?? null
+            : protectedUntilMs,
           workflowRunId: current.workflowRunId ?? null,
           workflowAttemptId: current.workflowAttemptId ?? null,
           workflowStartLeaseExpiresAtMs:
@@ -622,6 +645,7 @@ export async function armSandboxDeadline(
           nativeStopDeadlineAtMs,
           desiredIdleMs,
           platformTimeoutMs,
+          protectedUntilMs,
           workflowRunId: null,
           workflowAttemptId: null,
           workflowStartLeaseExpiresAtMs: null,
@@ -855,9 +879,14 @@ export async function claimSandboxDeadlineStop(
       || meta.status !== "running"
     ) return false;
     if (state.lastOutcome === "stopping") return true;
-    const activityDeadlineAtMs = typeof meta.lastAccessedAt === "number"
-      ? meta.lastAccessedAt + state.desiredIdleMs
-      : state.deadlineAtMs;
+    const activityDeadlineAtMs = Math.max(
+      typeof meta.lastAccessedAt === "number"
+        ? meta.lastAccessedAt + state.desiredIdleMs
+        : state.deadlineAtMs,
+      (state.protectedUntilMs ?? 0) > deps.now()
+        ? state.protectedUntilMs!
+        : 0,
+    );
     if (state.deadlineAtMs > deps.now() || activityDeadlineAtMs > deps.now()) {
       return false;
     }
@@ -1293,9 +1322,15 @@ export async function processSandboxDeadlineStep(
         `Host suspension is ${latestSuspension?.phase ?? "unknown"}.`,
       );
     }
-    const activityDeadlineAtMs = typeof latestMeta.lastAccessedAt === "number"
-      ? latestMeta.lastAccessedAt + latest.desiredIdleMs
-      : latest.deadlineAtMs;
+    const protectedUntilMs = (latest.protectedUntilMs ?? 0) > deps.now()
+      ? latest.protectedUntilMs!
+      : null;
+    const activityDeadlineAtMs = Math.max(
+      typeof latestMeta.lastAccessedAt === "number"
+        ? latestMeta.lastAccessedAt + latest.desiredIdleMs
+        : latest.deadlineAtMs,
+      protectedUntilMs ?? 0,
+    );
     const refreshedActivityDeadlineAtMs = Math.min(
       Math.max(latest.deadlineAtMs, activityDeadlineAtMs),
       latest.nativeStopDeadlineAtMs ?? Number.POSITIVE_INFINITY,
@@ -1307,6 +1342,7 @@ export async function processSandboxDeadlineStep(
       const refreshed: SandboxDeadlineState = {
         ...latest,
         deadlineAtMs: refreshedActivityDeadlineAtMs,
+        protectedUntilMs,
         workflowScheduledDeadlineAtMs: refreshedActivityDeadlineAtMs,
         updatedAtMs: deps.now(),
         lastAttemptAtMs: null,

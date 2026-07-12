@@ -11,7 +11,7 @@ It handles:
 - proxying the OpenClaw UI at `/gateway`
 - injecting the gateway token into proxied HTML so WebSocket connections and auth work through the app
 - learning and enforcing egress firewall rules
-- receiving Slack, Telegram, and Discord (experimental) webhooks and delivering them to OpenClaw; hosted WhatsApp fails closed because its former Meta webhook transport is incompatible with OpenClaw's linked-device runtime
+- receiving Slack and Telegram webhooks and delivering them to OpenClaw; hosted Discord and WhatsApp fail closed because their persistent upstream transports are incompatible with this HTTP webhook wrapper
 - exposing a hosted feature support matrix in `/api/status`, `/api/channels/summary`, and the admin UI
 
 It does not handle:
@@ -51,7 +51,7 @@ In enforcing mode, a configured or request-resolved canonical control-plane host
 - **Sandbox lifecycle** — create, resume, stop, health checks (Sandbox v2 persistent auto-save)
 - **Proxy** — reverse proxy to the sandbox, HTML injection, waiting page
 - **Firewall** — domain learning from shell commands, policy enforcement
-- **Channels** — Slack, Telegram, and Discord (experimental) webhook ingestion, boot-message flow, durable delivery via Workflow DevKit; explicit hosted WhatsApp unsupported state
+- **Channels** — Slack and Telegram webhook ingestion, boot-message flow, and durable delivery via Workflow DevKit; explicit hosted Discord and WhatsApp unsupported states
 - **Deployment readiness** — preflight config checks, launch verification runtime checks, watchdog cron
 - **Hosted feature support** — static support matrix that keeps hosted claims distinct from upstream-only OpenClaw capabilities
 

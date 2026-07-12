@@ -110,9 +110,8 @@ test("dedup: store-level failure returns 'degraded' and emits log", async () => 
   });
 });
 
-test("dedup: TTL constants are correct for platform retry windows", () => {
-  // 1 hour covers Slack (~10min), Telegram (~30min), WhatsApp (~a few min).
-  assert.equal(CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS, 60 * 60);
+test("dedup: acquisition lease is short while Slack message collapse stays durable", () => {
+  assert.equal(CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS, 30);
   // Slack user-message lock collapses dual-event app_mention + message
   // for the full conversation day.
   assert.equal(SLACK_USER_MESSAGE_DEDUP_LOCK_TTL_SECONDS, 24 * 60 * 60);

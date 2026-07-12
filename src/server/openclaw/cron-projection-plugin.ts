@@ -84,9 +84,26 @@ export default definePluginEntry({
     let worker = Promise.resolve();
     let activeAttempt;
     let settlementTimer;
-    let reconciliationSignal;
     let sourceLeaseToken = null;
     let sourceLeaseHeartbeat;
+    let reconciliationSignal;
+
+    const adoptCronContext = (
+      ctx,
+      enabledOverride,
+      ownerSignal = lifecycle.signal,
+    ) => {
+      const nextCron = ctx.getCron?.();
+      if (!nextCron) return false;
+      cron = nextCron;
+      enabled = enabledOverride ?? (
+        process.env.OPENCLAW_SKIP_CRON !== "1"
+        && ctx.config?.cron?.enabled !== false
+      );
+      hasBaseline = true;
+      reconciliationSignal = ownerSignal;
+      return true;
+    };
 
     const waitUntil = async (deadlineMs, signal) => {
       while (Date.now() < deadlineMs) {
@@ -254,6 +271,14 @@ export default definePluginEntry({
       });
       return worker;
     };
+
+    api.on("gateway_start", (_event, ctx) => {
+      if (!adoptCronContext(ctx)) {
+        api.logger.warn("gateway startup did not expose a cron scheduler");
+        return;
+      }
+      return requestProjection("startup");
+    });
 
     api.on("cron_reconciled", (event, ctx) => {
       const reconciledCron = ctx.getCron?.();

@@ -8,8 +8,15 @@ import {
   stopSandbox,
   touchRunningSandbox,
 } from "@/server/sandbox/lifecycle";
+import type { HostSuspensionState } from "@/server/sandbox/host-suspension";
 import { _setSandboxControllerForTesting } from "@/server/sandbox/controller";
-import { _resetStoreForTesting, getInitializedMeta, mutateMeta } from "@/server/store/store";
+import { hostSuspensionOperationKey } from "@/server/store/keyspace";
+import {
+  _resetStoreForTesting,
+  getInitializedMeta,
+  getStore,
+  mutateMeta,
+} from "@/server/store/store";
 import { FakeSandboxController, FakeSandboxHandle } from "@/test-utils/fake-sandbox-controller";
 
 const ENV_KEYS = [
@@ -97,10 +104,9 @@ test("LC-04 explicit wake path resumes persistent sandbox with resume:true", asy
   await withLifecycleEnv(fake, async () => {
     const meta = await getInitializedMeta();
     const persistentSandboxName = `oc-${meta.id.replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`;
-    fake.handlesByIds.set(
-      persistentSandboxName,
-      new FakeSandboxHandle(persistentSandboxName, fake.events),
-    );
+    const handle = new FakeSandboxHandle(persistentSandboxName, fake.events);
+    handle.setStatus("stopped");
+    fake.handlesByIds.set(persistentSandboxName, handle);
 
     await mutateMeta((meta) => {
       meta.status = "stopped";
@@ -109,6 +115,39 @@ test("LC-04 explicit wake path resumes persistent sandbox with resume:true", asy
       meta.persistedStateSavedAt = Date.now();
       meta.persistedStateSource = "persistent-auto-save";
     });
+    const now = Date.now();
+    const stoppedSuspension: HostSuspensionState = {
+      version: 1,
+      operationId: "lc-04-stop",
+      requestId: "lc-04-stop",
+      sandboxId: persistentSandboxName,
+      lifecycleAttemptId: null,
+      intent: "stop",
+      reason: "lc-04-fixture",
+      phase: "stopped",
+      ingressFenced: true,
+      suspensionId: "lc-04-suspension",
+      leaseExpiresAtMs: now + 120_000,
+      stopRequestDeadlineAtMs: null,
+      monitorHeartbeatAtMs: now,
+      startedAtMs: now - 1_000,
+      updatedAtMs: now,
+      stoppedAtMs: now,
+      resumedAtMs: null,
+      lastError: null,
+      lastErrorCode: null,
+      lastErrorClass: null,
+    };
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      stoppedSuspension,
+    );
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (params) => {
+      const found = await originalGet(params);
+      if (params.resume === true) handle.setStatus("running");
+      return found;
+    };
 
     await ensureSandboxRunning({
       origin: "https://app.example.test",
@@ -119,11 +158,10 @@ test("LC-04 explicit wake path resumes persistent sandbox with resume:true", asy
     });
 
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(
-      fake.getCalls.some((call) => call.sandboxId === persistentSandboxName && call.resume === true),
-      true,
-      "explicit wake should use resume:true",
-    );
+    assert.deepEqual(fake.getCalls.slice(0, 2), [
+      { sandboxId: persistentSandboxName, resume: false },
+      { sandboxId: persistentSandboxName, resume: true },
+    ]);
   });
 });
 

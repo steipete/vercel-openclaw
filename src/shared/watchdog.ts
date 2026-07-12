@@ -5,6 +5,7 @@ export type WatchdogCheckId =
   | "probe"
   | "reconcile"
   | "token.refresh"
+  | "channel.cleanup"
   | "sandbox.deadline"
   | "cron.wake"
   | "restore.prepare";

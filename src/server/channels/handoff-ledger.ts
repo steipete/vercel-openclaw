@@ -11,6 +11,10 @@ const HANDOFF_TTL_SECONDS = 24 * 60 * 60;
 const HANDOFF_LOCK_TTL_SECONDS = 10;
 const HANDOFF_LOCK_WAIT_MS = 5_000;
 const HANDOFF_STALE_START_MS = 5_000;
+// Native fast-path fetches may legitimately run for ten minutes. A platform
+// retry must not close their ownership while the original request can still
+// return an authoritative acceptance result.
+export const CHANNEL_FAST_PATH_DISPATCH_STALE_MS = 10 * 60 * 1000 + 30_000;
 
 export type ChannelHandoffState =
   | "acquired"
@@ -38,6 +42,32 @@ type PrepareResult =
   | { action: "start"; attemptId: string }
   | { action: "ack"; state: ChannelHandoffState }
   | { action: "retry"; state: ChannelHandoffState };
+
+export type FastPathDispatchDisposition =
+  | { action: "dispatch"; attemptId: string }
+  | { action: "ack"; state: "handed-off" | "processing" | "terminal" }
+  | {
+      action: "retry" | "settle-unknown";
+      state: "fast-path-dispatching";
+      attemptId: string;
+      ageMs: number;
+    };
+
+export function classifyFastPathDispatch(
+  record: ChannelHandoffRecord,
+  now = Date.now(),
+): Extract<FastPathDispatchDisposition, { state: "fast-path-dispatching" }> {
+  const ageMs = Math.max(0, now - record.updatedAt);
+  return {
+    action:
+      ageMs >= CHANNEL_FAST_PATH_DISPATCH_STALE_MS
+        ? "settle-unknown"
+        : "retry",
+    state: "fast-path-dispatching",
+    attemptId: record.attemptId,
+    ageMs,
+  };
+}
 
 async function withHandoffLock<T>(
   channel: ChannelName,
@@ -191,8 +221,17 @@ export async function claimChannelHandoff(input: {
 export async function markChannelDeliveryTerminal(input: {
   channel: ChannelName;
   deliveryId: string;
-}): Promise<void> {
-  await withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+  expectedAttemptId?: string | null;
+}): Promise<boolean> {
+  return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+    if (
+      input.expectedAttemptId &&
+      (!current ||
+        current.attemptId !== input.expectedAttemptId ||
+        current.state !== "fast-path-dispatching")
+    ) {
+      return false;
+    }
     const now = Date.now();
     await save({
       revision: (current?.revision ?? 0) + 1,
@@ -206,27 +245,61 @@ export async function markChannelDeliveryTerminal(input: {
       updatedAt: now,
       error: current?.error ?? null,
     });
+    return true;
   });
 }
 
 export async function markChannelFastPathDispatching(input: {
   channel: ChannelName;
   deliveryId: string;
-}): Promise<void> {
-  await withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+}): Promise<FastPathDispatchDisposition> {
+  return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
     const now = Date.now();
+    if (
+      current?.state === "handed-off" ||
+      current?.state === "processing" ||
+      current?.state === "terminal"
+    ) {
+      return { action: "ack", state: current.state };
+    }
+    if (current?.state === "fast-path-dispatching") {
+      return classifyFastPathDispatch(current, now);
+    }
+    const attemptId = `fast:${randomUUID()}`;
     await save({
       revision: (current?.revision ?? 0) + 1,
       channel: input.channel,
       deliveryId: input.deliveryId,
       state: "fast-path-dispatching",
-      attemptId: current?.attemptId ?? `fast:${randomUUID()}`,
+      attemptId,
       envelope: current?.envelope ?? null,
       runId: null,
       createdAt: current?.createdAt ?? now,
       updatedAt: now,
       error: null,
     });
+    return { action: "dispatch", attemptId };
+  });
+}
+
+/** Extend the exact active native-dispatch owner before another bounded fetch. */
+export async function renewChannelFastPathDispatch(input: {
+  channel: ChannelName;
+  deliveryId: string;
+  attemptId: string;
+}): Promise<boolean> {
+  return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+    if (
+      !current
+      || current.state !== "fast-path-dispatching"
+      || current.attemptId !== input.attemptId
+    ) return false;
+    await save({
+      ...current,
+      revision: current.revision + 1,
+      updatedAt: Date.now(),
+    });
+    return true;
   });
 }
 

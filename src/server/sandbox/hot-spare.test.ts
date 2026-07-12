@@ -9,6 +9,7 @@ import {
   preCreateHotSpareFromSnapshot,
   applyPreCreateToMeta,
   evaluateHotSparePromotion,
+  promoteHotSpare,
   type SnapshotBackedCreateDeps,
   type PreCreateResult,
 } from "@/server/sandbox/hot-spare";
@@ -472,6 +473,36 @@ test("evaluateHotSparePromotion: returns missing-candidate when candidateSandbox
 
     assert.equal(result.ok, false);
     assert.equal(result.reason, "missing-candidate");
+  } finally {
+    delete process.env.OPENCLAW_HOT_SPARE_ENABLED;
+  }
+});
+
+test("promoteHotSpare retires a candidate from a different snapshot", async () => {
+  process.env.OPENCLAW_HOT_SPARE_ENABLED = "true";
+  try {
+    let deleteCalls = 0;
+    const meta = {
+      ...buildMetaPick({
+        snapshotId: "snap-requested",
+        hotSpare: buildReadyHotSpare({
+          candidateSourceSnapshotId: "snap-other",
+        }),
+      }),
+    } as unknown as SingleMeta;
+
+    const result = await promoteHotSpare(meta, {
+      get: async () => ({
+        sandboxId: "oc-spare-test",
+        delete: async () => {
+          deleteCalls += 1;
+        },
+      }) as unknown as SandboxHandle,
+    });
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error, "candidate_rejected:snapshot-mismatch");
+    assert.equal(deleteCalls, 1);
   } finally {
     delete process.env.OPENCLAW_HOT_SPARE_ENABLED;
   }

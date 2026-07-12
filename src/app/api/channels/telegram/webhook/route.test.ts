@@ -13,6 +13,11 @@ import test from "node:test";
 
 import { channelDedupKey } from "@/server/channels/keys";
 import { getStore } from "@/server/store/store";
+import { getChannelDlqRecord } from "@/server/channels/dlq";
+import {
+  markChannelFastPathDispatching,
+  readChannelHandoff,
+} from "@/server/channels/handoff-ledger";
 import { FakeSandboxHandle } from "@/test-utils/fake-sandbox-controller";
 import { withHarness, type ScenarioHarness } from "@/test-utils/harness";
 import { buildTelegramWebhook } from "@/test-utils/webhook-builders";
@@ -124,6 +129,44 @@ test("Telegram webhook: wrong secret returns 401", async () => {
     assert.ok(rejected, "invalid secret rejection should be logged");
     assert.equal(rejected.data?.reason, "missing_or_invalid_secret");
     assert.equal(rejected.data?.hasSecretHeader, true);
+  });
+});
+
+test("Telegram webhook: pending activation fails closed with retryable 503", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    await h.mutateMeta((meta) => {
+      if (!meta.channels.telegram) return;
+      meta.channels.telegram.webhookSetupPending = true;
+    });
+    const result = await callRoute(
+      getTelegramWebhookRoute().POST,
+      buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+    );
+    assert.equal(result.status, 503);
+    assert.equal(
+      (result.json as { error: string }).error,
+      "CONFIG_ACTIVATION_PENDING",
+    );
+  });
+});
+
+test("Telegram webhook: pending disconnect fails closed with retryable 503", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    await h.mutateMeta((meta) => {
+      if (!meta.channels.telegram) return;
+      meta.channels.telegram.deletionPending = true;
+    });
+    const result = await callRoute(
+      getTelegramWebhookRoute().POST,
+      buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET }),
+    );
+    assert.equal(result.status, 503);
+    assert.equal(
+      (result.json as { error: string }).error,
+      "DISCONNECT_PENDING",
+    );
   });
 });
 
@@ -1755,5 +1798,46 @@ test("Telegram webhook: releases dedup lock and returns 500 when workflow start 
     } finally {
       startMock.mock.restore();
     }
+  });
+});
+
+test("Telegram webhook: retry does not terminalize an active fast-path dispatch", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    const payload = {
+      update_id: 99999,
+      message: {
+        message_id: 1,
+        from: { id: 12345, first_name: "Test", is_bot: false },
+        chat: { id: 12345, type: "private", first_name: "Test" },
+        date: Math.floor(Date.now() / 1000),
+        text: "active dispatch retry",
+      },
+    };
+    const deliveryId = `telegram:bot:123:${payload.update_id}`;
+    const dispatch = await markChannelFastPathDispatching({
+      channel: "telegram",
+      deliveryId,
+    });
+    assert.equal(dispatch.action, "dispatch");
+    await getStore().acquireLock(
+      channelDedupKey("telegram", deliveryId),
+      60 * 60,
+    );
+
+    const result = await callRoute(
+      getTelegramWebhookRoute().POST,
+      buildTelegramWebhook({
+        webhookSecret: TELEGRAM_WEBHOOK_SECRET,
+        payload,
+      }),
+    );
+
+    assert.equal(result.status, 500);
+    assert.equal(
+      (await readChannelHandoff("telegram", deliveryId))?.state,
+      "fast-path-dispatching",
+    );
+    assert.equal(await getChannelDlqRecord("telegram", deliveryId), null);
   });
 });

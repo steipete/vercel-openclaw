@@ -54,6 +54,7 @@ export type HostSuspensionState = {
 // this window. Rollback is safe only after the caller that could still commit
 // a late Sandbox.stop request can no longer be running.
 export const HOST_STOP_REQUEST_MAX_MS = 6 * 60 * 1000;
+export const PLATFORM_STOP_CONFIRMED_REASON = "platform-stop-confirmed";
 
 type SuspendBlocker = {
   kind?: unknown;
@@ -404,6 +405,86 @@ function createOperation(input: {
     lastErrorCode: null,
     lastErrorClass: null,
   };
+}
+
+/** Record SDK-confirmed stopped state before any resume can revive processes. */
+export async function recordPlatformStoppedHostSuspension(input: {
+  sandboxId: string;
+  lifecycleAttemptId: string | null;
+  expectedCurrentLifecycleAttemptId?: string | null;
+  allowMissingSandboxId?: boolean;
+}, deps: HostSuspensionDeps = defaultDeps): Promise<HostSuspensionState> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const generation = await deps.getCurrentGeneration();
+    const sandboxMatches = generation.sandboxId === input.sandboxId
+      || (input.allowMissingSandboxId === true && generation.sandboxId === null);
+    const expectedCurrentLifecycleAttemptId =
+      input.expectedCurrentLifecycleAttemptId === undefined
+        ? input.lifecycleAttemptId
+        : input.expectedCurrentLifecycleAttemptId;
+    if (
+      !sandboxMatches
+      || generation.lifecycleAttemptId !== expectedCurrentLifecycleAttemptId
+    ) {
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_STALE_GENERATION",
+        "The platform-stopped sandbox no longer owns the current generation.",
+      );
+    }
+    const existing = await readHostSuspensionState(deps);
+    if (existing?.ingressFenced) {
+      if (
+        existing.sandboxId !== input.sandboxId
+        || existing.lifecycleAttemptId !== input.lifecycleAttemptId
+      ) {
+        throw new ApiError(
+          409,
+          "HOST_SUSPENSION_CONFLICT",
+          "A fenced lifecycle operation belongs to another sandbox generation.",
+        );
+      }
+      if (
+        existing.suspensionId
+        && (existing.phase === "stop-requesting" || existing.phase === "stopping")
+      ) {
+        const stopped: HostSuspensionState = {
+          ...existing,
+          phase: "stopped",
+          stopRequestDeadlineAtMs: null,
+          stoppedAtMs: deps.now(),
+          updatedAtMs: deps.now(),
+        };
+        await deps.write(stopped);
+        return stopped;
+      }
+      if (
+        existing.phase === "stopped"
+        && (
+          existing.suspensionId
+          || existing.reason === PLATFORM_STOP_CONFIRMED_REASON
+        )
+      ) return existing;
+      throw new ApiError(
+        409,
+        "HOST_SUSPENSION_CONFLICT",
+        "The stopped sandbox is owned by a non-thawable lifecycle fence.",
+      );
+    }
+    const created = createOperation({
+      sandboxId: input.sandboxId,
+      lifecycleAttemptId: input.lifecycleAttemptId,
+      intent: "stop",
+      reason: PLATFORM_STOP_CONFIRMED_REASON,
+    }, deps);
+    const stopped: HostSuspensionState = {
+      ...created,
+      phase: "stopped",
+      stoppedAtMs: deps.now(),
+    };
+    await deps.write(stopped);
+    return stopped;
+  });
 }
 
 const HOST_STOP_MONITOR_STALE_MS = 30_000;
@@ -808,6 +889,33 @@ export async function clearHostSuspensionAfterGatewayReplacement(
   });
 }
 
+/** Retire an obsolete queued stop before any Gateway or platform stop began. */
+export async function clearObsoleteQueuedHostStop(input: {
+  expected: HostSuspensionState;
+  sandboxId: string;
+  lifecycleAttemptId: string | null;
+}, deps: HostSuspensionDeps = defaultDeps): Promise<boolean> {
+  return withHostSuspensionStateLock(deps, async () => {
+    const [current, generation] = await Promise.all([
+      readHostSuspensionState(deps),
+      deps.getCurrentGeneration(),
+    ]);
+    if (
+      !current
+      || current.operationId !== input.expected.operationId
+      || current.sandboxId !== input.sandboxId
+      || current.lifecycleAttemptId !== input.lifecycleAttemptId
+      || current.phase !== "stop-requesting"
+      || !current.ingressFenced
+      || current.suspensionId !== null
+      || generation.sandboxId !== input.sandboxId
+      || generation.lifecycleAttemptId !== input.lifecycleAttemptId
+    ) return false;
+    await deps.clear();
+    return true;
+  });
+}
+
 async function resumePreparedGateway(input: {
   state: HostSuspensionState;
   sandbox: SandboxHandle;
@@ -940,6 +1048,32 @@ export async function thawHostSuspensionIfNeeded(input: {
       sandboxId: input.sandbox.sandboxId,
     });
     return true;
+  }
+  if (state.reason === PLATFORM_STOP_CONFIRMED_REASON) {
+    if (input.sandbox.status !== "running") return false;
+    return withHostSuspensionStateLock(deps, async () => {
+      const [latest, currentGeneration] = await Promise.all([
+        readHostSuspensionState(deps),
+        deps.getCurrentGeneration(),
+      ]);
+      if (
+        !latest
+        || latest.operationId !== initialOperationId
+        || latest.phase !== "stopped"
+        || latest.reason !== PLATFORM_STOP_CONFIRMED_REASON
+        || input.sandbox.status !== "running"
+        || currentGeneration.sandboxId !== input.sandbox.sandboxId
+        || (
+          input.lifecycleAttemptId !== undefined
+          && currentGeneration.lifecycleAttemptId !== input.lifecycleAttemptId
+        )
+      ) return false;
+      // Platform timeout killed the old Gateway without a process-local
+      // suspension lease. SDK resume starts it admitted, so only the host fence
+      // must be retired after the resumed generation is lifecycle-owned.
+      await deps.clear();
+      return true;
+    });
   }
   if (
     input.lifecycleAttemptId !== undefined

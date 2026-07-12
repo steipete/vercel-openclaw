@@ -30,7 +30,10 @@ import {
 import { extractDomainsWithContext, groupByRegistrableDomain, normalizeDomainList } from "@/server/firewall/domains";
 import { logDebug, logInfo, logWarn } from "@/server/log";
 import { getSandboxController } from "@/server/sandbox/controller";
-import { resolveAiGatewayCredentialOptional } from "@/server/env";
+import {
+  resolveAiGatewayCredentialOptional,
+  type AiGatewayCredential,
+} from "@/server/env";
 import { getPublicOrigin } from "@/server/public-url";
 import {
   withSandboxLifecycleMutationLock,
@@ -54,6 +57,10 @@ const FIREWALL_POLICY_APPLY_LOCK_TTL_SECONDS = 330;
 type FirewallPolicyContext = {
   requestId?: string;
   controlPlaneOrigin?: string;
+};
+
+type OwnedFirewallPolicyContext = FirewallPolicyContext & {
+  credential?: AiGatewayCredential;
 };
 
 type AssertLifecycleOwnership = () => Promise<void>;
@@ -181,6 +188,10 @@ async function recordPolicySdkCompletion(
     recorded = true;
     meta.firewall.lastPolicySdkCompletionRevisionId = revision.revisionId;
     meta.firewall.lastPolicySdkCompletionHash = revision.policyHash;
+    if (applied) {
+      meta.firewall.lastPolicySdkSuccessRevisionId = revision.revisionId;
+      meta.firewall.lastPolicySdkSuccessHash = revision.policyHash;
+    }
     if (meta.firewall.policyRevisionId !== revision.revisionId) {
       // A later desired revision started while this SDK call was in flight.
       // Fence atomically with completion ordering so process death before the
@@ -754,11 +765,20 @@ export async function syncFirewallPolicyIfRunning(
   options?: FirewallPolicyContext,
 ): Promise<FirewallSyncOutcome> {
   return withFirewallLifecycleMutation((assertOwned) =>
-    withFirewallPolicyApplyLock(() =>
-      syncFirewallPolicyWithFailCloseWithinLifecycleLock(
-        assertOwned,
-        options,
-      )));
+    syncFirewallPolicyWithinLifecycleLock(assertOwned, options));
+}
+
+/**
+ * Apply one policy revision while the caller owns the lifecycle lease.
+ * Lifecycle token refresh uses this entry point so its network-policy write
+ * shares the long-lived apply lock, revision CAS, and fail-close path.
+ */
+export async function syncFirewallPolicyWithinLifecycleLock(
+  assertOwned: AssertLifecycleOwnership,
+  options?: OwnedFirewallPolicyContext,
+): Promise<FirewallSyncOutcome> {
+  return withFirewallPolicyApplyLock(() =>
+    syncFirewallPolicyWithFailCloseWithinLifecycleLock(assertOwned, options));
 }
 
 async function withFirewallPolicyApplyLock<T>(
@@ -786,7 +806,7 @@ async function withFirewallPolicyApplyLock<T>(
 
 async function syncFirewallPolicyWithFailCloseWithinLifecycleLock(
   assertOwned: AssertLifecycleOwnership,
-  options?: FirewallPolicyContext,
+  options?: OwnedFirewallPolicyContext,
 ): Promise<FirewallSyncOutcome> {
   try {
     return await syncFirewallPolicyIfRunningWithinLifecycleLock(
@@ -817,7 +837,7 @@ async function syncFirewallPolicyWithFailCloseWithinLifecycleLock(
 
 async function syncFirewallPolicyIfRunningWithinLifecycleLock(
   assertOwned: AssertLifecycleOwnership,
-  options?: FirewallPolicyContext,
+  options?: OwnedFirewallPolicyContext,
 ): Promise<FirewallSyncOutcome> {
   let meta = await getInitializedMeta();
   const sandboxActive =
@@ -896,7 +916,8 @@ async function syncFirewallPolicyIfRunningWithinLifecycleLock(
     // is refreshed with a fresh OIDC token on every policy sync. Without this,
     // the sandbox retains whatever token was injected at last restore, which
     // typically expires after ~1h and causes AI Gateway 401s with no recovery.
-    const credential = await resolveAiGatewayCredentialOptional();
+    const credential = options?.credential
+      ?? await resolveAiGatewayCredentialOptional();
     await assertOwned();
     const beforeApply = await getInitializedMeta();
     const beforeApplyDomains = requiredControlPlaneDomains(

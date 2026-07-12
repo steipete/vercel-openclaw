@@ -2069,6 +2069,9 @@ test("stale fail-close cannot stop a repaired policy revision on the same sandbo
           meta.firewall.lastPolicySdkCompletionRevisionId =
             "successor-policy-revision";
           meta.firewall.lastPolicySdkCompletionHash = "b".repeat(64);
+          meta.firewall.lastPolicySdkSuccessRevisionId =
+            "successor-policy-revision";
+          meta.firewall.lastPolicySdkSuccessHash = "b".repeat(64);
           meta.firewall.failClosedPolicyRevisionId = null;
           meta.firewall.failClosedPolicyHash = null;
           meta.firewall.lastSyncReason = "policy-applied";
@@ -2407,4 +2410,57 @@ test("ensureMetaShape: preserves valid FirewallIngestOutcome and FirewallSyncOut
   assert.ok(result);
   assert.deepEqual(result.firewall.lastIngestOutcome, ingestOutcome);
   assert.deepEqual(result.firewall.lastSyncOutcome, syncOutcome);
+});
+
+test("ensureMetaShape: migrates successful pre-field policy completion evidence", () => {
+  const policyHash = "d".repeat(64);
+  const result = ensureMetaShape({
+    id: "openclaw-single",
+    gatewayToken: "tok",
+    firewall: {
+      policyRevisionId: "revision-success",
+      lastPolicySdkCompletionRevisionId: "revision-success",
+      lastPolicySdkCompletionHash: policyHash,
+      lastSyncOutcome: {
+        timestamp: 2_000,
+        durationMs: 10,
+        allowlistCount: 1,
+        policyHash,
+        applied: true,
+        reason: "policy-applied",
+      },
+    },
+  });
+
+  assert.ok(result);
+  assert.equal(
+    result.firewall.lastPolicySdkSuccessRevisionId,
+    "revision-success",
+  );
+  assert.equal(result.firewall.lastPolicySdkSuccessHash, policyHash);
+});
+
+test("ensureMetaShape: does not migrate failed policy completion evidence", () => {
+  const policyHash = "e".repeat(64);
+  const result = ensureMetaShape({
+    id: "openclaw-single",
+    gatewayToken: "tok",
+    firewall: {
+      policyRevisionId: "revision-failed",
+      lastPolicySdkCompletionRevisionId: "revision-failed",
+      lastPolicySdkCompletionHash: policyHash,
+      lastSyncOutcome: {
+        timestamp: 2_000,
+        durationMs: 10,
+        allowlistCount: 1,
+        policyHash,
+        applied: false,
+        reason: "policy update failed",
+      },
+    },
+  });
+
+  assert.ok(result);
+  assert.equal(result.firewall.lastPolicySdkSuccessRevisionId, null);
+  assert.equal(result.firewall.lastPolicySdkSuccessHash, null);
 });

@@ -1,6 +1,12 @@
 import { ApiError } from "@/shared/http";
 import { createChannelAdminRouteHandlers } from "@/server/channels/admin/route-factory";
-import { getMe, getWebhookInfo, deleteWebhook, setWebhook } from "@/server/channels/telegram/bot-api";
+import {
+  TelegramApiError,
+  getMe,
+  getWebhookInfo,
+  deleteWebhook,
+  setWebhook,
+} from "@/server/channels/telegram/bot-api";
 import { syncTelegramCommands } from "@/server/channels/telegram/commands";
 import {
   buildTelegramWebhookUrl,
@@ -10,6 +16,7 @@ import {
 import { withChannelConfigLease } from "@/server/channels/config-lock";
 import { getInitializedMeta } from "@/server/store/store";
 import { logWarn } from "@/server/log";
+import { syncGatewayConfigToSandboxUnderLifecycleLock } from "@/server/sandbox/lifecycle";
 
 const PREVIOUS_SECRET_GRACE_MS = 30 * 60 * 1000;
 
@@ -19,6 +26,13 @@ function parseBotToken(value: unknown): string {
   }
 
   return value.trim();
+}
+
+function isDefiniteWebhookRejection(error: unknown): boolean {
+  if (!(error instanceof TelegramApiError)) return false;
+  return error.status_code >= 400
+    && error.status_code < 500
+    && ![408, 409, 425, 429].includes(error.status_code);
 }
 
 export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
@@ -61,30 +75,28 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
         sameBotIdentity && previousDeliveryNamespace
           ? previousDeliveryNamespace
           : `bot:${botId}`;
-      const webhookSecret = createTelegramWebhookSecret();
+      const retryingPendingSetup = Boolean(
+        current?.webhookSetupPending &&
+          current.botToken === botToken &&
+          sameBotIdentity,
+      );
+      const webhookSecret = retryingPendingSetup
+        ? current!.webhookSecret
+        : createTelegramWebhookSecret();
       const webhookUrl = buildTelegramWebhookUrl(request);
-
-      await assertMutationOwned();
-      await setWebhook(botToken, webhookUrl, webhookSecret, {
-        signal: lease.signal,
-      });
 
       const now = Date.now();
       let commandSyncStatus: "synced" | "error" = "synced";
       let commandSyncError: string | undefined;
       let commandsRegisteredAt: number | undefined = now;
 
-      try {
-        await assertMutationOwned();
-        await syncTelegramCommands(botToken, { signal: lease.signal });
-      } catch (error) {
-        commandSyncStatus = "error";
-        commandSyncError = error instanceof Error ? error.message : String(error);
-        commandsRegisteredAt = undefined;
-      }
-
-      const configuredAt = Math.max(now, (current?.configuredAt ?? 0) + 1);
-      const inheritedCleanups = current?.pendingWebhookCleanups ?? [];
+      const configuredAt = retryingPendingSetup
+        ? current!.configuredAt
+        : Math.max(now, (current?.configuredAt ?? 0) + 1);
+      const inheritedCleanups =
+        current?.pendingWebhookCleanups?.filter(
+          (cleanup) => cleanup.botToken !== botToken,
+        ) ?? [];
       const pendingWebhookCleanups =
         current?.botToken && !sameBotIdentity
           ? [
@@ -96,8 +108,7 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
               },
             ]
           : inheritedCleanups;
-      await assertMutationOwned();
-      await setTelegramChannelConfigUnderLease(lease, {
+      const pendingConfig = {
         botToken,
         botId,
         deliveryNamespace,
@@ -121,16 +132,148 @@ export const { GET, PUT, DELETE } = createChannelAdminRouteHandlers({
         webhookUrl,
         botUsername: bot.username ?? "",
         configuredAt,
+        webhookSetupPending: true,
+        lastError: "Telegram webhook registration is pending.",
         pendingWebhookCleanups:
           pendingWebhookCleanups.length > 0
             ? pendingWebhookCleanups
             : undefined,
-        commandSyncStatus,
-        commandsRegisteredAt,
-        commandSyncError,
+        commandSyncStatus: retryingPendingSetup
+          ? current?.commandSyncStatus
+          : commandSyncStatus,
+        commandsRegisteredAt: retryingPendingSetup
+          ? current?.commandsRegisteredAt
+          : commandsRegisteredAt,
+        commandSyncError: retryingPendingSetup
+          ? current?.commandSyncError
+          : commandSyncError,
+      };
+      if (!retryingPendingSetup) {
+        await assertMutationOwned();
+        await setTelegramChannelConfigUnderLease(lease, pendingConfig);
+      }
+
+      const rollbackConfigAndResync = async (): Promise<void> => {
+        await lease.mutateMeta((meta) => {
+          if (meta.channels.telegram?.configuredAt !== configuredAt) return;
+          meta.channels.telegram = current ?? null;
+        });
+        await assertMutationOwned();
+        const rollbackSync =
+          await syncGatewayConfigToSandboxUnderLifecycleLock(
+            assertMutationOwned,
+          );
+        const rollbackMeta = await getInitializedMeta();
+        if (
+          rollbackMeta.status === "running" &&
+          !rollbackSync.liveConfigFresh
+        ) {
+          await lease.mutateMeta((meta) => {
+            if (current) {
+              if (
+                meta.channels.telegram?.configuredAt !== current.configuredAt
+              ) return;
+              meta.channels.telegram.webhookSetupPending = true;
+              meta.channels.telegram.lastError =
+                "Telegram ingress is paused because rollback config sync failed.";
+              return;
+            }
+            if (meta.channels.telegram !== null) return;
+            meta.channels.telegram = {
+              ...pendingConfig,
+              webhookSetupPending: true,
+              deletionPending: true,
+              lastError:
+                "Telegram ingress is paused because rollback config sync failed; credential removal is pending.",
+            };
+          });
+          throw new ApiError(
+            503,
+            "TELEGRAM_ROLLBACK_SYNC_FAILED",
+            "Telegram ingress is paused because the previous configuration could not be restored in the running sandbox.",
+          );
+        }
+      };
+
+      // A running gateway must recognize the new host secret before Telegram
+      // starts sending it. Stopped sandboxes consume the persisted config on
+      // their next restore, so the skipped sync is the activation contract.
+      await assertMutationOwned();
+      const activationSync =
+        await syncGatewayConfigToSandboxUnderLifecycleLock(
+          assertMutationOwned,
+        );
+      const activationMeta = await getInitializedMeta();
+      if (
+        activationMeta.status === "running" &&
+        !activationSync.liveConfigFresh
+      ) {
+        if (!retryingPendingSetup) {
+          await rollbackConfigAndResync();
+        } else {
+          await lease.mutateMeta((meta) => {
+            if (meta.channels.telegram?.configuredAt !== configuredAt) return;
+            meta.channels.telegram.webhookSetupPending = true;
+            meta.channels.telegram.lastError =
+              "Telegram webhook activation is waiting for live config sync.";
+          });
+        }
+        throw new ApiError(
+          503,
+          "TELEGRAM_LIVE_CONFIG_SYNC_FAILED",
+          "Telegram webhook was not activated because the running sandbox could not load the new secret.",
+        );
+      }
+
+      try {
+        await assertMutationOwned();
+        await setWebhook(botToken, webhookUrl, webhookSecret, {
+          signal: lease.signal,
+        });
+      } catch (error) {
+        if (!retryingPendingSetup && isDefiniteWebhookRejection(error)) {
+          await rollbackConfigAndResync();
+        } else {
+          await lease.mutateMeta((meta) => {
+            if (meta.channels.telegram?.configuredAt !== configuredAt) return;
+            meta.channels.telegram.webhookSetupPending = true;
+            meta.channels.telegram.lastError =
+              "Telegram webhook registration outcome is uncertain; retry setup.";
+          });
+        }
+        throw error;
+      }
+
+      try {
+        await assertMutationOwned();
+        await syncTelegramCommands(botToken, { signal: lease.signal });
+      } catch (error) {
+        commandSyncStatus = "error";
+        commandSyncError = error instanceof Error ? error.message : String(error);
+        commandsRegisteredAt = undefined;
+      }
+
+      await lease.mutateMeta((meta) => {
+        const telegram = meta.channels.telegram;
+        if (
+          !telegram ||
+          telegram.configuredAt !== configuredAt ||
+          telegram.botToken !== botToken ||
+          telegram.webhookSecret !== webhookSecret
+        ) {
+          return;
+        }
+        telegram.webhookSetupPending = false;
+        telegram.deletionPending = undefined;
+        telegram.lastError = undefined;
+        telegram.commandSyncStatus = commandSyncStatus;
+        telegram.commandsRegisteredAt = commandsRegisteredAt;
+        telegram.commandSyncError = commandSyncError;
       });
 
-      for (const cleanup of pendingWebhookCleanups) {
+      for (const cleanup of pendingWebhookCleanups.filter(
+        (candidate) => candidate.botToken !== botToken,
+      )) {
         try {
           await assertMutationOwned();
           await deleteWebhook(cleanup.botToken, { signal: lease.signal });

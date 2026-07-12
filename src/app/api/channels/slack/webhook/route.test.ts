@@ -19,6 +19,11 @@ import {
 import { hostSuspensionOperationKey } from "@/server/store/keyspace";
 import type { HostSuspensionState } from "@/server/sandbox/host-suspension";
 import { getStore } from "@/server/store/store";
+import { getChannelDlqRecord } from "@/server/channels/dlq";
+import {
+  markChannelFastPathDispatching,
+  readChannelHandoff,
+} from "@/server/channels/handoff-ledger";
 import {
   withHarness,
   type FakeSandboxHandle,
@@ -1057,7 +1062,7 @@ test("Slack webhook: running fast path does not post wrapper processing placehol
   });
 });
 
-test("Slack webhook: fast path token refresh failure logs and still forwards", async () => {
+test("Slack webhook: fast path token refresh fail-close falls back to Workflow", async () => {
   await withHarness(async (h) => {
     await configureSlack(h);
     _resetLogBuffer();
@@ -1094,8 +1099,12 @@ test("Slack webhook: fast path token refresh failure logs and still forwards", a
         buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET }),
       );
       assert.equal(result.status, 200);
-      assert.equal(startMock.mock.callCount(), 0);
-      assert.equal(forwarded, true, "fast path should continue after refresh failure");
+      assert.equal(startMock.mock.callCount(), 1);
+      assert.equal(
+        forwarded,
+        false,
+        "a failed policy refresh must not use the stale fast path",
+      );
       assert.ok(
         getServerLogs().some((entry) => entry.message === "channels.fast_path_token_refresh"),
         "refresh failure should still produce a structured token outcome log",
@@ -1183,5 +1192,44 @@ test("Slack webhook: releases dedup lock and returns 500 when workflow start fai
     } finally {
       startMock.mock.restore();
     }
+  });
+});
+
+test("Slack webhook: retry does not terminalize an active fast-path dispatch", async () => {
+  await withHarness(async (h) => {
+    await configureSlack(h);
+    const payload = {
+      type: "event_callback",
+      event_id: "Ev_ACTIVE_FAST_PATH",
+      event: {
+        type: "message",
+        text: "hello",
+        channel: "C123",
+        ts: "1234567890.000099",
+        user: "U123",
+      },
+    };
+    const deliveryId = `slack:${payload.event_id}`;
+    const dispatch = await markChannelFastPathDispatching({
+      channel: "slack",
+      deliveryId,
+    });
+    assert.equal(dispatch.action, "dispatch");
+    await getStore().acquireLock(
+      channelDedupKey("slack", payload.event_id),
+      60 * 60,
+    );
+
+    const result = await callRoute(
+      getSlackWebhookRoute().POST,
+      buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET, payload }),
+    );
+
+    assert.equal(result.status, 500);
+    assert.equal(
+      (await readChannelHandoff("slack", deliveryId))?.state,
+      "fast-path-dispatching",
+    );
+    assert.equal(await getChannelDlqRecord("slack", deliveryId), null);
   });
 });

@@ -9,6 +9,7 @@ import {
   type SingleMeta,
 } from "@/shared/types";
 import { firewallFailClosedReason } from "@/server/firewall/fail-close";
+import { setFirewallMode } from "@/server/firewall/state";
 import {
   OPENCLAW_BUNDLE_IDENTITY_PATH,
   OPENCLAW_BUNDLE_SEALED_ARCHIVE_PATH,
@@ -62,12 +63,14 @@ import {
 } from "@/server/store/store";
 import {
   hostSuspensionOperationKey,
+  firewallPolicyApplyLockKey,
   lifecycleLockKey,
   sandboxDeadlineLockKey,
   sandboxDeadlineV2Key,
 } from "@/server/store/keyspace";
 import {
   HOST_STOP_REQUEST_MAX_MS,
+  PLATFORM_STOP_CONFIRMED_REASON,
   readHostSuspensionState,
   type HostSuspensionState,
 } from "@/server/sandbox/host-suspension";
@@ -813,6 +816,36 @@ test("ensureSandboxRunning schedules restore when snapshot exists", async () => 
   });
 });
 
+test("missing persistent sandbox restores from the selected snapshot without blank fallback", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = null;
+      meta.snapshotId = "snap-selected-history";
+    });
+
+    const scheduledCallbacks: Array<() => Promise<void> | void> = [];
+    await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "selected-history-restore-test",
+      schedule(callback) {
+        scheduledCallbacks.push(callback);
+      },
+    });
+    assert.equal(scheduledCallbacks.length, 1);
+
+    await scheduledCallbacks[0]!();
+
+    assert.equal(fake.createCalls.length, 1);
+    assert.deepEqual(fake.createCalls[0]?.source, {
+      type: "snapshot",
+      snapshotId: "snap-selected-history",
+    });
+    assert.equal((await getInitializedMeta()).snapshotId, "snap-selected-history");
+  });
+});
+
 test("getSandboxDomain returns cached URL when available", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
@@ -1397,20 +1430,104 @@ test("persistent resume requests explicit SDK resume", async () => {
       meta.gatewayToken = "test-gw-token";
     });
 
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
 
     try {
-      await triggerRestore(fake, {
-        tokenOverride: "test-ai-key",
-      });
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("explicit-resume-proof");
 
-      assert.deepEqual(fake.getCalls[0], {
-        sandboxId: LIFECYCLE_SANDBOX_NAME,
-        resume: true,
-      });
+      assert.deepEqual(fake.getCalls.slice(0, 2), [
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: true },
+      ]);
     } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("persistent resume backfills a fence without restoring an older snapshot", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-unfenced-resume";
+      meta.gatewayToken = "test-gw-token";
+    });
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("unfenced-resume");
+
+      assert.deepEqual(fake.getCalls.slice(0, 2), [
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: true },
+      ]);
+      assert.equal(handle.deleteCalled, false);
+      assert.equal(fake.createCalls.length, 0);
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.snapshotId, "snap-unfenced-resume");
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("persistent resume backfills a fence without a snapshot source", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = null;
+      meta.gatewayToken = "test-gw-token";
+    });
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
+
+    try {
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("unfenced-no-snapshot");
+
+      assert.deepEqual(fake.getCalls.slice(0, 2), [
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: false },
+        { sandboxId: LIFECYCLE_SANDBOX_NAME, resume: true },
+      ]);
+      assert.equal(handle.deleteCalled, false);
+      assert.equal(fake.createCalls.length, 0);
+      const meta = await getInitializedMeta();
+      assert.equal(meta.status, "running");
+      assert.equal(meta.snapshotId, null);
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
     }
   });
 });
@@ -2089,6 +2206,14 @@ test("persistent bundle resume without snapshotId takes fast-restore path", asyn
       return undefined;
     });
     fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
     const originalGet = fake.get.bind(fake);
     fake.get = async (params) => {
       const found = await originalGet(params);
@@ -2198,6 +2323,14 @@ test("persistent bundle corruption fails before fast restore launches Gateway", 
       return undefined;
     });
     fake.handlesByIds.set(LIFECYCLE_SANDBOX_NAME, handle);
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(LIFECYCLE_SANDBOX_NAME, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
     const originalGet = fake.get.bind(fake);
     fake.get = async (params) => {
       const found = await originalGet(params);
@@ -4745,7 +4878,7 @@ test("[lifecycle] ensureFreshGatewayToken: no OIDC token available -> skips sile
   });
 });
 
-test("[lifecycle] ensureFreshGatewayToken: policy update failure does not corrupt metadata", async () => {
+test("[lifecycle] ensureFreshGatewayToken: policy update failure fences and stops the sandbox", async () => {
   const fake = new FakeSandboxController();
 
   await withTestEnv(fake, async () => {
@@ -4769,16 +4902,20 @@ test("[lifecycle] ensureFreshGatewayToken: policy update failure does not corrup
       };
       fake.handlesByIds.set("sbx-policy-fail", handle);
 
-      await ensureFreshGatewayToken();
+      const result = await ensureFreshGatewayToken();
 
-      // Metadata should NOT be updated since policy update failed
+      assert.equal(result.refreshed, false);
+      assert.equal(result.reason, "sandbox-changed");
       const meta = await getInitializedMeta();
-      assert.equal(meta.status, "running", "Status should still be running");
+      assert.equal(meta.status, "error");
+      assert.equal(meta.lastError, FIREWALL_FAIL_CLOSED_LAST_ERROR);
       assert.equal(
         meta.lastTokenRefreshAt,
         refreshTime,
         "lastTokenRefreshAt should not be updated on failure",
       );
+      assert.equal(handle.stopCalled, true);
+      assert.equal((await readHostSuspensionState())?.phase, "stopped");
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
     }
@@ -5011,6 +5148,82 @@ test("[lifecycle] token refresh cannot mutate a replaced lifecycle generation", 
       assert.equal(meta.lastTokenRefreshAt, 123);
       assert.equal(meta.lastTokenExpiresAt, 456);
     } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+    }
+  });
+});
+
+test("[lifecycle] token refresh holds the firewall apply lock after lifecycle lease loss", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-token-apply-lock";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    fake.handlesByIds.set(sandboxId, handle);
+    _setAiGatewayTokenOverrideForTesting("fresh-oidc-token");
+    const store = getStore();
+    const originalAcquireLock = store.acquireLock.bind(store);
+    let lifecycleToken: string | null = null;
+    const acquiredKeys: string[] = [];
+    store.acquireLock = async (key, ttlSeconds) => {
+      const token = await originalAcquireLock(key, ttlSeconds);
+      acquiredKeys.push(key);
+      if (key === lifecycleLockKey() && token && !lifecycleToken) {
+        lifecycleToken = token;
+      }
+      return token;
+    };
+    let signalApplyStarted!: () => void;
+    let releaseApply!: () => void;
+    const applyStarted = new Promise<void>((resolve) => {
+      signalApplyStarted = resolve;
+    });
+    const applyGate = new Promise<void>((resolve) => {
+      releaseApply = resolve;
+    });
+    handle.networkPolicyHandler = async (policy) => {
+      signalApplyStarted();
+      await applyGate;
+      return policy;
+    };
+
+    try {
+      await mutateMeta((meta) => {
+        meta.status = "running";
+        meta.sandboxId = sandboxId;
+        meta.lifecycleAttemptId = "attempt-token-apply-lock";
+        meta.firewall.mode = "learning";
+        meta.firewall.allowlist = ["registry.npmjs.org"];
+        meta.lastTokenRefreshAt = null;
+        meta.lastTokenExpiresAt = null;
+        meta.lastTokenSource = "oidc";
+      });
+
+      const refresh = ensureUsableAiGatewayCredential({ force: true });
+      await applyStarted;
+      assert.ok(lifecycleToken);
+      await store.releaseLock(lifecycleLockKey(), lifecycleToken);
+
+      await assert.rejects(
+        setFirewallMode("enforcing"),
+        (error: unknown) => {
+          assert.equal(
+            (error as { code?: unknown }).code,
+            "FIREWALL_POLICY_APPLY_IN_PROGRESS",
+          );
+          return true;
+        },
+      );
+      releaseApply();
+      await assert.rejects(
+        refresh,
+        /Sandbox lifecycle lock ownership was lost/,
+      );
+      assert.ok(acquiredKeys.includes(firewallPolicyApplyLockKey()));
+      assert.equal(handle.networkPolicies.length, 1);
+      assert.equal((await getInitializedMeta()).firewall.mode, "learning");
+    } finally {
+      releaseApply();
+      store.acquireLock = originalAcquireLock;
       _setAiGatewayTokenOverrideForTesting(null);
     }
   });
@@ -5732,6 +5945,43 @@ test("reconcileSandboxHealth returns ready when gateway is reachable", async () 
       assert.equal(result.repaired, false);
       assert.equal(result.meta.status, "running");
     } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("reconcileSandboxHealth returns recovering when token refresh fail-closes", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-health-refresh-fail";
+    const handle = new FakeSandboxHandle(sandboxId, fake.events);
+    handle.networkPolicyHandler = async () => {
+      throw new Error("policy update failed");
+    };
+    fake.handlesByIds.set(sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = "attempt-health-refresh-fail";
+      meta.portUrls = { "3000": handle.domain(3000) };
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response('<html><div id="openclaw-app"></div></html>', {
+        status: 200,
+      });
+    _setAiGatewayTokenOverrideForTesting("test-ai-key");
+
+    try {
+      const result = await reconcileSandboxHealth({
+        origin: "https://test.example.com",
+        reason: "refresh-fail-close",
+      });
+      assert.equal(result.status, "recovering");
+      assert.equal(result.repaired, true);
+      assert.notEqual(result.meta.status, "running");
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
     }
   });
@@ -7819,7 +8069,7 @@ test("[lifecycle] touchRunningSandbox liveness runCommand throws -> NOT marked u
 // Q4: Resume failure via unhealthy handle falls back to create and clears snapshot
 // ---------------------------------------------------------------------------
 
-test("[lifecycle] ensureSandboxRunning resume unhealthy handle -> clears snapshotId, falls back to create (snapshotHistory retained)", async () => {
+test("[lifecycle] ensureSandboxRunning resume unhealthy handle restores its selected snapshot", async () => {
   const fake = new FakeSandboxController();
   const originalFetch = globalThis.fetch;
 
@@ -7876,13 +8126,16 @@ test("[lifecycle] ensureSandboxRunning resume unhealthy handle -> clears snapsho
 
       const meta = await getInitializedMeta();
       assert.equal(meta.status, "running", "Should reach running after fallback");
-      // Snapshot metadata should be cleared because the restore was abandoned.
-      assert.equal(meta.snapshotId, null, "snapshotId should be cleared on fallback");
-      assert.equal(meta.snapshotConfigHash, null);
-      assert.equal(meta.snapshotDynamicConfigHash, null);
-      assert.equal(meta.snapshotAssetSha256, null);
-      assert.equal(meta.restorePreparedStatus, "dirty");
-      assert.equal(meta.restorePreparedReason, "snapshot-missing");
+      assert.equal(meta.snapshotId, "snap-resume-fail");
+      assert.equal(meta.snapshotConfigHash, "hash-existing");
+      assert.equal(meta.snapshotDynamicConfigHash, "dynhash-existing");
+      assert.equal(meta.snapshotAssetSha256, "assetsha-existing");
+      assert.equal(meta.restorePreparedStatus, "ready");
+      assert.equal(meta.restorePreparedReason, null);
+      assert.deepEqual(fake.createCalls.at(-1)?.source, {
+        type: "snapshot",
+        snapshotId: "snap-resume-fail",
+      });
       // snapshotHistory is NOT wiped by the fallback path — it remains for
       // diagnostics / future prepare cycles. Asserted so the invariant is
       // explicit and any future behavior change is caught.
@@ -7921,6 +8174,14 @@ test("[lifecycle] ensureSandboxRunning resume stopped handle after explicit resu
       meta.restorePreparedReason = null;
       meta.restorePreparedAt = Date.now();
     });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxName, {
+        phase: "stopped",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
 
     globalThis.fetch = async () =>
       new Response('<div id="openclaw-app"></div>', { status: 200 });
@@ -7941,14 +8202,18 @@ test("[lifecycle] ensureSandboxRunning resume stopped handle after explicit resu
 
       const meta = await getInitializedMeta();
       assert.equal(meta.status, "running", "Should reach running after fallback");
-      assert.equal(meta.snapshotId, null, "snapshotId should be cleared on fallback");
-      assert.equal(meta.restorePreparedStatus, "dirty");
-      assert.equal(meta.restorePreparedReason, "snapshot-missing");
-      assert.ok(stopped.deleteCalled, "Stopped handle should be deleted before create fallback");
-      assert.deepEqual(fake.getCalls[0], {
-        sandboxId: sandboxName,
-        resume: true,
+      assert.equal(meta.snapshotId, "snap-resume-stopped");
+      assert.equal(meta.restorePreparedStatus, "ready");
+      assert.equal(meta.restorePreparedReason, null);
+      assert.deepEqual(fake.createCalls.at(-1)?.source, {
+        type: "snapshot",
+        snapshotId: "snap-resume-stopped",
       });
+      assert.ok(stopped.deleteCalled, "Stopped handle should be deleted before create fallback");
+      assert.deepEqual(fake.getCalls.slice(0, 2), [
+        { sandboxId: sandboxName, resume: false },
+        { sandboxId: sandboxName, resume: true },
+      ]);
     } finally {
       _setAiGatewayTokenOverrideForTesting(null);
       globalThis.fetch = originalFetch;
@@ -8152,6 +8417,80 @@ test("stale-running reconciliation preserves transitional platform states", asyn
     assert.equal(reconciled.status, "running");
     assert.equal(reconciled.sandboxId, handle.sandboxId);
     assert.equal(reconciled.lifecycleAttemptId, "attempt-transitioning");
+  });
+});
+
+test("stale-running reconciliation fences and resumes a platform-stopped generation", async () => {
+  const fake = new FakeSandboxController();
+  const originalFetch = globalThis.fetch;
+  await withTestEnv(fake, async () => {
+    const handle = preRegisterResumeHandle(fake);
+    handle.setStatus("stopped");
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "attempt-platform-timeout";
+      meta.gatewayToken = "test-gw-token";
+    });
+    const originalGet = fake.get.bind(fake);
+    fake.get = async (input) => {
+      const result = await originalGet(input);
+      if (input.resume === true) handle.setStatus("running");
+      return result;
+    };
+    globalThis.fetch = async () =>
+      new Response('<div id="openclaw-app"></div>', { status: 200 });
+    _resetReconcileStaleRunningDebounceForTesting();
+
+    try {
+      const reconciled = await reconcileStaleRunningStatus();
+      const stoppedFence = await readHostSuspensionState();
+      assert.equal(reconciled.status, "stopped");
+      assert.equal(stoppedFence?.phase, "stopped");
+      assert.equal(stoppedFence?.sandboxId, handle.sandboxId);
+      assert.equal(stoppedFence?.suspensionId, null);
+
+      _setAiGatewayTokenOverrideForTesting("test-ai-key");
+      await runScheduledEnsure("platform-timeout-resume");
+
+      assert.equal((await getInitializedMeta()).status, "running");
+      assert.equal(await readHostSuspensionState(), null);
+      assert.ok(fake.getCalls.some((call) => call.resume === true));
+    } finally {
+      _setAiGatewayTokenOverrideForTesting(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+test("snapshotting reconciliation completes a committed platform-stop fence", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const sandboxId = "sbx-platform-stop-crash";
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = "attempt-platform-stop-crash";
+      meta.portUrls = { "3000": "https://still-published.invalid" };
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(sandboxId, {
+        lifecycleAttemptId: "attempt-platform-stop-crash",
+        reason: PLATFORM_STOP_CONFIRMED_REASON,
+        phase: "stopped",
+        suspensionId: null,
+        leaseExpiresAtMs: null,
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+      }),
+    );
+
+    const reconciled = await reconcileSnapshottingStatus();
+
+    assert.equal(reconciled.status, "stopped");
+    assert.equal(reconciled.portUrls, null);
+    assert.equal((await readHostSuspensionState())?.ingressFenced, true);
   });
 });
 
@@ -8477,6 +8816,7 @@ test("firewall fail-closed monitor stops the exact fenced generation", async () 
       hostSuspensionState(handle.sandboxId, {
         lifecycleAttemptId: "firewall-attempt",
         reason: FIREWALL_FAIL_CLOSED_REASON,
+        suspensionId: null,
       }),
     );
 
@@ -8505,12 +8845,16 @@ test("firewall fail-closed monitor ignores an older policy revision on the same 
       meta.firewall.lastPolicySdkCompletionRevisionId =
         "successor-policy-revision";
       meta.firewall.lastPolicySdkCompletionHash = "b".repeat(64);
+      meta.firewall.lastPolicySdkSuccessRevisionId =
+        "successor-policy-revision";
+      meta.firewall.lastPolicySdkSuccessHash = "b".repeat(64);
     });
     await getStore().setValue(
       hostSuspensionOperationKey(),
       hostSuspensionState(handle.sandboxId, {
         lifecycleAttemptId: "firewall-attempt",
         reason: FIREWALL_FAIL_CLOSED_REASON,
+        suspensionId: null,
       }),
     );
 
@@ -8519,6 +8863,38 @@ test("firewall fail-closed monitor ignores an older policy revision on the same 
     assert.equal(reconciled.status, "running");
     assert.equal(handle.stopCalled, false);
     assert.deepEqual(handle.networkPolicies, []);
+    assert.equal(await readHostSuspensionState(), null);
+  });
+});
+
+test("firewall fail-closed monitor retains an older fence when the successor failed", async () => {
+  const fake = new FakeSandboxController();
+  await withTestEnv(fake, async () => {
+    const handle = new FakeSandboxHandle("sbx-firewall-failed-successor", fake.events);
+    fake.handlesByIds.set(handle.sandboxId, handle);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = handle.sandboxId;
+      meta.lifecycleAttemptId = "firewall-attempt";
+      meta.firewall.policyRevisionId = "failed-successor-policy-revision";
+      meta.firewall.lastPolicySdkCompletionRevisionId =
+        "failed-successor-policy-revision";
+      meta.firewall.lastPolicySdkCompletionHash = "c".repeat(64);
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        lifecycleAttemptId: "firewall-attempt",
+        reason: FIREWALL_FAIL_CLOSED_REASON,
+        suspensionId: null,
+      }),
+    );
+
+    const reconciled = await reconcileSnapshottingStatus();
+
+    assert.equal(reconciled.status, "running");
+    assert.equal(handle.stopCalled, false);
+    assert.equal((await readHostSuspensionState())?.ingressFenced, true);
   });
 });
 
@@ -8592,7 +8968,7 @@ test("missing sandbox during stop is deleted state, not a reusable stop", async 
   });
 });
 
-test("reconcileSnapshottingStatus rolls back when accepted stop remains running", async () => {
+test("reconcileSnapshottingStatus keeps an acknowledged stop fenced until terminal proof", async () => {
   const fake = new FakeSandboxController();
   await withTestEnv(fake, async () => {
     const handle = new FakeSandboxHandle("sbx-stop-not-applied", fake.events);
@@ -8619,18 +8995,19 @@ test("reconcileSnapshottingStatus rolls back when accepted stop remains running"
       updatedAtMs: Date.now() - 20_000,
     });
 
-    const reconciled = await reconcileSnapshottingStatus();
-    assert.equal(reconciled.status, "running");
-    assert.equal(reconciled.portUrls?.["3000"], handle.domain(3000));
-    const rolledBack = await getStore().getValue<HostSuspensionState>(
+    const stillStopping = await reconcileSnapshottingStatus();
+    assert.equal(stillStopping.status, "snapshotting");
+    assert.equal(stillStopping.portUrls, null);
+    const fenced = await getStore().getValue<HostSuspensionState>(
       hostSuspensionOperationKey(),
     );
-    assert.equal(rolledBack?.phase, "failed");
-    assert.equal(rolledBack?.ingressFenced, false);
-    const deadline = await getStore().getValue<{ sandboxId?: string }>(
-      sandboxDeadlineV2Key(),
-    );
-    assert.equal(deadline?.sandboxId, handle.sandboxId);
+    assert.equal(fenced?.phase, "stopping");
+    assert.equal(fenced?.ingressFenced, true);
+
+    handle.setStatus("stopped");
+    const terminal = await reconcileSnapshottingStatus();
+    assert.equal(terminal.status, "stopped");
+    assert.equal((await readHostSuspensionState())?.phase, "stopped");
   });
 });
 

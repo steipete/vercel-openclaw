@@ -4,13 +4,12 @@ import { getStore } from "@/server/store/store";
 
 /**
  * TTL for the primary per-delivery dedup lock used by every channel
- * webhook route. Must comfortably cover each platform's retry window:
- * Slack retries up to ~10 minutes, Telegram gives up after ~30 minutes,
- * WhatsApp similar. 1 hour is a generous ceiling with no practical
- * downside. The old 24-hour TTL held stale locks for an entire day
- * past usefulness and added unnecessary Redis pressure.
+ * webhook route. This is only the short acquisition lease; the handoff ledger
+ * owns durable duplicate suppression after Workflow start. Keeping the lease
+ * short bounds the crash window between lock acquisition and ledger prepare,
+ * so a platform retry can recover instead of receiving 500 for an hour.
  */
-export const CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS = 60 * 60;
+export const CHANNEL_DELIVERY_DEDUP_LOCK_TTL_SECONDS = 30;
 
 /**
  * TTL for Slack's secondary user-message dedup lock, keyed on

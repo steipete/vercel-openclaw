@@ -328,11 +328,42 @@ export async function promoteHotSpare(
   }
 
   const hotSpare = meta.hotSpare ?? createDefaultHotSpareState();
-
-  if (hotSpare.status !== "ready" || !hotSpare.candidateSandboxId) {
+  const decision = evaluateHotSparePromotion({
+    hotSpare,
+    desiredSnapshotId: meta.snapshotId,
+    desiredDynamicConfigHash:
+      meta.snapshotDynamicConfigHash ?? meta.snapshotConfigHash,
+    desiredAssetSha256: meta.snapshotAssetSha256,
+  });
+  if (!decision.ok || !hotSpare.candidateSandboxId) {
     logInfo("hot_spare.promote.skipped", {
-      reason: hotSpare.status === "ready" ? "no_candidate_id" : `status_${hotSpare.status}`,
+      reason: decision.reason,
     });
+    if (
+      hotSpare.candidateSandboxId
+      && [
+        "snapshot-mismatch",
+        "dynamic-config-mismatch",
+        "asset-mismatch",
+      ].includes(decision.reason)
+    ) {
+      try {
+        const stale = await deps.get({
+          sandboxId: hotSpare.candidateSandboxId,
+        });
+        await stale.delete();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("404") && !message.includes("not found")) {
+          throw error;
+        }
+      }
+      return {
+        status: "failed",
+        promotedSandboxId: null,
+        error: `candidate_rejected:${decision.reason}`,
+      };
+    }
     return { status: "skipped", promotedSandboxId: null, error: null };
   }
 

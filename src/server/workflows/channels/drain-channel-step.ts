@@ -1,10 +1,14 @@
 import {
   isChannelName,
+  type ChannelLastForwardInput,
   type ChannelName,
   type SlackChannelConfig,
   type TelegramChannelConfig,
 } from "@/shared/channels";
-import { acquireChannelConfigLease } from "@/server/channels/config-lock";
+import {
+  acquireChannelConfigLease,
+  withChannelConfigLease,
+} from "@/server/channels/config-lock";
 import {
   RetryableSendError,
   type BootMessageHandle,
@@ -55,6 +59,13 @@ import {
 // turn), abort and send the user an out-of-band "took too long"
 // notice via the interaction token while it's still valid.
 const DISCORD_INTERACTION_SOFT_DEADLINE_MS = 13.5 * 60 * 1000;
+
+class SlackAcceptedCleanupPendingError extends Error {
+  constructor(cause: unknown) {
+    super("slack_boot_message_cleanup_pending_after_accept", { cause });
+    this.name = "SlackAcceptedCleanupPendingError";
+  }
+}
 
 type DiscordInteractionContext = {
   applicationId: string;
@@ -220,6 +231,7 @@ export type DrainChannelWorkflowDependencies = {
   createDiscordAdapter: typeof import("@/server/channels/discord/adapter").createDiscordAdapter;
   runWithBootMessages: typeof import("@/server/channels/core/boot-messages").runWithBootMessages;
   ensureSandboxReady: typeof import("@/server/sandbox/lifecycle").ensureSandboxReady;
+  syncGatewayConfigToSandbox: typeof import("@/server/sandbox/lifecycle").syncGatewayConfigToSandbox;
   getSandboxDomain: typeof import("@/server/sandbox/lifecycle").getSandboxDomain;
   forwardToNativeHandler: typeof forwardToNativeHandler;
   forwardTelegramToNativeHandlerLocally: typeof forwardTelegramToNativeHandlerLocally;
@@ -527,6 +539,7 @@ export async function processChannelStep(
   const {
     runWithBootMessages,
     ensureSandboxReady,
+    syncGatewayConfigToSandbox,
     getSandboxDomain,
     forwardToNativeHandler,
     forwardTelegramToNativeHandlerLocally,
@@ -589,17 +602,26 @@ export async function processChannelStep(
   let existingBootHandle: BootMessageHandle | undefined;
   let nativeAcceptance: NativeDeliveryAcceptance | null = null;
   let finalForwardClassification: string | null = null;
+  let acceptedForwardForCleanup: ChannelLastForwardInput | null = null;
   const slackBootTarget = options?.workflowHandoff?.slackBootTarget ?? null;
 
   try {
-    if (channel === "slack") {
+    // Accepted cleanup ownership is non-expiring and must be observed before
+    // any helper can create a new placeholder or reach native forwarding.
+    const slackCleanupDebt =
+      channel === "slack"
+        ? await readSlackBootMessageCleanupPending(deliveryId)
+        : null;
+    const effectiveBootMessageId =
+      slackCleanupDebt?.messageId ?? bootMessageId;
+    if (channel === "slack" && !slackCleanupDebt) {
     const currentSlackConfig = (await getInitializedMeta()).channels.slack;
     const reason = getSlackConfigStaleReason(currentSlackConfig);
     if (reason) {
       const cleanupHandle = await buildExistingBootHandle(
         channel,
         payload,
-        bootMessageId,
+        effectiveBootMessageId,
         { slack: slackCleanupConfig, telegram: null },
         slackBootTarget,
         deriveSlackBootClientMessageId(deliveryId),
@@ -612,7 +634,7 @@ export async function processChannelStep(
   if (
     channel === "slack" &&
     requireSlackConfigGuard &&
-    typeof bootMessageId !== "string" &&
+    typeof effectiveBootMessageId !== "string" &&
     slackBootTarget
   ) {
     const configLease = await acquireChannelConfigLease("slack");
@@ -626,7 +648,7 @@ export async function processChannelStep(
       existingBootHandle = await buildExistingBootHandle(
         channel,
         payload,
-        bootMessageId,
+        effectiveBootMessageId,
         { slack: slackCleanupConfig, telegram: null },
         slackBootTarget,
         deriveSlackBootClientMessageId(deliveryId),
@@ -639,15 +661,45 @@ export async function processChannelStep(
     existingBootHandle = await buildExistingBootHandle(
       channel,
       payload,
-      bootMessageId,
+      effectiveBootMessageId,
       {
         slack: slackCleanupConfig,
         telegram: fallbackTelegramConfig,
       },
       slackBootTarget,
+      channel === "slack"
+        ? deriveSlackBootClientMessageId(deliveryId)
+        : null,
     );
   }
   diag.hasExistingBootHandle = Boolean(existingBootHandle);
+
+  // A prior attempt already delivered the event and durably transferred this
+  // Workflow to cleanup-only mode. Retry deletion without forwarding again.
+  if (channel === "slack" && existingBootHandle && slackCleanupDebt) {
+    if (slackCleanupDebt.acceptedForward) {
+      acceptedForwardForCleanup = slackCleanupDebt.acceptedForward;
+      await recordChannelLastForward(
+        "slack",
+        slackCleanupDebt.acceptedForward,
+      );
+    }
+    // Settle delivery truth while the cleanup-debt record still exists. If
+    // settlement fails, Workflow retries this cleanup-only path, never the
+    // already-accepted native forward.
+    await resolveChannelDlqFailure("slack", deliveryId);
+    try {
+      await existingBootHandle.clear();
+    } catch (error) {
+      throw new SlackAcceptedCleanupPendingError(error);
+    }
+    logInfo("channels.slack_boot_message_cleanup_retry_completed", {
+      channel,
+      requestId,
+      deliveryId,
+    });
+    return;
+  }
 
   async function currentTelegramConfigOrSettle(
     phase: "step-start" | "post-wake" | "pre-forward",
@@ -1156,6 +1208,33 @@ export async function processChannelStep(
           (retryingResult.ok ? "accepted" : "rejected"),
       };
     } else if (channel === "slack") {
+      const slackConfigBeforeSync = (await getInitializedMeta()).channels.slack;
+      if (
+        requireSlackConfigGuard &&
+        slackConfigBeforeSync?.liveConfigSync !== undefined &&
+        slackConfigBeforeSync.liveConfigSync.liveConfigFresh !== true
+      ) {
+        const liveSync = await syncGatewayConfigToSandbox();
+        if (!liveSync.liveConfigFresh) {
+          throw new resolvedDependencies.RetryableError(
+            `slack_config_not_live:${liveSync.reason ?? "unknown"}`,
+            { retryAfter: "5s" },
+          );
+        }
+        await withChannelConfigLease("slack", (lease) =>
+          lease.mutateMeta((meta) => {
+            const slack = meta.channels.slack;
+            if (!slack || slack.configuredAt !== slackConfigGeneration) return;
+            slack.liveConfigSync = {
+              outcome: liveSync.outcome,
+              reason: liveSync.reason,
+              liveConfigFresh: true,
+              checkedAt: Date.now(),
+              operatorMessage: liveSync.operatorMessage,
+            };
+          }),
+        );
+      }
       const configLease = await acquireChannelConfigLease("slack");
       try {
         const currentSlackConfig = (await getInitializedMeta()).channels.slack;
@@ -1169,16 +1248,6 @@ export async function processChannelStep(
           return;
         }
         if (currentSlackConfig) {
-          if (
-            requireSlackConfigGuard &&
-            currentSlackConfig.liveConfigSync !== undefined &&
-            currentSlackConfig.liveConfigSync?.liveConfigFresh !== true
-          ) {
-            throw new resolvedDependencies.RetryableError(
-              "slack_config_not_live",
-              { retryAfter: "5s" },
-            );
-          }
           effectiveReadyMeta = {
             ...effectiveReadyMeta,
             channels: {
@@ -1462,28 +1531,32 @@ export async function processChannelStep(
       finalForwardClassification = finalClassification;
       const port = portForChannel(channel);
       const sandboxUrl = effectiveReadyMeta.portUrls?.[String(port)] ?? null;
+      const lastForward: ChannelLastForwardInput = {
+        ok: forwardResult.ok,
+        status: forwardResult.status,
+        classification: finalClassification,
+        attempts: retryingResult?.attempts ?? 1,
+        totalMs:
+          retryingResult?.totalMs ??
+          (forwardCompletedAt - forwardStartedAt),
+        transport:
+          retryingResult?.transport ??
+          (channel === "telegram" || channel === "slack" ? "public" : null),
+        sandboxUrl,
+        sandboxId: effectiveReadyMeta.sandboxId ?? null,
+        finalReasonHead: lastAttempt?.bodyHead
+          ? lastAttempt.bodyHead.slice(0, 200)
+          : null,
+        startedAt: forwardStartedAt,
+        completedAt: forwardCompletedAt,
+        deliveryId: deliveryId ?? null,
+      };
+      if (channel === "slack" && forwardResult.acceptance === "accepted") {
+        acceptedForwardForCleanup = lastForward;
+      }
       await recordChannelLastForward(
         channel,
-        {
-          ok: forwardResult.ok,
-          status: forwardResult.status,
-          classification: finalClassification,
-          attempts: retryingResult?.attempts ?? 1,
-          totalMs:
-            retryingResult?.totalMs ??
-            (forwardCompletedAt - forwardStartedAt),
-          transport:
-            retryingResult?.transport ??
-            (channel === "telegram" || channel === "slack" ? "public" : null),
-          sandboxUrl,
-          sandboxId: effectiveReadyMeta.sandboxId ?? null,
-          finalReasonHead: lastAttempt?.bodyHead
-            ? lastAttempt.bodyHead.slice(0, 200)
-            : null,
-          startedAt: forwardStartedAt,
-          completedAt: forwardCompletedAt,
-          deliveryId: deliveryId ?? null,
-        },
+        lastForward,
         forwardResult.acceptance === "unknown"
           ? { closedOutcome: "unknown" }
           : undefined,
@@ -1632,37 +1705,79 @@ export async function processChannelStep(
       if (channel === "slack" && forwardResult.ok) {
         diag.bootMessageAction = "slack-cleared-after-native-accept";
         diag.bootMessageClearedAt = Date.now();
-        await existingBootHandle
-          .clear()
-          .then(() => {
-            logInfo("channels.slack_boot_message_cleared_after_accept", {
-              channel,
-              requestId,
+        const slackPayload = payload as {
+          event?: { channel?: string };
+        } | null;
+        const cleanupChannel =
+          slackBootTarget?.channel ?? slackPayload?.event?.channel;
+        let durableCleanupOwner = false;
+        try {
+          const cleanupConfig =
+            slackCleanupConfig ??
+            (typeof bootMessageId === "string"
+              ? (await getInitializedMeta()).channels.slack
+              : null);
+          if (acceptedForwardForCleanup) {
+            durableCleanupOwner = await markSlackBootMessageCleanupPending(
               deliveryId,
-              bootMessageId: bootMessageId ?? null,
-              forwardStatus: forwardResult.status,
-              forwardAttempts: retryingResult?.attempts ?? null,
-              forwardTransport: retryingResult?.transport ?? null,
-              forwardTotalMs: retryingResult?.totalMs ?? null,
-              placeholderAction: "cleared",
-              clearOnAccept: true,
-              reason: "native_handler_accepted_event",
-            });
-          })
-          .catch((bootError) => {
-            logWarn("channels.slack_boot_message_cleanup_after_accept_failed", {
-              channel,
-              requestId,
-              deliveryId,
-              bootMessageId: bootMessageId ?? null,
-              phase: "accepted-forward",
-              forwardStatus: forwardResult.status,
-              error:
-                bootError instanceof Error
-                  ? bootError.message
-                  : String(bootError),
-            });
+              acceptedForwardForCleanup,
+              typeof bootMessageId === "string" &&
+                cleanupChannel &&
+                cleanupConfig
+                ? {
+                    messageId: bootMessageId,
+                    channel: cleanupChannel,
+                    config: cleanupConfig,
+                  }
+                : null,
+            );
+          }
+        } catch (ownerError) {
+          // Native acceptance is authoritative. Cleanup bookkeeping failure
+          // must never replay the already-accepted event.
+          logWarn("channels.slack_boot_message_cleanup_owner_persist_failed", {
+            channel,
+            requestId,
+            deliveryId,
+            error:
+              ownerError instanceof Error
+                ? ownerError.message
+                : String(ownerError),
           });
+        }
+        try {
+          await existingBootHandle.clear();
+          logInfo("channels.slack_boot_message_cleared_after_accept", {
+            channel,
+            requestId,
+            deliveryId,
+            bootMessageId: bootMessageId ?? null,
+            forwardStatus: forwardResult.status,
+            forwardAttempts: retryingResult?.attempts ?? null,
+            forwardTransport: retryingResult?.transport ?? null,
+            forwardTotalMs: retryingResult?.totalMs ?? null,
+            placeholderAction: "cleared",
+            clearOnAccept: true,
+            reason: "native_handler_accepted_event",
+          });
+        } catch (bootError) {
+          logWarn("channels.slack_boot_message_cleanup_after_accept_failed", {
+            channel,
+            requestId,
+            deliveryId,
+            bootMessageId: bootMessageId ?? null,
+            phase: "accepted-forward",
+            durableCleanupOwner,
+            forwardStatus: forwardResult.status,
+            error:
+              bootError instanceof Error
+                ? bootError.message
+                : String(bootError),
+          });
+          if (durableCleanupOwner) {
+            throw new SlackAcceptedCleanupPendingError(bootError);
+          }
+        }
       } else if (channel === "telegram" && forwardResult.ok) {
         diag.bootMessageAction = "telegram-cleared-after-durable-accept";
         diag.bootMessageClearedAt = Date.now();
@@ -1816,6 +1931,29 @@ export async function processChannelStep(
     try {
       await getStore().setValue(channelForwardDiagnosticKey(), diag, 3600);
     } catch { /* best effort */ }
+
+    if (error instanceof SlackAcceptedCleanupPendingError) {
+      // Native acceptance is terminal delivery truth. Placeholder cleanup is
+      // a separate retry lane: no retry budget, failure projection, or DLQ
+      // write may downgrade or replay the already-accepted event.
+      if (acceptedForwardForCleanup) {
+        await recordChannelLastForward("slack", acceptedForwardForCleanup);
+      }
+      await resolveChannelDlqFailure("slack", deliveryId).catch((dlqError) => {
+        logWarn("channels.dlq_resolution_failed", {
+          channel: "slack",
+          deliveryId,
+          phase: "accepted-cleanup-pending",
+          error:
+            dlqError instanceof Error
+              ? dlqError.message
+              : String(dlqError),
+        });
+      });
+      throw new resolvedDependencies.RetryableError(error.message, {
+        retryAfter: WORKFLOW_RETRY_AFTER,
+      });
+    }
 
     const retryBudget = resolveRetryBudget(receivedAtMs, resolvedDependencies);
     diag.workflowAttempt = retryBudget.attempt;
@@ -3091,11 +3229,55 @@ type SlackBootMessageRecord = {
   clientMessageId?: string;
   team?: string;
   botId?: string;
-  state?: "posting" | "sent";
+  state?: "posting" | "sent" | "cleanup-pending";
   messageId?: string;
+  acceptedForward?: ChannelLastForwardInput;
 };
 
 const SLACK_BOOT_MESSAGE_TTL_SECONDS = 3600;
+
+async function markSlackBootMessageCleanupPending(
+  deliveryId: string,
+  acceptedForward: ChannelLastForwardInput,
+  fallback?: {
+    messageId: string;
+    channel: string;
+    config: Pick<SlackChannelConfig, "configuredAt" | "team" | "botId">;
+  } | null,
+): Promise<boolean> {
+  const key = channelBootMessageKey(
+    "slack",
+    deriveSlackBootClientMessageId(deliveryId),
+  );
+  const store = getStore();
+  const record = await store.getValue<SlackBootMessageRecord>(key);
+  const ownedRecord = record?.messageId
+    ? record
+    : fallback
+      ? {
+          channel: fallback.channel,
+          configuredAt: fallback.config.configuredAt,
+          ...(fallback.config.team ? { team: fallback.config.team } : {}),
+          ...(fallback.config.botId ? { botId: fallback.config.botId } : {}),
+          messageId: fallback.messageId,
+        }
+      : null;
+  if (!ownedRecord) return false;
+  await store.setValue(
+    key,
+    { ...ownedRecord, state: "cleanup-pending", acceptedForward },
+  );
+  return true;
+}
+
+async function readSlackBootMessageCleanupPending(
+  deliveryId: string,
+): Promise<SlackBootMessageRecord | null> {
+  const record = await getStore().getValue<SlackBootMessageRecord>(
+    channelBootMessageKey("slack", deriveSlackBootClientMessageId(deliveryId)),
+  );
+  return record?.state === "cleanup-pending" ? record : null;
+}
 
 function slackBootPostOutcomeMayBeAccepted(input: {
   response: Response;
@@ -3527,7 +3709,7 @@ async function loadDrainChannelWorkflowDependencies(): Promise<DrainChannelWorkf
     { createTelegramAdapter },
     { createDiscordAdapter },
     { runWithBootMessages },
-    { ensureSandboxReady, getSandboxDomain },
+    { ensureSandboxReady, getSandboxDomain, syncGatewayConfigToSandbox },
     { hydrateVerifiedBundleIdentity },
     { RetryableError, FatalError, getStepMetadata, getWorkflowMetadata },
   ] = await Promise.all([
@@ -3548,6 +3730,7 @@ async function loadDrainChannelWorkflowDependencies(): Promise<DrainChannelWorkf
     createDiscordAdapter,
     runWithBootMessages,
     ensureSandboxReady,
+    syncGatewayConfigToSandbox,
     getSandboxDomain,
     forwardToNativeHandler,
     forwardTelegramToNativeHandlerLocally,

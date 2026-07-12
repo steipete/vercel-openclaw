@@ -57,6 +57,10 @@ import {
   readWatchdogReport,
   writeWatchdogReport,
 } from "@/server/watchdog/state";
+import {
+  reconcileTelegramWebhookCleanups,
+  type TelegramWebhookCleanupResult,
+} from "@/server/channels/telegram/webhook-cleanup";
 
 export type RunSandboxWatchdogOptions = {
   request: Request;
@@ -100,6 +104,7 @@ export type WatchdogDeps = {
     op?: OperationContext;
   }) => Promise<PrepareHotSpareResult>;
   armDeadline: (meta: SingleMeta) => Promise<SandboxDeadlineState | null>;
+  reconcileChannelCleanups: () => Promise<TelegramWebhookCleanupResult>;
   now: () => number;
 };
 
@@ -182,6 +187,7 @@ const defaultDeps: WatchdogDeps = {
       nativeTimeoutRemainingMs: sandbox.timeoutRemaining,
     });
   },
+  reconcileChannelCleanups: reconcileTelegramWebhookCleanups,
   now: () => Date.now(),
 };
 
@@ -216,18 +222,31 @@ export async function runSandboxWatchdog(
     message: string;
   }): Promise<TokenRefreshResult> => {
     const refreshStartedAt = deps.now();
+    const expectedSandboxId = meta.sandboxId;
+    const expectedLifecycleAttemptId = meta.lifecycleAttemptId ?? null;
     const result = await deps.refreshGatewayToken({
       force: input.force,
       reason: input.reason,
       controlPlaneOrigin: getPublicOrigin(options.request),
     });
+    const postRefreshMeta = await deps.getMeta();
+    const generationChanged =
+      postRefreshMeta.status !== "running"
+      || postRefreshMeta.sandboxId !== expectedSandboxId
+      || (postRefreshMeta.lifecycleAttemptId ?? null)
+        !== expectedLifecycleAttemptId;
+    meta = postRefreshMeta;
     const failed = result.reason.startsWith("refresh-failed:") ||
-      result.reason === "no-credential-available";
+      result.reason === "no-credential-available" ||
+      generationChanged;
+    const failureReason = generationChanged
+      ? "sandbox generation changed or was fail-closed during token refresh"
+      : result.reason;
     addCheck(
       "token.refresh",
       failed ? "fail" : "pass",
       refreshStartedAt,
-      failed ? `AI Gateway token refresh failed: ${result.reason}` : input.message,
+      failed ? `AI Gateway token refresh failed: ${failureReason}` : input.message,
       {
         refreshed: result.refreshed,
         reason: result.reason,
@@ -235,13 +254,15 @@ export async function runSandboxWatchdog(
         retryAfterMs: result.retryAfterMs,
         source: result.credential?.source ?? null,
         expiresAt: result.credential?.expiresAt ?? null,
+        postRefreshSandboxStatus: postRefreshMeta.status,
       },
     );
     if (failed) {
       tokenRefreshFailed = true;
-      lastError = `AI Gateway token refresh failed: ${result.reason}`;
+      lastError = `AI Gateway token refresh failed: ${failureReason}`;
       status = "failed";
     }
+    if (generationChanged) throw new Error(lastError ?? failureReason);
     return result;
   };
 
@@ -262,6 +283,43 @@ export async function runSandboxWatchdog(
   let tokenRefreshFailed = false;
   let deadlineOwnerFailed = false;
   let cronProjectionEnabled = false;
+
+  const runChannelCleanupAntiEntropy = async (): Promise<void> => {
+    const cleanupStartedAt = deps.now();
+    try {
+      const cleanup = await deps.reconcileChannelCleanups();
+      const repaired = cleanup.cleaned > 0;
+      triggeredRepair ||= repaired;
+      if (cleanup.remaining > 0) {
+        lastError = `Telegram webhook cleanup remains pending for ${cleanup.remaining} token(s).`;
+        status = "failed";
+        addCheck(
+          "channel.cleanup",
+          "fail",
+          cleanupStartedAt,
+          lastError,
+          { ...cleanup },
+        );
+        return;
+      }
+      if (repaired && status !== "failed") status = "repairing";
+      addCheck(
+        "channel.cleanup",
+        cleanup.attempted > 0 ? "pass" : "skip",
+        cleanupStartedAt,
+        cleanup.attempted > 0
+          ? "Telegram webhook cleanup obligations reconciled."
+          : "No pending channel cleanup obligations.",
+        { ...cleanup },
+      );
+    } catch (error) {
+      lastError = `Channel cleanup reconciliation failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      status = "failed";
+      addCheck("channel.cleanup", "fail", cleanupStartedAt, lastError);
+    }
+  };
 
   const runCronAntiEntropy = async (): Promise<void> => {
     // Independent repair lane: unrelated contract, sandbox, deadline, or
@@ -586,6 +644,7 @@ export async function runSandboxWatchdog(
   }
 
   await runCronAntiEntropy();
+  await runChannelCleanupAntiEntropy();
 
   if (deadlineOwnerFailed) status = "failed";
 

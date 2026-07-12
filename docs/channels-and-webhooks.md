@@ -2,7 +2,7 @@
 
 ## What this doc covers
 
-This guide explains how to connect Slack, Telegram, and Discord (experimental) to your OpenClaw deployment. Hosted WhatsApp is disabled because the wrapper's former Meta webhook design does not match OpenClaw's linked-device transport.
+This guide explains how to connect Slack and Telegram to your OpenClaw deployment. Hosted Discord and WhatsApp are disabled because their upstream persistent transports do not match the wrapper's HTTP webhook model.
 
 Channels are a first-class part of the product. They depend on durable state (Redis), a working sandbox lifecycle, and a verified deployment. This guide walks through the full path from "deployment exists" to "channel is safely connected and working."
 
@@ -68,7 +68,7 @@ Channel save and channel readiness are separate. A channel can be connectable be
 | --- | --- | --- | --- |
 | Slack | supported | Credential storage, OAuth/manual setup, `/api/channels/slack/webhook`, wake forwarding, `lastForward`, readiness summary. | Route ready, native `/slack/events` accepted, and user-visible reply observation. |
 | Telegram | supported | Bot token storage, webhook secret, `/api/channels/telegram/webhook`, port 8787 native forwarding, wake forwarding, `lastForward`, readiness summary. | Webhook registered, native listener ready, native forward accepted, and user-visible reply observation. |
-| Discord | experimental | Token/public-key storage, interactions endpoint setup, `/ask` registration, `/api/channels/discord/webhook`, workflow forwarding, readiness summary. | Endpoint configured, command registered, native accepted, and final reply visibility verified through the real platform. |
+| Discord | not supported | New setup and delivery fail closed; legacy credentials remain removable so old interaction endpoints can be detached. | Use local/upstream OpenClaw's persistent Discord Gateway transport. |
 | WhatsApp | not supported | Setup and webhook routes fail closed; legacy credentials are not projected into the sandbox. | Use local/upstream OpenClaw linked-device WhatsApp support. |
 | Other upstream channels | upstream-only | None in this wrapper. | Add credential storage, platform verification, webhook/native route, wake forwarding, `lastForward`, readiness summary, and real reply proof before claiming hosted support. |
 
@@ -139,38 +139,9 @@ Use local/upstream OpenClaw for linked-device WhatsApp until a single hosted tra
 
 ## Discord
 
-### Connecting Discord
+Hosted Discord is not supported. OpenClaw's Discord integration owns a persistent Bot Gateway connection; this wrapper cannot replace it with an HTTP interaction forward. New setup, command registration, and Workflow delivery fail closed. A signed interaction for a retained legacy config receives an immediate private unavailable response instead of a deferred acknowledgement that can never complete.
 
-Create or open a Discord application in the Discord Developer Portal, add a bot, and copy the bot token. Paste that token into the Discord panel. The app strips an optional `Bot ` prefix, validates the token with Discord, fetches the application identity, and stores the application ID, public key, app name, and bot username. The public key is required for Ed25519 signature validation; Discord webhooks are rejected until that key is saved.
-
-Initial connect can do two independent setup actions:
-
-- Configure the Discord interactions endpoint to this deployment's `/api/channels/discord/webhook` URL.
-- Register the global `/ask` application command.
-
-Those states are intentionally separate. A valid endpoint does not prove `/ask` exists, and a registered command does not prove Discord points at this deployment. The invite link is available whenever an application ID is known so the operator can add the bot to a server and run a real `/ask` test.
-
-If Discord already has a different interactions endpoint, `PUT /api/channels/discord` returns `409 DISCORD_ENDPOINT_CONFLICT` with the current endpoint, this deployment's desired endpoint, and a repair hint. The admin panel shows both URLs and offers **Use this deployment endpoint** or **Keep existing endpoint**. Overwriting is explicit because it changes which deployment owns the Discord application. Operator-visible URLs are display-safe and never include the deployment protection bypass secret.
-
-Manual command registration remains available through `POST /api/channels/discord/register-command`. That route only registers `/ask`; it does not mutate endpoint configuration.
-
-### How Discord interactions flow
-
-When Discord calls the interactions endpoint:
-
-1. The route validates `x-signature-ed25519` and `x-signature-timestamp` with the stored Discord public key.
-2. PING interactions (`type: 1`) return `type: 1`.
-3. Command interactions return `type: 5` as a deferred ACK and start the workflow path.
-4. The workflow forwards the original raw body and signature headers to OpenClaw's native `/discord-webhook` handler on port 3000.
-5. OpenClaw owns the final interaction edit or fallback channel reply.
-
-The `type: 5` deferred ACK is only route acceptance. It is not native handler acceptance and it is not proof that a user saw a reply. Readiness keeps these signals separate:
-
-- `routeReady` means Discord setup points at the endpoint and `/ask` is registered.
-- `nativeAccepted` means the native `/discord-webhook` path recently accepted the forwarded interaction.
-- `userVisibleReplyVerified` means reply evidence was observed through an interaction edit or fallback channel reply.
-
-After endpoint and command setup, invite the bot, run `/ask` in Discord, return to the admin panel, and confirm the final reply path. If the panel says Discord accepted the initial interaction response but no user-visible OpenClaw reply was observed, inspect `channels.discord_*`, `channels.forward_attempt`, and `channels.forward_outcome` logs rather than treating endpoint setup as complete delivery.
+Use local/upstream OpenClaw for Discord. The hosted DELETE route exists only to detach a legacy interactions endpoint and retains the credential when remote cleanup fails so the operator can retry.
 
 ## Protected deployments
 

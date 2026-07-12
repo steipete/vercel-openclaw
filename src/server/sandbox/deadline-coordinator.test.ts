@@ -19,6 +19,7 @@ import {
 } from "@/server/sandbox/host-suspension";
 import { SandboxLifecycleGuardRejectedError } from "@/server/sandbox/lifecycle";
 import {
+  _resetSandboxSleepConfigCacheForTesting,
   MAX_PORTABLE_SANDBOX_SLEEP_AFTER_MS,
   SANDBOX_TIMEOUT_SAFETY_RUNWAY_MS,
 } from "@/server/sandbox/timeout";
@@ -151,6 +152,39 @@ test("armSandboxDeadline stops before native expiry when session headroom is exh
 
   assert.equal(armed?.deadlineAtMs, 11_000);
   assert.equal(armed?.nativeStopDeadlineAtMs, 11_000);
+});
+
+test("cron runway survives a shorter configured idle deadline and later activity", async (t) => {
+  const originalSleepAfterMs = process.env.OPENCLAW_SANDBOX_SLEEP_AFTER_MS;
+  process.env.OPENCLAW_SANDBOX_SLEEP_AFTER_MS = String(5 * 60_000);
+  _resetSandboxSleepConfigCacheForTesting();
+  t.after(() => {
+    if (originalSleepAfterMs === undefined) {
+      delete process.env.OPENCLAW_SANDBOX_SLEEP_AFTER_MS;
+    } else {
+      process.env.OPENCLAW_SANDBOX_SLEEP_AFTER_MS = originalSleepAfterMs;
+    }
+    _resetSandboxSleepConfigCacheForTesting();
+  });
+  const h = coordinatorHarness();
+  const protectedUntilMs = 15 * 60_000;
+
+  const armed = await armSandboxDeadline(runningMeta(), h.deps, {
+    activityAtMs: 1_000,
+    nativeTimeoutRemainingMs:
+      protectedUntilMs + SANDBOX_TIMEOUT_SAFETY_RUNWAY_MS,
+    minimumDeadlineAtMs: protectedUntilMs,
+  });
+  assert.equal(armed?.deadlineAtMs, protectedUntilMs);
+  assert.equal(armed?.protectedUntilMs, protectedUntilMs);
+
+  h.setNow(60_000);
+  const refreshed = await armSandboxDeadline(runningMeta(), h.deps, {
+    activityAtMs: 60_000,
+  });
+  assert.ok(refreshed);
+  assert.ok(refreshed.deadlineAtMs >= protectedUntilMs);
+  assert.equal(refreshed.protectedUntilMs, protectedUntilMs);
 });
 
 test("moving a deadline earlier starts a same-generation replacement workflow", async () => {

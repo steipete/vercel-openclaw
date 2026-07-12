@@ -157,7 +157,7 @@ This separation makes it easy to tell whether a failure is inside the sandbox or
 
 OpenClaw remains the only authority for cron jobs and due checks. The hosted app projects only wake times:
 
-1. **After scheduler reconciliation:** a trusted plugin receives `cron_reconciled`, adopts that exact scheduler, lists its jobs, and posts a bounded snapshot of the earliest 4,096 wake times plus credential-keyed job hashes to the authenticated host endpoint.
+1. **After gateway startup:** a trusted plugin adopts the live scheduler from the `gateway_start` context, lists its jobs, and posts a bounded snapshot of the earliest 4,096 wake times plus credential-keyed job hashes to the authenticated host endpoint. Later `cron_changed` hooks refresh that full snapshot from their live scheduler context.
 2. **After job changes:** `cron_changed` is a coalesced hint to reread the adopted scheduler. Event deltas are never treated as ordered state.
 3. **On host acceptance:** the endpoint atomically replaces the sanitized Redis projection. Job IDs are keyed-hashed inside the sandbox before transmission; job names, prompts, payloads, delivery targets, and other job configuration never enter the host store.
 4. **For the earliest wake:** Vercel Workflow sleeps until the projected time. Its step rereads the Redis projection and atomically claims the current revision and dispatch token before resuming the sandbox. Superseded workflows become no-ops.

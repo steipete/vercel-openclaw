@@ -14,8 +14,10 @@ import {
   markHostSuspensionStopRequesting,
   markHostSuspensionStopped,
   markHostSuspensionStopping,
+  PLATFORM_STOP_CONFIRMED_REASON,
   prepareHostSuspension,
   readHostSuspensionState,
+  recordPlatformStoppedHostSuspension,
   renewHostSuspension,
   rollbackHostSuspension,
   thawHostSuspensionIfNeeded,
@@ -32,6 +34,60 @@ const FIREWALL_FAIL_CLOSED_REASON = firewallFailClosedReason({
 function fakeSandbox(): SandboxHandle {
   return { sandboxId: "sbx-host-suspension" } as SandboxHandle;
 }
+
+test("platform-stop fence clears only after the SDK handle is running", async () => {
+  const h = harness(async <T>() => ({}) as T);
+  const sandbox = {
+    sandboxId: fakeSandbox().sandboxId,
+    status: "stopped",
+  } as SandboxHandle;
+  const stopped = await recordPlatformStoppedHostSuspension({
+    sandboxId: sandbox.sandboxId,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps);
+  assert.equal(stopped.reason, PLATFORM_STOP_CONFIRMED_REASON);
+
+  assert.equal(await thawHostSuspensionIfNeeded({
+    sandbox,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps), false);
+  assert.equal(h.readState()?.ingressFenced, true);
+
+  (sandbox as { status: string }).status = "running";
+  assert.equal(await thawHostSuspensionIfNeeded({
+    sandbox,
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+  }, h.deps), true);
+  assert.equal(h.readState(), null);
+});
+
+test("platform stop confirmation advances an exact prepared stop", async () => {
+  const h = harness(async <T>(input: { method: string }) => {
+    if (input.method === "gateway.suspend.prepare") {
+      return {
+        status: "ready",
+        suspensionId: "suspension-platform-confirmed",
+        expiresAtMs: 10_000,
+      } as T;
+    }
+    return { status: "running" } as T;
+  });
+  const prepared = await prepareHostSuspension({
+    sandbox: fakeSandbox(),
+    lifecycleAttemptId: LIFECYCLE_ATTEMPT_ID,
+    reason: "platform-confirmed-during-stop",
+  }, h.deps);
+  const stopping = await markHostSuspensionStopping(prepared, h.deps);
+
+  const stopped = await recordPlatformStoppedHostSuspension({
+    sandboxId: stopping.sandboxId,
+    lifecycleAttemptId: stopping.lifecycleAttemptId,
+  }, h.deps);
+
+  assert.equal(stopped.phase, "stopped");
+  assert.equal(stopped.suspensionId, "suspension-platform-confirmed");
+  assert.equal(stopped.ingressFenced, true);
+});
 
 function harness(
   rpc: HostSuspensionDeps["callRpc"],

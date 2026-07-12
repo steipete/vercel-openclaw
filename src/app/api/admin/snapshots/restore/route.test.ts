@@ -10,6 +10,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { _setSnapshotValidationOverrideForTesting } from "@/server/sandbox/snapshot-delete";
 import { withHarness } from "@/test-utils/harness";
 import {
   callRoute,
@@ -137,5 +138,118 @@ test("admin/snapshots/restore POST: restores snapshot from history", async () =>
     const body = result.json as { snapshotId: string; state: string };
     assert.equal(body.snapshotId, "snap-from-history");
     await drainAfterCallbacks();
+  });
+});
+
+test("admin/snapshots/restore POST: retires a running generation before selecting history", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const running = await h.getMeta();
+    assert.ok(running.sandboxId);
+    const runningHandle = h.controller.getHandle(running.sandboxId);
+    assert.ok(runningHandle);
+
+    await h.mutateMeta((meta) => {
+      meta.snapshotId = "snap-current";
+      meta.snapshotHistory = [
+        {
+          id: "hist-old",
+          snapshotId: "snap-old",
+          timestamp: Date.now() - 1_000,
+          reason: "scheduled",
+        },
+      ];
+    });
+
+    const route = getAdminRestoreRoute();
+    const result = await callAdminPost(
+      route.POST,
+      "/api/admin/snapshots/restore",
+      JSON.stringify({ snapshotId: "snap-old" }),
+    );
+
+    assert.ok(result.status === 200 || result.status === 202);
+    assert.equal(
+      runningHandle.deleteCalled,
+      true,
+      "the previous Gateway must be retired before the restore is scheduled",
+    );
+    const prepared = await h.getMeta();
+    assert.notEqual(prepared.sandboxId, running.sandboxId);
+    await drainAfterCallbacks();
+  });
+});
+
+test("admin/snapshots/restore POST: retires an orphaned named sandbox", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const running = await h.getMeta();
+    assert.ok(running.sandboxId);
+    const runningHandle = h.controller.getHandle(running.sandboxId);
+    assert.ok(runningHandle);
+    h.controller.handlesByIds.set("oc-openclaw-single", runningHandle);
+    await h.mutateMeta((meta) => {
+      meta.sandboxId = null;
+      meta.portUrls = null;
+      meta.status = "stopped";
+      meta.snapshotId = "snap-current";
+      meta.snapshotHistory = [
+        {
+          id: "hist-orphaned",
+          snapshotId: "snap-orphaned-restore",
+          timestamp: Date.now() - 1_000,
+          reason: "scheduled",
+        },
+      ];
+    });
+
+    const result = await callAdminPost(
+      getAdminRestoreRoute().POST,
+      "/api/admin/snapshots/restore",
+      JSON.stringify({ snapshotId: "snap-orphaned-restore" }),
+    );
+
+    assert.ok(result.status === 200 || result.status === 202);
+    assert.equal(runningHandle.deleteCalled, true);
+    assert.equal((await h.getMeta()).snapshotId, "snap-orphaned-restore");
+    await drainAfterCallbacks();
+  });
+});
+
+test("admin/snapshots/restore POST: validates provider snapshot before retiring running state", async () => {
+  await withHarness(async (h) => {
+    await h.driveToRunning();
+    const running = await h.getMeta();
+    assert.ok(running.sandboxId);
+    const runningHandle = h.controller.getHandle(running.sandboxId);
+    assert.ok(runningHandle);
+    await h.mutateMeta((meta) => {
+      meta.snapshotHistory = [
+        {
+          id: "expired-history",
+          snapshotId: "snap-expired",
+          timestamp: Date.now() - 1_000,
+          reason: "scheduled",
+        },
+      ];
+    });
+    _setSnapshotValidationOverrideForTesting(async () => ({
+      status: "created",
+      expiresAt: new Date(Date.now() - 1),
+    }));
+
+    try {
+      const result = await callAdminPost(
+        getAdminRestoreRoute().POST,
+        "/api/admin/snapshots/restore",
+        JSON.stringify({ snapshotId: "snap-expired" }),
+      );
+      assert.equal(result.status, 410);
+      assert.equal((result.json as { error: string }).error, "SNAPSHOT_EXPIRED");
+      assert.equal(runningHandle.deleteCalled, false);
+      assert.equal((await h.getMeta()).sandboxId, running.sandboxId);
+    } finally {
+      _setSnapshotValidationOverrideForTesting(null);
+    }
   });
 });

@@ -141,6 +141,12 @@ function makeDeps(overrides: Partial<WatchdogDeps> = {}): WatchdogDeps {
       candidateSandboxId: null,
     }),
     armDeadline: async () => attachedDeadlineState(),
+    reconcileChannelCleanups: async () => ({
+      attempted: 0,
+      cleaned: 0,
+      remaining: 0,
+      disconnected: false,
+    }),
     now: (() => {
       let current = 0;
       return () => (current += 10);
@@ -159,6 +165,36 @@ test("running sandbox with healthy probe reports ok", async () => {
   assert.equal(report.triggeredRepair, false);
   assert.equal(report.consecutiveFailures, 0);
   assert.equal(findCheck(report, "cron.wake")?.status, "skip");
+});
+
+test("watchdog runs cron anti-entropy before channel cleanup", async () => {
+  const order: string[] = [];
+  await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      reconcileCronProjection: async () => {
+        order.push("cron");
+        return {
+          status: "empty",
+          projectionRevision: null,
+          nextRunAtMs: null,
+          workflowRunId: null,
+          repaired: false,
+        };
+      },
+      reconcileChannelCleanups: async () => {
+        order.push("channel-cleanup");
+        return {
+          attempted: 0,
+          cleaned: 0,
+          remaining: 0,
+          disconnected: false,
+        };
+      },
+    }),
+  );
+
+  assert.deepEqual(order, ["cron", "channel-cleanup"]);
 });
 
 test("watchdog repairs a persisted firewall fail-closed handoff", async () => {
@@ -426,6 +462,38 @@ test("watchdog reports token refresh failure", async () => {
   const check = findCheck(report, "token.refresh");
   assert.equal(check?.status, "fail");
   assert.equal(check?.data?.retryAfterMs, 30_000);
+});
+
+test("watchdog reports fail-closed generation after token refresh", async () => {
+  let metaReads = 0;
+  const report = await runSandboxWatchdog(
+    { request: new Request("https://app.test/api/cron/watchdog") },
+    makeDeps({
+      getMeta: async () => {
+        metaReads += 1;
+        return metaReads === 1
+          ? ({
+              status: "running",
+              sandboxId: "sbx_123",
+              lifecycleAttemptId: null,
+            } as SingleMeta)
+          : ({
+              status: "error",
+              sandboxId: "sbx_123",
+              lifecycleAttemptId: null,
+            } as SingleMeta);
+      },
+      refreshGatewayToken: async () => ({
+        refreshed: false,
+        reason: "sandbox-changed",
+      }),
+    }),
+  );
+
+  assert.equal(report.status, "failed");
+  assert.equal(report.sandboxStatus, "error");
+  assert.match(report.lastError ?? "", /fail-closed during token refresh/);
+  assert.equal(findCheck(report, "token.refresh")?.status, "fail");
 });
 
 test("running sandbox with failed probe schedules repair", async () => {

@@ -216,6 +216,10 @@ export type FirewallState = {
   lastPolicySdkCompletionRevisionId?: string | null;
   /** Policy hash paired with the latest settled SDK policy call. */
   lastPolicySdkCompletionHash?: string | null;
+  /** Latest SDK policy call that completed successfully for this generation. */
+  lastPolicySdkSuccessRevisionId?: string | null;
+  /** Policy hash paired with the latest successful SDK policy call. */
+  lastPolicySdkSuccessHash?: string | null;
 };
 
 export type FirewallReport = {
@@ -596,6 +600,8 @@ export function createDefaultMeta(
       failClosedPolicyHash: null,
       lastPolicySdkCompletionRevisionId: null,
       lastPolicySdkCompletionHash: null,
+      lastPolicySdkSuccessRevisionId: null,
+      lastPolicySdkSuccessHash: null,
     },
     lastTokenRefreshAt: null,
     channels: createDefaultChannelConfigs(),
@@ -689,6 +695,43 @@ export function ensureMetaShape(
       ? rawPersistedStateSource
       : persistedStateDynamicConfigHash || persistedStateAssetSha256
         ? legacySnapshotId ? "manual-snapshot" : "persistent-auto-save"
+        : null;
+  const rawFirewall = (raw.firewall ?? {}) as Record<string, unknown>;
+  const completionRevisionId =
+    typeof rawFirewall.lastPolicySdkCompletionRevisionId === "string"
+      ? rawFirewall.lastPolicySdkCompletionRevisionId
+      : null;
+  const completionHash =
+    typeof rawFirewall.lastPolicySdkCompletionHash === "string"
+      ? rawFirewall.lastPolicySdkCompletionHash
+      : null;
+  const policyRevisionId =
+    typeof rawFirewall.policyRevisionId === "string"
+      ? rawFirewall.policyRevisionId
+      : null;
+  const lastSyncOutcome = isFirewallSyncOutcome(rawFirewall.lastSyncOutcome)
+    ? rawFirewall.lastSyncOutcome
+    : null;
+  // Pre-field records can attest success only when desired revision,
+  // completion, and the persisted successful sync all describe one policy.
+  const inferredSuccessfulCompletion = Boolean(
+    completionRevisionId
+    && completionHash
+    && policyRevisionId === completionRevisionId
+    && lastSyncOutcome?.applied === true
+    && lastSyncOutcome.policyHash === completionHash,
+  );
+  const successfulRevisionId =
+    typeof rawFirewall.lastPolicySdkSuccessRevisionId === "string"
+      ? rawFirewall.lastPolicySdkSuccessRevisionId
+      : inferredSuccessfulCompletion
+        ? completionRevisionId
+        : null;
+  const successfulHash =
+    typeof rawFirewall.lastPolicySdkSuccessHash === "string"
+      ? rawFirewall.lastPolicySdkSuccessHash
+      : inferredSuccessfulCompletion
+        ? completionHash
         : null;
 
   return {
@@ -935,10 +978,7 @@ export function ensureMetaShape(
         ? ((raw.firewall as Record<string, unknown>).lastSyncOutcome as FirewallSyncOutcome)
         : null,
       policyRevisionId:
-        typeof (raw.firewall as Record<string, unknown>)?.policyRevisionId
-          === "string"
-          ? (raw.firewall as Record<string, unknown>).policyRevisionId as string
-          : null,
+        policyRevisionId,
       failClosedPolicyRevisionId:
         typeof (raw.firewall as Record<string, unknown>)
           ?.failClosedPolicyRevisionId === "string"
@@ -951,17 +991,11 @@ export function ensureMetaShape(
           ? (raw.firewall as Record<string, unknown>).failClosedPolicyHash as string
           : null,
       lastPolicySdkCompletionRevisionId:
-        typeof (raw.firewall as Record<string, unknown>)
-          ?.lastPolicySdkCompletionRevisionId === "string"
-          ? (raw.firewall as Record<string, unknown>)
-              .lastPolicySdkCompletionRevisionId as string
-          : null,
+        completionRevisionId,
       lastPolicySdkCompletionHash:
-        typeof (raw.firewall as Record<string, unknown>)
-          ?.lastPolicySdkCompletionHash === "string"
-          ? (raw.firewall as Record<string, unknown>)
-              .lastPolicySdkCompletionHash as string
-          : null,
+        completionHash,
+      lastPolicySdkSuccessRevisionId: successfulRevisionId,
+      lastPolicySdkSuccessHash: successfulHash,
     },
     lastTokenRefreshAt:
       typeof raw.lastTokenRefreshAt === "number" ? raw.lastTokenRefreshAt : null,

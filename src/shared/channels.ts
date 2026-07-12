@@ -61,6 +61,7 @@ export type TelegramChannelConfig = {
     botId?: string;
     requestedAt: number;
   }>;
+  webhookSetupPending?: boolean;
   deletionPending?: boolean;
   webhookUrl: string;
   botUsername: string;
@@ -394,6 +395,8 @@ function isTelegramChannelConfig(value: unknown): value is TelegramChannelConfig
             typeof cleanup.requestedAt === "number",
         ))) &&
     (raw.deletionPending === undefined || typeof raw.deletionPending === "boolean") &&
+    (raw.webhookSetupPending === undefined ||
+      typeof raw.webhookSetupPending === "boolean") &&
     (raw.commandSyncStatus === undefined ||
       raw.commandSyncStatus === "synced" ||
       raw.commandSyncStatus === "unsynced" ||

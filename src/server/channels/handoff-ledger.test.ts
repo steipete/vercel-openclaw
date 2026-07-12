@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import test, { beforeEach } from "node:test";
+import test, { beforeEach, mock } from "node:test";
 
 import {
+  CHANNEL_FAST_PATH_DISPATCH_STALE_MS,
+  classifyFastPathDispatch,
   claimChannelHandoff,
   markChannelDeliveryTerminal,
   markChannelFastPathDispatching,
@@ -10,6 +12,7 @@ import {
   markChannelHandoffStarting,
   prepareChannelHandoff,
   readChannelHandoff,
+  renewChannelFastPathDispatch,
 } from "@/server/channels/handoff-ledger";
 import { _resetStoreForTesting } from "@/server/store/store";
 
@@ -71,13 +74,107 @@ test("direct fast-path settlement durably acknowledges later duplicates", async 
 });
 
 test("fast-path dispatch intent survives for retry-side unknown settlement", async () => {
-  await markChannelFastPathDispatching({
+  const dispatch = await markChannelFastPathDispatching({
     channel: "slack",
     deliveryId: "slack:event-dispatching",
   });
+  assert.equal(dispatch.action, "dispatch");
   assert.equal(
     (await readChannelHandoff("slack", "slack:event-dispatching"))?.state,
     "fast-path-dispatching",
+  );
+});
+
+test("fast-path dispatch ownership stays active until its native timeout elapses", async () => {
+  const dispatch = await markChannelFastPathDispatching({
+    channel: "telegram",
+    deliveryId: "telegram:active-dispatch",
+  });
+  assert.equal(dispatch.action, "dispatch");
+  if (dispatch.action !== "dispatch") return;
+  const record = await readChannelHandoff(
+    "telegram",
+    "telegram:active-dispatch",
+  );
+  assert.ok(record);
+
+  assert.equal(
+    classifyFastPathDispatch(
+      record,
+      record.updatedAt + CHANNEL_FAST_PATH_DISPATCH_STALE_MS - 1,
+    ).action,
+    "retry",
+  );
+  assert.equal(
+    classifyFastPathDispatch(
+      record,
+      record.updatedAt + CHANNEL_FAST_PATH_DISPATCH_STALE_MS,
+    ).action,
+    "settle-unknown",
+  );
+
+  assert.equal(
+    await markChannelDeliveryTerminal({
+      channel: "telegram",
+      deliveryId: "telegram:active-dispatch",
+      expectedAttemptId: "fast:other-owner",
+    }),
+    false,
+  );
+  assert.equal(
+    (await readChannelHandoff("telegram", "telegram:active-dispatch"))?.state,
+    "fast-path-dispatching",
+  );
+  assert.equal(
+    await markChannelDeliveryTerminal({
+      channel: "telegram",
+      deliveryId: "telegram:active-dispatch",
+      expectedAttemptId: dispatch.attemptId,
+    }),
+    true,
+  );
+});
+
+test("fast-path repair renews only the exact active dispatch owner", async () => {
+  const dispatch = await markChannelFastPathDispatching({
+    channel: "slack",
+    deliveryId: "slack:repair-dispatch",
+  });
+  assert.equal(dispatch.action, "dispatch");
+  if (dispatch.action !== "dispatch") return;
+  const initial = await readChannelHandoff("slack", "slack:repair-dispatch");
+  assert.ok(initial);
+  const renewedAt = initial.updatedAt + CHANNEL_FAST_PATH_DISPATCH_STALE_MS - 1;
+  const dateMock = mock.method(Date, "now", () => renewedAt);
+  try {
+    assert.equal(
+      await renewChannelFastPathDispatch({
+        channel: "slack",
+        deliveryId: "slack:repair-dispatch",
+        attemptId: "fast:wrong-owner",
+      }),
+      false,
+    );
+    assert.equal(
+      await renewChannelFastPathDispatch({
+        channel: "slack",
+        deliveryId: "slack:repair-dispatch",
+        attemptId: dispatch.attemptId,
+      }),
+      true,
+    );
+  } finally {
+    dateMock.mock.restore();
+  }
+  const renewed = await readChannelHandoff("slack", "slack:repair-dispatch");
+  assert.ok(renewed);
+  assert.equal(renewed.updatedAt, renewedAt);
+  assert.equal(
+    classifyFastPathDispatch(
+      renewed,
+      renewedAt + CHANNEL_FAST_PATH_DISPATCH_STALE_MS - 1,
+    ).action,
+    "retry",
   );
 });
 

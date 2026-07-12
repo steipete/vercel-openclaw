@@ -257,6 +257,12 @@ test("L4-host Slack local cycle: durable Workflow before and after wake", async 
               };
             },
             ensureSandboxReady: async () => h.getMeta(),
+            syncGatewayConfigToSandbox: async () => ({
+              outcome: "applied",
+              reason: "config_written_and_restarted",
+              liveConfigFresh: true,
+              operatorMessage: null,
+            }),
             getSandboxDomain: async () => (await h.getMeta()).portUrls?.["3000"] ?? sandboxUrl,
             forwardToNativeHandler: async () => ({
               ok: true,

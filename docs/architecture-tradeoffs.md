@@ -4,7 +4,7 @@ This document captures key architectural decisions in vercel-openclaw, the trade
 
 ## Control plane channels vs container-native channels
 
-vercel-openclaw owns the Slack, Telegram, and experimental Discord channel layer in the control plane. Hosted WhatsApp is disabled: the app's former Meta Cloud API webhook layer did not match OpenClaw's Baileys linked-device runtime. moltworker delegates channels entirely to OpenClaw inside the container.
+vercel-openclaw owns the Slack and Telegram channel layer in the control plane. Hosted Discord and WhatsApp are disabled because their upstream persistent transports do not match the wrapper's HTTP webhook model. moltworker delegates channels entirely to OpenClaw inside the container.
 
 ### What "control plane channels" means
 

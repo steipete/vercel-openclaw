@@ -9,8 +9,10 @@ import {
 import {
   recordChannelDlqFailure,
   recordFastPathAcceptanceUnknown,
+  resolveChannelDlqFailure,
 } from "@/server/channels/dlq";
 import {
+  classifyFastPathDispatch,
   markChannelHandoffHandedOff,
   markChannelDeliveryTerminal,
   markChannelFastPathDispatching,
@@ -18,6 +20,7 @@ import {
   markChannelHandoffStarting,
   prepareChannelHandoff,
   readChannelHandoff,
+  renewChannelFastPathDispatch,
 } from "@/server/channels/handoff-ledger";
 import { refreshChannelFastPathGatewayToken } from "@/server/channels/fast-path-token";
 import { recordChannelLastForward } from "@/server/channels/last-forward";
@@ -95,8 +98,25 @@ function workflowStartFailedResponse() {
   );
 }
 
-async function settleFastPathDelivery(deliveryId: string): Promise<void> {
-  await markChannelDeliveryTerminal({ channel: "slack", deliveryId }).catch(
+async function settleFastPathDelivery(
+  deliveryId: string,
+  attemptId: string,
+  outcome: "accepted" | "unknown",
+): Promise<void> {
+  if (outcome === "accepted") {
+    await resolveChannelDlqFailure("slack", deliveryId).catch((error) => {
+      logWarn("channels.slack_fast_path_dlq_resolution_failed", {
+        deliveryId,
+        attemptId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+  const terminalized = await markChannelDeliveryTerminal({
+    channel: "slack",
+    deliveryId,
+    expectedAttemptId: attemptId,
+  }).catch(
     (error) => {
       // Native admission already happened. Bookkeeping failure must never
       // turn a settled platform delivery into a second native dispatch.
@@ -104,8 +124,16 @@ async function settleFastPathDelivery(deliveryId: string): Promise<void> {
         deliveryId,
         error: error instanceof Error ? error.message : String(error),
       });
+      return false;
     },
   );
+  if (!terminalized) {
+    logInfo("channels.slack_fast_path_terminal_ownership_lost", {
+      deliveryId,
+      attemptId,
+      outcome,
+    });
+  }
 }
 
 async function releaseSlackWebhookDedupLocksForRetry(
@@ -360,6 +388,16 @@ export async function POST(request: Request): Promise<Response> {
         return Response.json({ ok: true });
       }
       if (handoff?.state === "fast-path-dispatching") {
+        const disposition = classifyFastPathDispatch(handoff);
+        if (disposition.action === "retry") {
+          logInfo("channels.slack_fast_path_dispatch_still_active", {
+            requestId,
+            deliveryId: handoffDeliveryId,
+            attemptId: disposition.attemptId,
+            dispatchAgeMs: disposition.ageMs,
+          });
+          return workflowStartFailedResponse();
+        }
         const dlqRecord = await recordFastPathAcceptanceUnknown({
           channel: "slack",
           deliveryId: handoffDeliveryId,
@@ -368,7 +406,11 @@ export async function POST(request: Request): Promise<Response> {
           reason: "slack_fast_path_dispatch_interrupted",
         });
         if (!dlqRecord) return workflowStartFailedResponse();
-        await settleFastPathDelivery(handoffDeliveryId);
+        await settleFastPathDelivery(
+          handoffDeliveryId,
+          disposition.attemptId,
+          "unknown",
+        );
         return Response.json({ ok: true });
       }
       return workflowStartFailedResponse();
@@ -460,6 +502,7 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     const fastPathStartedAt = Date.now();
+    let fastPathDispatchAttemptId: string | null = null;
     let fastPathSandboxUrl: string | null = null;
     let fastPathAttempts = 0;
     let nativeDispatchInFlight = false;
@@ -513,10 +556,33 @@ export async function POST(request: Request): Promise<Response> {
         }));
 
         fastPathAttempts += 1;
-        await markChannelFastPathDispatching({
+        const dispatch = await markChannelFastPathDispatching({
           channel: "slack",
           deliveryId: fastPathDeliveryId,
         });
+        if (dispatch.action === "ack") {
+          return Response.json({ ok: true });
+        }
+        if (dispatch.action === "retry") {
+          return workflowStartFailedResponse();
+        }
+        if (dispatch.action === "settle-unknown") {
+          const dlqRecord = await recordFastPathAcceptanceUnknown({
+            channel: "slack",
+            deliveryId: fastPathDeliveryId,
+            requestId: requestId ?? null,
+            receivedAtMs,
+            reason: "slack_fast_path_dispatch_abandoned",
+          });
+          if (!dlqRecord) return workflowStartFailedResponse();
+          await settleFastPathDelivery(
+            fastPathDeliveryId,
+            dispatch.attemptId,
+            "unknown",
+          );
+          return Response.json({ ok: true });
+        }
+        fastPathDispatchAttemptId = dispatch.attemptId;
         nativeDispatchInFlight = true;
         let resp = await fetch(forwardUrl, {
           method: "POST",
@@ -546,7 +612,11 @@ export async function POST(request: Request): Promise<Response> {
             completedAt: Date.now(),
             deliveryId: fastPathDedupId ? `slack:${fastPathDedupId}` : null,
           });
-          await settleFastPathDelivery(fastPathDeliveryId);
+          await settleFastPathDelivery(
+            fastPathDeliveryId,
+            fastPathDispatchAttemptId,
+            "accepted",
+          );
           return Response.json({ ok: true });
         }
 
@@ -563,6 +633,16 @@ export async function POST(request: Request): Promise<Response> {
           }));
 
           if (sync.liveConfigFresh) {
+            if (
+              !fastPathDispatchAttemptId
+              || !(await renewChannelFastPathDispatch({
+                channel: "slack",
+                deliveryId: fastPathDeliveryId,
+                attemptId: fastPathDispatchAttemptId,
+              }))
+            ) {
+              return Response.json({ ok: true });
+            }
             fastPathAttempts += 1;
             nativeDispatchInFlight = true;
             const retry = await fetch(forwardUrl, {
@@ -593,7 +673,11 @@ export async function POST(request: Request): Promise<Response> {
                 completedAt: Date.now(),
                 deliveryId: fastPathDedupId ? `slack:${fastPathDedupId}` : null,
               });
-              await settleFastPathDelivery(fastPathDeliveryId);
+              await settleFastPathDelivery(
+                fastPathDeliveryId,
+                fastPathDispatchAttemptId,
+                "accepted",
+              );
               return Response.json({ ok: true });
             }
             resp = retry;
@@ -685,7 +769,11 @@ export async function POST(request: Request): Promise<Response> {
           if (!dlqRecord) {
             return workflowStartFailedResponse();
           }
-          await settleFastPathDelivery(fastPathDeliveryId);
+          await settleFastPathDelivery(
+            fastPathDeliveryId,
+            fastPathDispatchAttemptId,
+            "unknown",
+          );
           return Response.json({ ok: true });
         }
         revalidateSandboxBeforeForward = admittedGatewayUnavailable;
@@ -817,14 +905,24 @@ export async function POST(request: Request): Promise<Response> {
         if (!dlqRecord) {
           return workflowStartFailedResponse();
         }
-        await settleFastPathDelivery(fastPathDeliveryId);
+        if (fastPathDispatchAttemptId) {
+          await settleFastPathDelivery(
+            fastPathDeliveryId,
+            fastPathDispatchAttemptId,
+            "unknown",
+          );
+        }
         return Response.json({ ok: true });
       }
       effectiveMeta = await reconcileStaleRunningStatus();
     }
   } else {
     logInfo("channels.slack_fast_path_skipped", withOperationContext(op, {
-      reason: effectiveMeta.status !== "running" ? `sandbox_status_${effectiveMeta.status}` : "no_sandbox_id",
+      reason: !nativeFastPathEnabledForTesting
+        ? "workflow_only"
+        : effectiveMeta.status !== "running"
+          ? `sandbox_status_${effectiveMeta.status}`
+          : "no_sandbox_id",
       status: effectiveMeta.status,
       sandboxId: effectiveMeta.sandboxId,
       ...eventInfo,

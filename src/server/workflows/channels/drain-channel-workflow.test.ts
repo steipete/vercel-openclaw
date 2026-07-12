@@ -64,13 +64,13 @@ test("drain channel step retry policy covers delivery and cleanup budgets", () =
   assert.equal(processChannelWorkflowStep.maxRetries, 49);
 });
 
-test("delivery retry budget counts Workflow's zero-based attempt index", async () => {
+test("delivery retry budget counts Workflow's one-based attempt number", async () => {
   const dependencies = createWorkflowDependencies({
     getStepMetadata: (() => ({
       stepName: "processChannelStep",
       stepId: "delivery-attempt-cap",
       stepStartedAt: new Date(),
-      attempt: 24,
+      attempt: 25,
     })) as never,
     runWithBootMessages: async () => {
       throw new Error("sandbox_not_ready");

@@ -320,8 +320,7 @@ function resolveRetryBudget(
   let attempt: number | null = null;
   let workflowStartedAtMs: number | null = null;
   try {
-    // Workflow metadata is a zero-based retry index; budgets count executions.
-    attempt = dependencies.getStepMetadata().attempt + 1;
+    attempt = dependencies.getStepMetadata().attempt;
   } catch {
     // Metadata is only available inside a step; calling outside throws.
   }
@@ -2258,7 +2257,7 @@ export async function processChannelStep(
           // Direct/test callers without a durable handoff retain a hard cap.
           workflowExecution = Math.max(
             1,
-            resolvedDependencies.getStepMetadata().attempt + 1,
+            resolvedDependencies.getStepMetadata().attempt,
           );
         } catch {
           // Metadata is only available inside a Workflow step.

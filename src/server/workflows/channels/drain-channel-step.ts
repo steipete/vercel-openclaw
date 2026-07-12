@@ -30,6 +30,7 @@ import {
   claimChannelHandoff,
   markChannelWorkflowNativeAccepted,
   readChannelHandoff,
+  reserveChannelAcceptedCleanupAttempt,
   resetChannelWorkflowDispatch,
 } from "@/server/channels/handoff-ledger";
 import {
@@ -530,6 +531,9 @@ export async function processChannelStep(
   let handoffRunId: string | null = null;
   let resumeAcceptedSlackDispatch = false;
   let settleInterruptedSlackDispatch = false;
+  let acceptedSlackForwardReceipt: ChannelLastForwardInput | null = null;
+  let acceptedCleanupAttemptOffset = 0;
+  let acceptedCleanupFirstAtMs: number | null = null;
   if (handoffDeliveryId && handoffAttemptId && isChannelName(channel)) {
     const runId = resolvedDependencies.getWorkflowMetadata().workflowRunId;
     const claimed = await claimChannelHandoff({
@@ -553,6 +557,11 @@ export async function processChannelStep(
       resumeAcceptedSlackDispatch = handoff?.state === "native-accepted";
       settleInterruptedSlackDispatch =
         handoff?.state === "workflow-dispatching";
+      acceptedSlackForwardReceipt = handoff?.nativeAcceptedForward ?? null;
+      acceptedCleanupAttemptOffset =
+        handoff?.acceptedCleanupRetry?.attempts ?? 0;
+      acceptedCleanupFirstAtMs =
+        handoff?.acceptedCleanupRetry?.firstAttemptAtMs ?? null;
     }
   }
   // Diagnostic trace — every phase appends here, written to store at the end.
@@ -654,7 +663,7 @@ export async function processChannelStep(
   let existingBootHandle: BootMessageHandle | undefined;
   let nativeAcceptance: NativeDeliveryAcceptance | null = null;
   let finalForwardClassification: string | null = null;
-  let acceptedForwardForCleanup: ChannelLastForwardInput | null = null;
+  let acceptedForwardForCleanup = acceptedSlackForwardReceipt;
   const slackBootTarget = options?.workflowHandoff?.slackBootTarget ?? null;
 
   try {
@@ -694,6 +703,10 @@ export async function processChannelStep(
     }
     if (channel === "slack" && resumeAcceptedSlackDispatch) {
       try {
+        if (acceptedForwardForCleanup) {
+          await recordChannelLastForward("slack", acceptedForwardForCleanup);
+          await resolveChannelDlqFailure("slack", deliveryId);
+        }
         await markSlackBootMessageCleanupPending(
           deliveryId,
           undefined,
@@ -713,10 +726,18 @@ export async function processChannelStep(
     }
     // Accepted cleanup ownership is non-expiring and must be observed before
     // any helper can create a new placeholder or reach native forwarding.
-    const slackCleanupDebt =
-      channel === "slack"
-        ? await readSlackBootMessageCleanupPending(deliveryId)
-        : null;
+    let slackCleanupDebt: SlackBootMessageRecord | null = null;
+    try {
+      slackCleanupDebt =
+        channel === "slack"
+          ? await readSlackBootMessageCleanupPending(deliveryId)
+          : null;
+    } catch (error) {
+      if (channel === "slack" && resumeAcceptedSlackDispatch) {
+        throw new SlackAcceptedCleanupPendingError(error, null);
+      }
+      throw error;
+    }
     const effectiveBootMessageId =
       slackCleanupDebt?.messageId ?? bootMessageId;
     if (channel === "slack" && slackCleanupDebt) {
@@ -1512,15 +1533,40 @@ export async function processChannelStep(
           retryingResult.acceptance === "accepted" ||
           retryingResult.ok
         ) {
+          const acceptedAt = Date.now();
+          const acceptedAttempt = retryingResult.attemptsDetail?.[
+            retryingResult.attemptsDetail.length - 1
+          ] ?? null;
+          const acceptedForward: ChannelLastForwardInput = {
+            ok: true,
+            status: retryingResult.status,
+            classification: acceptedAttempt?.classification ?? "accepted",
+            attempts: retryingResult.attempts,
+            totalMs: retryingResult.totalMs,
+            transport: retryingResult.transport ?? null,
+            sandboxUrl:
+              effectiveReadyMeta.portUrls?.[
+                String(portForChannel("slack"))
+              ] ?? null,
+            sandboxId: effectiveReadyMeta.sandboxId ?? null,
+            finalReasonHead: acceptedAttempt?.bodyHead
+              ? acceptedAttempt.bodyHead.slice(0, 200)
+              : null,
+            startedAt: forwardStartedAt,
+            completedAt: acceptedAt,
+            deliveryId: deliveryId ?? null,
+          };
           const marked = await markChannelWorkflowNativeAccepted({
             channel: "slack",
             deliveryId: handoffDeliveryId,
             attemptId: handoffAttemptId,
             runId: handoffRunId,
+            acceptedForward,
           });
           if (!marked) {
             throw new Error("slack_native_acceptance_fence_lost");
           }
+          acceptedForwardForCleanup = acceptedForward;
         } else if (retryingResult.acceptance === "rejected") {
           const reset = await resetChannelWorkflowDispatch({
             channel: "slack",
@@ -2169,49 +2215,108 @@ export async function processChannelStep(
       // Native acceptance is terminal delivery truth. Placeholder cleanup is
       // a separate bounded retry lane: no failure projection or DLQ write may
       // downgrade or replay the already-accepted event.
-      if (acceptedForwardForCleanup) {
-        await recordChannelLastForward("slack", acceptedForwardForCleanup);
+      let unrecordedCleanupAttempt: {
+        attempt: number;
+        firstAttemptAtMs: number;
+      } | null = null;
+      if (
+        !error.cleanupAttempt &&
+        handoffDeliveryId &&
+        handoffAttemptId &&
+        handoffRunId
+      ) {
+        try {
+          const reserved = await reserveChannelAcceptedCleanupAttempt({
+            channel: "slack",
+            deliveryId: handoffDeliveryId,
+            attemptId: handoffAttemptId,
+            runId: handoffRunId,
+          });
+          if (!reserved) {
+            throw new Error("slack_accepted_cleanup_fence_lost");
+          }
+          unrecordedCleanupAttempt = reserved;
+        } catch (reserveError) {
+          logWarn("channels.slack_boot_message_cleanup_attempt_reserve_failed", {
+            channel: "slack",
+            requestId,
+            deliveryId,
+            error:
+              reserveError instanceof Error
+                ? reserveError.message
+                : String(reserveError),
+          });
+          throw new resolvedDependencies.RetryableError(error.message, {
+            retryAfter: error.retryAfter,
+          });
+        }
       }
-      try {
-        await resolveChannelDlqFailure("slack", deliveryId);
-      } catch (dlqError) {
-        logWarn("channels.dlq_resolution_failed", {
-          channel: "slack",
-          deliveryId,
-          phase: "accepted-cleanup-pending",
-          error:
-            dlqError instanceof Error
-              ? dlqError.message
-              : String(dlqError),
-        });
+      if (!error.cleanupAttempt && !unrecordedCleanupAttempt) {
+        let workflowExecution = 1;
+        try {
+          // Direct/test callers without a durable handoff retain a hard cap.
+          workflowExecution = Math.max(
+            1,
+            resolvedDependencies.getStepMetadata().attempt + 1,
+          );
+        } catch {
+          // Metadata is only available inside a Workflow step.
+        }
+        unrecordedCleanupAttempt = {
+          attempt: workflowExecution,
+          firstAttemptAtMs: Date.now(),
+        };
+      }
+      const cleanupAttempt = error.cleanupAttempt
+        ? {
+            attempt:
+              acceptedCleanupAttemptOffset + error.cleanupAttempt.attempt,
+            firstAttemptAtMs:
+              acceptedCleanupFirstAtMs === null
+                ? error.cleanupAttempt.firstAttemptAtMs
+                : Math.min(
+                    acceptedCleanupFirstAtMs,
+                    error.cleanupAttempt.firstAttemptAtMs,
+                  ),
+          }
+        : unrecordedCleanupAttempt;
+      if (!cleanupAttempt) {
         throw new resolvedDependencies.RetryableError(error.message, {
           retryAfter: error.retryAfter,
         });
       }
-      let unrecordedCleanupAttempt = 1;
+      const cleanupBudget = resolveSlackAcceptedCleanupRetryBudget(
+        cleanupAttempt.attempt,
+        cleanupAttempt.firstAttemptAtMs,
+        Date.now(),
+      );
+      let acceptedProjectionError: unknown = null;
       try {
-        // Workflow metadata is zero-based; cleanup budgets count executions.
-        unrecordedCleanupAttempt = Math.max(
-          1,
-          resolvedDependencies.getStepMetadata().attempt + 1,
-        );
-      } catch {
-        // Tests and direct callers can run outside Workflow metadata.
+        if (acceptedForwardForCleanup) {
+          await recordChannelLastForward("slack", acceptedForwardForCleanup);
+        }
+        await resolveChannelDlqFailure("slack", deliveryId);
+      } catch (projectionError) {
+        acceptedProjectionError = projectionError;
+        logWarn("channels.slack_accepted_projection_retry", {
+          channel: "slack",
+          deliveryId,
+          cleanupAttempt: cleanupBudget.attempts,
+          error:
+            projectionError instanceof Error
+              ? projectionError.message
+              : String(projectionError),
+        });
       }
-      const cleanupBudget = error.cleanupAttempt
-        ? resolveSlackAcceptedCleanupRetryBudget(
-            error.cleanupAttempt.attempt,
-            error.cleanupAttempt.firstAttemptAtMs,
-            Date.now(),
-          )
-        : resolveSlackAcceptedCleanupRetryBudget(
-            unrecordedCleanupAttempt,
-            Date.now(),
-            Date.now(),
-          );
+      if (acceptedProjectionError && !cleanupBudget.exceeded) {
+        throw new resolvedDependencies.RetryableError(error.message, {
+          retryAfter: error.retryAfter,
+        });
+      }
       const permanentCleanupFailure =
         error.cleanupError instanceof SlackMessageDeletePermanentError;
       if (
+        !acceptedProjectionError &&
         permanentCleanupFailure &&
         !cleanupBudget?.exceeded &&
         isSlackCleanupAuthError(error.cleanupError)
@@ -2250,7 +2355,11 @@ export async function processChannelStep(
           });
         }
       }
-      if (permanentCleanupFailure || cleanupBudget?.exceeded) {
+      if (
+        acceptedProjectionError ||
+        permanentCleanupFailure ||
+        cleanupBudget.exceeded
+      ) {
         try {
           await retireSlackBootMessageCleanupPending(deliveryId);
         } catch (retireError) {
@@ -2275,6 +2384,7 @@ export async function processChannelStep(
           channel: "slack",
           requestId,
           deliveryId,
+          acceptedProjectionFailure: Boolean(acceptedProjectionError),
           permanentCleanupFailure,
           slackErrorCode:
             error.cleanupError instanceof SlackMessageDeletePermanentError

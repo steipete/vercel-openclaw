@@ -15,6 +15,7 @@ import {
   prepareChannelHandoff,
   readChannelHandoff,
   renewChannelFastPathDispatch,
+  reserveChannelAcceptedCleanupAttempt,
   resetChannelWorkflowDispatch,
 } from "@/server/channels/handoff-ledger";
 import { _resetStoreForTesting } from "@/server/store/store";
@@ -300,8 +301,49 @@ test("workflow dispatch fence prevents replay and preserves native acceptance", 
       deliveryId: "slack:user-message:C1:1.0",
       attemptId: prepared.attemptId,
       runId: "run-fenced",
+      acceptedForward: {
+        ok: true,
+        status: 200,
+        classification: "accepted",
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        sandboxUrl: "https://sandbox.example",
+        sandboxId: "sbx-fenced",
+        finalReasonHead: null,
+        startedAt: 1,
+        completedAt: 11,
+        deliveryId: "slack:event-fenced",
+      },
     }),
     true,
+  );
+  assert.equal(
+    (await readChannelHandoff("slack", "slack:user-message:C1:1.0"))
+      ?.nativeAcceptedForward?.deliveryId,
+    "slack:event-fenced",
+  );
+  assert.equal(
+    (
+      await reserveChannelAcceptedCleanupAttempt({
+        channel: "slack",
+        deliveryId: "slack:user-message:C1:1.0",
+        attemptId: prepared.attemptId,
+        runId: "run-fenced",
+      })
+    )?.attempt,
+    1,
+  );
+  assert.equal(
+    (
+      await reserveChannelAcceptedCleanupAttempt({
+        channel: "slack",
+        deliveryId: "slack:user-message:C1:1.0",
+        attemptId: prepared.attemptId,
+        runId: "run-fenced",
+      })
+    )?.attempt,
+    2,
   );
   assert.deepEqual(
     await prepareChannelHandoff({

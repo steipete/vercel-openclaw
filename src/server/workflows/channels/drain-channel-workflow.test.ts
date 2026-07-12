@@ -22,6 +22,9 @@ import {
   recordChannelDlqFailure,
 } from "@/server/channels/dlq";
 import {
+  beginChannelWorkflowDispatch,
+  claimChannelHandoff,
+  markChannelWorkflowNativeAccepted,
   prepareChannelHandoff,
   readChannelHandoff,
 } from "@/server/channels/handoff-ledger";
@@ -2418,6 +2421,14 @@ test("Slack accepted delivery does not replay when cleanup debt persistence fail
   let forwardCalls = 0;
   let clearCalls = 0;
   const dependencies = createWorkflowDependencies({
+    // Delivery retries are nearly exhausted; accepted cleanup still starts
+    // its own independent attempt budget at one.
+    getStepMetadata: (() => ({
+      stepName: "processChannelStep",
+      stepId: "cleanup-debt-store-failure",
+      stepStartedAt: new Date(),
+      attempt: 24,
+    })) as never,
     buildExistingBootHandle: async () => ({
       async update() {},
       async clear() {
@@ -2480,6 +2491,11 @@ test("Slack accepted delivery does not replay when cleanup debt persistence fail
     await assert.rejects(
       run(),
       (error: unknown) => error instanceof TestRetryableError,
+    );
+    assert.equal(
+      (await readChannelHandoff("slack", handoffDeliveryId))
+        ?.acceptedCleanupRetry?.attempts,
+      1,
     );
     await run();
     assert.equal(forwardCalls, 1);
@@ -2569,6 +2585,140 @@ test("Slack accepted handoff fence prevents Workflow step replay", async () => {
   );
   await run();
   assert.equal(forwardCalls, 1);
+});
+
+test("Slack accepted handoff replay restores its durable forward receipt", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+  };
+  await setSlackChannelConfig(config);
+  const handoffDeliveryId =
+    "slack:user-message:C-receipt:1710000000.000888";
+  const deliveryId = "slack:Ev-receipt-crash";
+  const prepared = await prepareChannelHandoff({
+    channel: "slack",
+    deliveryId: handoffDeliveryId,
+    envelope: { version: 1 },
+  });
+  assert.equal(prepared.action, "start");
+  if (prepared.action !== "start") return;
+  assert.equal(
+    await claimChannelHandoff({
+      channel: "slack",
+      deliveryId: handoffDeliveryId,
+      attemptId: prepared.attemptId,
+      runId: "test-run-id",
+    }),
+    true,
+  );
+  assert.deepEqual(
+    await beginChannelWorkflowDispatch({
+      channel: "slack",
+      deliveryId: handoffDeliveryId,
+      attemptId: prepared.attemptId,
+      runId: "test-run-id",
+    }),
+    { action: "dispatch" },
+  );
+  assert.equal(
+    await markChannelWorkflowNativeAccepted({
+      channel: "slack",
+      deliveryId: handoffDeliveryId,
+      attemptId: prepared.attemptId,
+      runId: "test-run-id",
+      acceptedForward: {
+        ok: true,
+        status: 200,
+        classification: "accepted",
+        attempts: 1,
+        totalMs: 10,
+        transport: "public",
+        sandboxUrl: "https://sandbox.example",
+        sandboxId: "sbx-receipt",
+        finalReasonHead: null,
+        startedAt: 10,
+        completedAt: 20,
+        deliveryId,
+      },
+    }),
+    true,
+  );
+  await recordChannelDlqFailure({
+    channel: "slack",
+    deliveryId,
+    phase: "workflow-step-failed",
+    terminal: false,
+    retryable: true,
+    deliveryOutcome: "not-accepted",
+    requestId: "req-receipt-crash",
+    receivedAtMs: 1,
+    error: new Error("stale failure"),
+  });
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    forwardToNativeHandlerWithRetry: async () => {
+      forwardCalls += 1;
+      throw new Error("accepted replay must not forward");
+    },
+  });
+  const store = getStore();
+  const originalGetValue = store.getValue.bind(store);
+  let failCleanupRead = true;
+  const getValueMock = mock.method(
+    store,
+    "getValue",
+    async (...args: Parameters<typeof store.getValue>) => {
+      if (failCleanupRead && args[0].includes(":boot-message:")) {
+        failCleanupRead = false;
+        throw new Error("cleanup owner read unavailable");
+      }
+      return originalGetValue(...args);
+    },
+  );
+  const run = () =>
+    processChannelStep(
+      "slack",
+      {
+        event_id: "Ev-receipt-crash",
+        event: { channel: "C-receipt", ts: "1710000000.000888" },
+      },
+      "test",
+      "req-receipt-crash",
+      null,
+      {
+        dependencies,
+        workflowHandoff: {
+          handoffDeliveryId,
+          handoffAttemptId: prepared.attemptId,
+          slackCleanupConfig: config,
+          slackConfigGeneration: config.configuredAt,
+          slackBootTarget: null,
+        },
+      },
+    );
+
+  try {
+    await assert.rejects(run(), TestRetryableError);
+    assert.equal(await getChannelDlqRecord("slack", deliveryId), null);
+    assert.equal(
+      (await readChannelHandoff("slack", handoffDeliveryId))
+        ?.acceptedCleanupRetry?.attempts,
+      1,
+    );
+    await run();
+  } finally {
+    getValueMock.mock.restore();
+  }
+
+  assert.equal(forwardCalls, 0);
+  assert.equal(
+    (await getInitializedMeta()).channelDiagnostics?.slack?.lastForward
+      ?.deliveryId,
+    deliveryId,
+  );
+  assert.equal(await getChannelDlqRecord("slack", deliveryId), null);
 });
 
 test("processChannelStep durably retries Slack boot cleanup after API rejection", async () => {

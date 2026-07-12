@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 
-import type { ChannelName } from "@/shared/channels";
+import type {
+  ChannelLastForwardInput,
+  ChannelName,
+} from "@/shared/channels";
 import {
   channelHandoffKey,
   channelHandoffLockKey,
@@ -38,6 +41,11 @@ export type ChannelHandoffRecord = {
   createdAt: number;
   updatedAt: number;
   error: string | null;
+  nativeAcceptedForward?: ChannelLastForwardInput | null;
+  acceptedCleanupRetry?: {
+    attempts: number;
+    firstAttemptAtMs: number;
+  } | null;
 };
 
 type PrepareResult =
@@ -151,6 +159,8 @@ export async function prepareChannelHandoff(input: {
       createdAt: current?.createdAt ?? now,
       updatedAt: now,
       error: null,
+      nativeAcceptedForward: null,
+      acceptedCleanupRetry: null,
     });
     return { action: "start", attemptId };
   });
@@ -288,6 +298,7 @@ export async function markChannelWorkflowNativeAccepted(input: {
   deliveryId: string;
   attemptId: string;
   runId: string;
+  acceptedForward: ChannelLastForwardInput;
 }): Promise<boolean> {
   return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
     if (
@@ -305,8 +316,42 @@ export async function markChannelWorkflowNativeAccepted(input: {
       state: "native-accepted",
       updatedAt: Date.now(),
       error: null,
+      nativeAcceptedForward: input.acceptedForward,
+      acceptedCleanupRetry: null,
     });
     return true;
+  });
+}
+
+/** Count cleanup failures independently after native acceptance is durable. */
+export async function reserveChannelAcceptedCleanupAttempt(input: {
+  channel: ChannelName;
+  deliveryId: string;
+  attemptId: string;
+  runId: string;
+}): Promise<{ attempt: number; firstAttemptAtMs: number } | null> {
+  return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+    if (
+      !current ||
+      current.state !== "native-accepted" ||
+      current.attemptId !== input.attemptId ||
+      current.runId !== input.runId
+    ) {
+      return null;
+    }
+    const now = Date.now();
+    const next = {
+      attempts: (current.acceptedCleanupRetry?.attempts ?? 0) + 1,
+      firstAttemptAtMs:
+        current.acceptedCleanupRetry?.firstAttemptAtMs ?? now,
+    };
+    await save({
+      ...current,
+      revision: current.revision + 1,
+      updatedAt: now,
+      acceptedCleanupRetry: next,
+    });
+    return { attempt: next.attempts, firstAttemptAtMs: next.firstAttemptAtMs };
   });
 }
 
@@ -364,6 +409,8 @@ export async function markChannelDeliveryTerminal(input: {
       createdAt: current?.createdAt ?? now,
       updatedAt: now,
       error: current?.error ?? null,
+      nativeAcceptedForward: current?.nativeAcceptedForward ?? null,
+      acceptedCleanupRetry: current?.acceptedCleanupRetry ?? null,
     });
     return true;
   });
@@ -399,6 +446,8 @@ export async function markChannelFastPathDispatching(input: {
       createdAt: current?.createdAt ?? now,
       updatedAt: now,
       error: null,
+      nativeAcceptedForward: null,
+      acceptedCleanupRetry: null,
     });
     return { action: "dispatch", attemptId };
   });

@@ -1255,10 +1255,12 @@ async function finalizeCommittedGatewayReplacement(
   expectedMeta: SingleMeta,
   expectedSuspension: HostSuspensionState,
 ): Promise<boolean> {
+  const replacementPhase = expectedSuspension.phase === "replacement-starting"
+    || expectedSuspension.phase === "replacement-failed";
   if (
     expectedMeta.status !== "running"
     || !expectedMeta.sandboxId
-    || expectedSuspension.phase !== "replacement-starting"
+    || !replacementPhase
     || expectedSuspension.replacementStage !== "launching"
     || !expectedSuspension.replacementSessionId
     || expectedSuspension.sandboxId !== expectedMeta.sandboxId
@@ -1277,7 +1279,12 @@ async function finalizeCommittedGatewayReplacement(
         || (meta.lifecycleAttemptId ?? null)
           !== (expectedMeta.lifecycleAttemptId ?? null)
         || suspension?.operationId !== expectedSuspension.operationId
-        || suspension.phase !== "replacement-starting"
+        || suspension.requestId !== expectedSuspension.requestId
+        || suspension.phase !== expectedSuspension.phase
+        || (
+          suspension.phase !== "replacement-starting"
+          && suspension.phase !== "replacement-failed"
+        )
         || suspension.replacementStage !== "launching"
         || suspension.replacementSessionId
           !== expectedSuspension.replacementSessionId
@@ -1287,7 +1294,7 @@ async function finalizeCommittedGatewayReplacement(
       const replacementSessionId = suspension.replacementSessionId;
       if (!replacementSessionId) return false;
       await assertOwned();
-      const sandbox = await getSandboxController().get({
+      let sandbox = await getSandboxController().get({
         sandboxId: meta.sandboxId,
         resume: false,
       });
@@ -1296,10 +1303,57 @@ async function finalizeCommittedGatewayReplacement(
         sandbox.status !== "running"
         || sandbox.currentSessionId !== replacementSessionId
       ) return false;
+      let finalizationSuspension = suspension;
+      if (suspension.phase === "replacement-failed") {
+        const lifecycleAttemptId = meta.lifecycleAttemptId;
+        if (!lifecycleAttemptId) return false;
+        try {
+          finalizationSuspension =
+            await adoptHostSuspensionGatewayReplacement({
+              expected: suspension,
+              sandboxId: meta.sandboxId,
+              lifecycleAttemptId,
+              sessionId: replacementSessionId,
+            });
+        } catch {
+          // Redis may commit the failed -> starting CAS and lose only its
+          // response. Continue only when a reread proves that exact adoption.
+          const [adoptedMeta, adoptedSuspension] = await Promise.all([
+            getInitializedMeta(),
+            readHostSuspensionState(),
+          ]).catch(() => [null, null] as const);
+          if (
+            adoptedMeta?.status !== "running"
+            || adoptedMeta.sandboxId !== meta.sandboxId
+            || adoptedMeta.lifecycleAttemptId !== lifecycleAttemptId
+            || adoptedSuspension?.operationId !== suspension.operationId
+            || adoptedSuspension.requestId !== suspension.requestId
+            || adoptedSuspension.sandboxId !== suspension.sandboxId
+            || adoptedSuspension.lifecycleAttemptId !== lifecycleAttemptId
+            || adoptedSuspension.phase !== "replacement-starting"
+            || adoptedSuspension.replacementStage !== "launching"
+            || adoptedSuspension.replacementSessionId !== replacementSessionId
+            || !adoptedSuspension.ingressFenced
+          ) return false;
+          finalizationSuspension = adoptedSuspension;
+        }
+        await assertOwned();
+        // Adoption is a new durable owner boundary. Fetch without resume and
+        // revalidate the exact live session before retiring its fence.
+        sandbox = await getSandboxController().get({
+          sandboxId: meta.sandboxId,
+          resume: false,
+        });
+        await assertOwned();
+        if (
+          sandbox.status !== "running"
+          || sandbox.currentSessionId !== replacementSessionId
+        ) return false;
+      }
       await clearCommittedGatewayReplacement(
         sandbox,
         meta,
-        suspension,
+        finalizationSuspension,
       );
       return true;
     });
@@ -1307,6 +1361,10 @@ async function finalizeCommittedGatewayReplacement(
     if (
       error instanceof SandboxLifecycleLockContendedError
       || error instanceof LifecycleLockOwnershipLostError
+      || (
+        error instanceof ApiError
+        && error.code === "HOST_SUSPENSION_REPLACEMENT_ADOPTION_CONFLICT"
+      )
     ) return false;
     throw error;
   }
@@ -1347,7 +1405,10 @@ export async function ensureSandboxRunning(options: {
     let hostSuspension = await readHostSuspensionState();
     if (hostSuspension?.ingressFenced) {
       if (
-        hostSuspension.phase === "replacement-starting"
+        (
+          hostSuspension.phase === "replacement-starting"
+          || hostSuspension.phase === "replacement-failed"
+        )
         && hostSuspension.replacementStage === "launching"
         && await finalizeCommittedGatewayReplacement(meta, hostSuspension)
       ) {
@@ -7451,12 +7512,23 @@ async function createAndBootstrapSandboxWithinLifecycleLock(
       // running-state CAS. Later deadline/progress failures must not delete it.
       bundleCandidateCommitted = !bundleMode || resumedMeta.bundleIdentity !== null;
       if (activeGatewayReplacement) {
-        await assertGatewayReplacementSessionCurrent(initialSandbox);
-        await clearCommittedGatewayReplacement(
-          initialSandbox,
-          resumedMeta,
-          activeGatewayReplacement,
-        );
+        try {
+          await assertGatewayReplacementSessionCurrent(initialSandbox);
+          await clearCommittedGatewayReplacement(
+            initialSandbox,
+            resumedMeta,
+            activeGatewayReplacement,
+          );
+        } catch (error) {
+          logWarn("sandbox.gateway_replacement_finalization_deferred", {
+            sandboxId: initialSandbox.sandboxId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          // Running metadata is already committed. Preserve it and its exact
+          // ingress fence for the running-meta finalizer instead of projecting
+          // a later Redis/session uncertainty as a failed sandbox generation.
+          throw new LifecycleLockOwnershipLostError();
+        }
         activeGatewayReplacement = null;
         activeGatewayReplacementSession = null;
       }

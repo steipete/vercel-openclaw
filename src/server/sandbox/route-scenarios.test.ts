@@ -408,6 +408,166 @@ test("Admin: POST /api/admin/ensure finalizes an exact retained Gateway replacem
   }
 });
 
+test("Admin: POST /api/admin/ensure recovers an exact failed Gateway replacement fence", async () => {
+  const h = createScenarioHarness();
+  try {
+    const sandboxId = "sbx-route-failed-replacement";
+    const lifecycleAttemptId = "attempt-route-failed-replacement";
+    const handle = new FakeSandboxHandle(sandboxId, h.controller.events);
+    h.controller.handlesByIds.set(sandboxId, handle);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = null;
+    });
+    await h.getStore().setValue(
+      hostSuspensionOperationKey(),
+      {
+        ...retainedGatewayReplacementState({
+          sandboxId,
+          lifecycleAttemptId,
+          replacementSessionId: handle.currentSessionId,
+        }),
+        phase: "replacement-failed",
+        lastError: "worker crashed after running metadata commit",
+        lastErrorCode: "Error",
+        lastErrorClass: "Error",
+      } satisfies HostSuspensionState,
+    );
+
+    const result = await callAdminPost(
+      adminEnsureRoute.POST,
+      "/api/admin/ensure",
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal((result.json as { state?: unknown }).state, "running");
+    assert.equal(
+      await h.getStore().getValue(hostSuspensionOperationKey()),
+      null,
+    );
+    assert.equal(handle.commands.length, 0);
+    assert.equal(handle.writtenFiles.length, 0);
+  } finally {
+    h.teardown();
+  }
+});
+
+test("Admin: POST /api/admin/ensure recovers a lost failed-fence adoption response", async () => {
+  const h = createScenarioHarness();
+  try {
+    const sandboxId = "sbx-route-failed-adoption-response-lost";
+    const lifecycleAttemptId = "attempt-route-failed-adoption-response-lost";
+    const handle = new FakeSandboxHandle(sandboxId, h.controller.events);
+    h.controller.handlesByIds.set(sandboxId, handle);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = null;
+    });
+    const store = h.getStore();
+    await store.setValue(
+      hostSuspensionOperationKey(),
+      {
+        ...retainedGatewayReplacementState({
+          sandboxId,
+          lifecycleAttemptId,
+          replacementSessionId: handle.currentSessionId,
+        }),
+        phase: "replacement-failed",
+        lastError: "worker crashed after running metadata commit",
+        lastErrorCode: "Error",
+        lastErrorClass: "Error",
+      } satisfies HostSuspensionState,
+    );
+    const setValue = store.setValue.bind(store);
+    let lostResponse = false;
+    store.setValue = async (key, value, ttlSeconds) => {
+      await setValue(key, value, ttlSeconds);
+      if (
+        key === hostSuspensionOperationKey()
+        && !lostResponse
+        && (value as HostSuspensionState).phase === "replacement-starting"
+      ) {
+        lostResponse = true;
+        throw new Error("injected Redis response loss after adoption SET");
+      }
+    };
+
+    try {
+      const result = await callAdminPost(
+        adminEnsureRoute.POST,
+        "/api/admin/ensure",
+      );
+
+      assert.equal(lostResponse, true);
+      assert.equal(result.status, 200);
+      assert.equal((result.json as { state?: unknown }).state, "running");
+      assert.equal(
+        await store.getValue(hostSuspensionOperationKey()),
+        null,
+      );
+      assert.equal((await h.getMeta()).status, "running");
+      assert.equal(handle.commands.length, 0);
+      assert.equal(handle.writtenFiles.length, 0);
+    } finally {
+      store.setValue = setValue;
+    }
+  } finally {
+    h.teardown();
+  }
+});
+
+test("Admin: POST /api/admin/ensure retains a failed replacement with the wrong session", async () => {
+  const h = createScenarioHarness();
+  try {
+    const sandboxId = "sbx-route-failed-replacement-wrong-session";
+    const lifecycleAttemptId = "attempt-route-failed-replacement-wrong-session";
+    const handle = new FakeSandboxHandle(sandboxId, h.controller.events);
+    h.controller.handlesByIds.set(sandboxId, handle);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = sandboxId;
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+      meta.lastError = null;
+    });
+    const retained: HostSuspensionState = {
+      ...retainedGatewayReplacementState({
+        sandboxId,
+        lifecycleAttemptId,
+        replacementSessionId: "different-replacement-session",
+      }),
+      phase: "replacement-failed",
+      lastError: "worker crashed after running metadata commit",
+      lastErrorCode: "Error",
+      lastErrorClass: "Error",
+    };
+    await h.getStore().setValue(hostSuspensionOperationKey(), retained);
+
+    const result = await callAdminPost(
+      adminEnsureRoute.POST,
+      "/api/admin/ensure",
+    );
+
+    assert.equal(result.status, 503);
+    assert.equal(
+      (result.json as { error?: unknown }).error,
+      "HOST_INGRESS_FENCED",
+    );
+    assert.deepEqual(
+      await h.getStore().getValue(hostSuspensionOperationKey()),
+      retained,
+    );
+    assert.equal((await h.getMeta()).status, "running");
+    assert.equal(handle.commands.length, 0);
+    assert.equal(handle.writtenFiles.length, 0);
+  } finally {
+    h.teardown();
+  }
+});
+
 test("Admin: POST /api/admin/ensure rejects a replaced Gateway session without side effects", async () => {
   const h = createScenarioHarness();
   try {

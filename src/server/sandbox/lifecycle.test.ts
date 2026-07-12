@@ -2796,6 +2796,149 @@ test("running metadata finalizer tolerates a lost Redis delete response", async 
   });
 });
 
+test("running metadata finalizer adopts an exact failed replacement", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    const lifecycleAttemptId = "replacement-committed-failed-attempt";
+    const handle = preRegisterResumeHandle(fake);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.snapshotId = "snap-replacement-committed-failed";
+      meta.sandboxId = handle.sandboxId;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        version: 2,
+        lifecycleAttemptId,
+        phase: "replacement-failed",
+        replacementSessionId: handle.currentSessionId,
+        replacementStage: "launching",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+        lastError: "worker crashed after running metadata commit",
+        lastErrorCode: "Error",
+        lastErrorClass: "Error",
+      }),
+    );
+
+    const result = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "replacement-commit-failed-finalize",
+    });
+
+    assert.equal(result.state, "running");
+    assert.equal(result.meta.status, "running");
+    assert.equal(await readHostSuspensionState(), null);
+    assert.equal(handle.commands.length, 0);
+    assert.equal(handle.writtenFiles.length, 0);
+    assert.equal(
+      fake.getCalls.filter((call) => call.sandboxId === handle.sandboxId).length,
+      2,
+      "failed-fence adoption must re-fetch the live session before clear",
+    );
+  });
+});
+
+test("running metadata finalizer keeps a failed replacement with the wrong session fenced", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    const lifecycleAttemptId = "replacement-committed-failed-wrong-session";
+    const handle = preRegisterResumeHandle(fake);
+    const failed = hostSuspensionState(handle.sandboxId, {
+      version: 2,
+      lifecycleAttemptId,
+      phase: "replacement-failed",
+      replacementSessionId: "different-replacement-session",
+      replacementStage: "launching",
+      stopRequestDeadlineAtMs: null,
+      stoppedAtMs: Date.now(),
+      lastError: "worker crashed after running metadata commit",
+      lastErrorCode: "Error",
+      lastErrorClass: "Error",
+    });
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.snapshotId = "snap-replacement-committed-failed-wrong-session";
+      meta.sandboxId = handle.sandboxId;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+    });
+    await getStore().setValue(hostSuspensionOperationKey(), failed);
+
+    const result = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "replacement-commit-failed-wrong-session",
+    });
+
+    assert.equal(result.state, "waiting");
+    assert.equal(result.meta.status, "running");
+    assert.deepEqual(await readHostSuspensionState(), failed);
+    assert.equal(handle.commands.length, 0);
+    assert.equal(handle.writtenFiles.length, 0);
+  });
+});
+
+test("failed replacement finalizer tolerates a lost Redis delete response", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    const lifecycleAttemptId = "replacement-failed-finalizer-del-response-lost";
+    const handle = preRegisterResumeHandle(fake);
+    await mutateMeta((meta) => {
+      meta.status = "running";
+      meta.snapshotId = "snap-replacement-failed-finalizer-del-response-lost";
+      meta.sandboxId = handle.sandboxId;
+      meta.gatewayToken = "test-gw-token";
+      meta.lifecycleAttemptId = lifecycleAttemptId;
+    });
+    await getStore().setValue(
+      hostSuspensionOperationKey(),
+      hostSuspensionState(handle.sandboxId, {
+        version: 2,
+        lifecycleAttemptId,
+        phase: "replacement-failed",
+        replacementSessionId: handle.currentSessionId,
+        replacementStage: "launching",
+        stopRequestDeadlineAtMs: null,
+        stoppedAtMs: Date.now(),
+        lastError: "worker crashed after running metadata commit",
+        lastErrorCode: "Error",
+        lastErrorClass: "Error",
+      }),
+    );
+    const store = getStore();
+    const deleteValue = store.deleteValue.bind(store);
+    let lostResponse = false;
+    store.deleteValue = async (key) => {
+      if (key === hostSuspensionOperationKey() && !lostResponse) {
+        lostResponse = true;
+        await deleteValue(key);
+        throw new Error("injected Redis response loss after failed-fence DEL");
+      }
+      await deleteValue(key);
+    };
+
+    try {
+      const result = await ensureSandboxRunning({
+        origin: "https://test.example.com",
+        reason: "replacement-failed-finalizer-del-response-lost",
+      });
+
+      assert.equal(lostResponse, true);
+      assert.equal(result.state, "running");
+      assert.equal(result.meta.status, "running");
+      assert.equal(await readHostSuspensionState(), null);
+    } finally {
+      store.deleteValue = deleteValue;
+    }
+  });
+});
+
 test("lost Redis delete response preserves committed running replacement", async () => {
   const fake = new FakeSandboxController();
 
@@ -2835,6 +2978,62 @@ test("lost Redis delete response preserves committed running replacement", async
     } finally {
       store.deleteValue = deleteValue;
     }
+  });
+});
+
+test("post-commit replacement read failure never downgrades running metadata", async () => {
+  const fake = new FakeSandboxController();
+
+  await withTestEnv(fake, async () => {
+    await mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.snapshotId = "snap-post-commit-replacement-read-failure";
+      meta.gatewayToken = "test-gw-token";
+    });
+    const handle = await preRegisterFencedStoppedResumeHandle(fake);
+    const store = getStore();
+    const getValueState = store.getValueState.bind(store);
+    let injected = false;
+    store.getValueState = async <T>(key: string) => {
+      const state = await getValueState<T>(key);
+      if (
+        key === hostSuspensionOperationKey()
+        && !injected
+        && state.status === "present"
+        && (state.value as HostSuspensionState | null)?.phase
+          === "replacement-starting"
+        && (state.value as HostSuspensionState | null)?.replacementStage
+          === "launching"
+        && (await store.getMeta())?.status === "running"
+      ) {
+        injected = true;
+        throw new Error("injected Redis read failure after running commit");
+      }
+      return state;
+    };
+
+    try {
+      await runScheduledEnsure("replacement-post-commit-read-failure");
+    } finally {
+      store.getValueState = getValueState;
+    }
+
+    assert.equal(injected, true);
+    const committed = await getInitializedMeta();
+    assert.equal(committed.status, "running");
+    assert.equal(committed.lastError, null);
+    const retained = await readHostSuspensionState();
+    assert.equal(retained?.phase, "replacement-starting");
+    assert.equal(retained?.replacementStage, "launching");
+    assert.equal(retained?.replacementSessionId, handle.currentSessionId);
+
+    const recovered = await ensureSandboxRunning({
+      origin: "https://test.example.com",
+      reason: "replacement-post-commit-read-recovery",
+    });
+    assert.equal(recovered.state, "running");
+    assert.equal(recovered.meta.status, "running");
+    assert.equal(await readHostSuspensionState(), null);
   });
 });
 

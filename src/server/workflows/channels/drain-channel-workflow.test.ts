@@ -22,6 +22,10 @@ import {
   recordChannelDlqFailure,
 } from "@/server/channels/dlq";
 import {
+  prepareChannelHandoff,
+  readChannelHandoff,
+} from "@/server/channels/handoff-ledger";
+import {
   processChannelStep,
   forwardToNativeHandlerWithRetry,
   buildExistingBootHandle,
@@ -31,7 +35,10 @@ import {
   type RetryingForwardResult,
   type TelegramProbeResult,
 } from "@/server/workflows/channels/drain-channel-step";
-import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-workflow";
+import {
+  drainChannelWorkflow,
+  processChannelStep as processChannelWorkflowStep,
+} from "@/server/workflows/channels/drain-channel-workflow";
 
 class TestRetryableError extends Error {
   retryAfter?: string | number | Date;
@@ -49,6 +56,10 @@ class TestRetryableError extends Error {
     return err instanceof TestRetryableError;
   }
 }
+
+test("drain channel step retry policy reaches the cleanup budget", () => {
+  assert.equal(processChannelWorkflowStep.maxRetries, 24);
+});
 
 class TestFatalError extends Error {
   constructor(message: string) {
@@ -668,6 +679,7 @@ test("processChannelStep settles a queued Telegram handoff after config deletion
 test("processChannelStep settles a queued Telegram handoff after config rotation", async () => {
   const existingConfig = {
     ...createFallbackTelegramConfig(),
+    botToken: "different-bot-token",
     webhookSecret: "existing-secret",
     botUsername: "existing_bot",
     configuredAt: createFallbackTelegramConfig().configuredAt + 1,
@@ -721,6 +733,154 @@ test("processChannelStep settles a queued Telegram handoff after config rotation
   assert.equal(failure?.terminal, true);
   assert.equal(failure?.deliveryOutcome, "not-accepted");
   assert.equal(failure?.errorMessage, "telegram-config-rotated");
+});
+
+test("processChannelStep adopts active same-bot Telegram rotation before wake", async () => {
+  const fallback = {
+    ...createFallbackTelegramConfig(),
+    botId: "7005",
+    deliveryNamespace: "bot:7005",
+  };
+  const rotated = {
+    ...fallback,
+    botToken: "rotated-same-bot-token",
+    webhookSecret: "rotated-same-bot-secret",
+    configuredAt: fallback.configuredAt + 1,
+  };
+  await setTelegramChannelConfig(rotated);
+  let forwardedSecret: string | null = null;
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({ status: "running", sandboxId: "sbx-same-bot-before" }),
+      bootMessageSent: false,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async (_channel, _payload, meta) => {
+      forwardedSecret = meta.channels.telegram?.webhookSecret ?? null;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 1,
+        transport: "local",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 7005, message: { chat: { id: 5 } } },
+    "test",
+    "req-same-bot-before",
+    null,
+    {
+      dependencies,
+      workflowHandoff: {
+        fallbackTelegramConfig: fallback,
+        telegramConfigGeneration: fallback.configuredAt,
+      },
+      requireTelegramConfigGeneration: true,
+    },
+  );
+  assert.equal(forwardedSecret, rotated.webhookSecret);
+});
+
+test("processChannelStep retries while same-bot Telegram activation is pending", async () => {
+  const fallback = {
+    ...createFallbackTelegramConfig(),
+    botId: "7007",
+    deliveryNamespace: "bot:7007",
+  };
+  await setTelegramChannelConfig({
+    ...fallback,
+    webhookSecret: "pending-same-bot-secret",
+    configuredAt: fallback.configuredAt + 1,
+    webhookSetupPending: true,
+  });
+  let wakeCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    isRetryable: TestRetryableError.is,
+    runWithBootMessages: async () => {
+      wakeCalls += 1;
+      throw new Error("must not wake during Telegram activation");
+    },
+  });
+
+  await assert.rejects(
+    processChannelStep(
+      "telegram",
+      { update_id: 7007, message: { chat: { id: 7 } } },
+      "test",
+      "req-same-bot-pending",
+      null,
+      {
+        dependencies,
+        workflowHandoff: {
+          fallbackTelegramConfig: fallback,
+          telegramConfigGeneration: fallback.configuredAt,
+        },
+        requireTelegramConfigGeneration: true,
+      },
+    ),
+    (error: unknown) => error instanceof TestRetryableError,
+  );
+  assert.equal(wakeCalls, 0);
+});
+
+test("processChannelStep adopts active same-bot Telegram rotation during wake", async () => {
+  const fallback = {
+    ...createFallbackTelegramConfig(),
+    botId: "7006",
+    deliveryNamespace: "bot:7006",
+  };
+  const rotated = {
+    ...fallback,
+    webhookSecret: "rotated-during-wake-secret",
+    configuredAt: fallback.configuredAt + 1,
+  };
+  await setTelegramChannelConfig(fallback);
+  let forwardedSecret: string | null = null;
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => {
+      await setTelegramChannelConfig(rotated);
+      return {
+        meta: asMeta({ status: "running", sandboxId: "sbx-same-bot-wake" }),
+        bootMessageSent: false,
+        admissionReady: true,
+      };
+    },
+    forwardToNativeHandlerWithRetry: async (_channel, _payload, meta) => {
+      forwardedSecret = meta.channels.telegram?.webhookSecret ?? null;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 1,
+        transport: "local",
+        retries: [],
+      };
+    },
+  });
+
+  await processChannelStep(
+    "telegram",
+    { update_id: 7006, message: { chat: { id: 6 } } },
+    "test",
+    "req-same-bot-wake",
+    null,
+    {
+      dependencies,
+      workflowHandoff: {
+        fallbackTelegramConfig: fallback,
+        telegramConfigGeneration: fallback.configuredAt,
+      },
+      requireTelegramConfigGeneration: true,
+    },
+  );
+  assert.equal(forwardedSecret, rotated.webhookSecret);
 });
 
 test("processChannelStep rechecks Telegram config after sandbox wake", async () => {
@@ -858,7 +1018,7 @@ test("processChannelStep releases the Telegram config lease before native dispat
   store.acquireLock = acquireLock;
 });
 
-test("processChannelStep closes Telegram delivery as unknown when config rotates during dispatch", async () => {
+test("processChannelStep preserves Telegram acceptance when config rotates during dispatch", async () => {
   const currentConfig = createFallbackTelegramConfig();
   await setTelegramChannelConfig(currentConfig);
 
@@ -915,8 +1075,7 @@ test("processChannelStep closes Telegram delivery as unknown when config rotates
     "telegram",
     `telegram:legacy:${currentConfig.botUsername}:${currentConfig.configuredAt}:88`,
   );
-  assert.equal(failure?.deliveryOutcome, "unknown");
-  assert.equal(failure?.terminal, true);
+  assert.equal(failure, null);
 });
 
 test("processChannelStep fails closed when post-wake bundle identity cannot be verified", async () => {
@@ -2239,22 +2398,30 @@ test("Slack accepted delivery does not replay when cleanup debt persistence fail
   await setSlackChannelConfig(config);
   const store = getStore();
   const originalSetValue = store.setValue.bind(store);
+  let failCleanupOwnerWrite = true;
   const setValueMock = mock.method(
     store,
     "setValue",
     async (...args: Parameters<typeof store.setValue>) => {
-      if (args[0].includes(":boot-message:")) {
+      const value = args[1] as { state?: unknown } | undefined;
+      if (
+        failCleanupOwnerWrite &&
+        args[0].includes(":boot-message:") &&
+        value?.state === "cleanup-pending"
+      ) {
+        failCleanupOwnerWrite = false;
         throw new Error("cleanup debt store unavailable");
       }
       return originalSetValue(...args);
     },
   );
   let forwardCalls = 0;
+  let clearCalls = 0;
   const dependencies = createWorkflowDependencies({
     buildExistingBootHandle: async () => ({
       async update() {},
       async clear() {
-        throw new Error("Slack cleanup unavailable");
+        clearCalls += 1;
       },
     }),
     runWithBootMessages: async () => ({
@@ -2284,24 +2451,39 @@ test("Slack accepted delivery does not replay when cleanup debt persistence fail
       };
     },
   });
-
-  try {
-    await processChannelStep(
+  const handoffDeliveryId = "slack:user-message:C-cleanup-debt:boot-cleanup-debt-ts";
+  const prepared = await prepareChannelHandoff({
+    channel: "slack",
+    deliveryId: handoffDeliveryId,
+    envelope: { version: 1 },
+  });
+  assert.equal(prepared.action, "start");
+  if (prepared.action !== "start") return;
+  const workflowHandoff = {
+    handoffDeliveryId,
+    handoffAttemptId: prepared.attemptId,
+    slackCleanupConfig: config,
+    slackConfigGeneration: config.configuredAt,
+    slackBootTarget: { channel: "C-cleanup-debt", threadTs: null },
+  } satisfies ChannelWorkflowHandoff;
+  const run = () =>
+    processChannelStep(
       "slack",
       { event_id: "Ev-cleanup-debt", event: { channel: "C-cleanup-debt" } },
       "test",
       "req-slack-cleanup-debt",
       "boot-cleanup-debt-ts",
-      {
-        dependencies,
-        workflowHandoff: {
-          slackCleanupConfig: config,
-          slackConfigGeneration: config.configuredAt,
-          slackBootTarget: { channel: "C-cleanup-debt", threadTs: null },
-        },
-      },
+      { dependencies, workflowHandoff },
     );
+
+  try {
+    await assert.rejects(
+      run(),
+      (error: unknown) => error instanceof TestRetryableError,
+    );
+    await run();
     assert.equal(forwardCalls, 1);
+    assert.equal(clearCalls, 1);
     assert.ok(
       getServerLogs().some(
         (entry) =>
@@ -2312,6 +2494,81 @@ test("Slack accepted delivery does not replay when cleanup debt persistence fail
   } finally {
     setValueMock.mock.restore();
   }
+});
+
+test("Slack accepted handoff fence prevents Workflow step replay", async () => {
+  const config = {
+    signingSecret: "slack-signing-secret",
+    botToken: "xoxb-slack-token",
+    configuredAt: Date.now(),
+    team: "T-fence",
+    botId: "B-fence",
+  };
+  await setSlackChannelConfig(config);
+  const handoffDeliveryId = "slack:user-message:C-fence:1710000000.000777";
+  const prepared = await prepareChannelHandoff({
+    channel: "slack",
+    deliveryId: handoffDeliveryId,
+    envelope: { version: 1 },
+  });
+  assert.equal(prepared.action, "start");
+  if (prepared.action !== "start") return;
+  let forwardCalls = 0;
+  const dependencies = createWorkflowDependencies({
+    runWithBootMessages: async () => ({
+      meta: asMeta({
+        status: "running",
+        sandboxId: "sbx-slack-fence",
+        channels: {
+          telegram: null,
+          slack: config,
+          discord: null,
+          whatsapp: null,
+        },
+      }),
+      bootMessageSent: false,
+      admissionReady: true,
+    }),
+    forwardToNativeHandlerWithRetry: async () => {
+      forwardCalls += 1;
+      return {
+        ok: true,
+        acceptance: "accepted",
+        status: 200,
+        attempts: 1,
+        totalMs: 1,
+        transport: "public",
+        retries: [],
+      };
+    },
+  });
+  const workflowHandoff = {
+    handoffDeliveryId,
+    handoffAttemptId: prepared.attemptId,
+    slackCleanupConfig: config,
+    slackConfigGeneration: config.configuredAt,
+    slackBootTarget: null,
+  } satisfies ChannelWorkflowHandoff;
+  const run = () =>
+    processChannelStep(
+      "slack",
+      {
+        event_id: "Ev-fence",
+        event: { channel: "C-fence", ts: "1710000000.000777" },
+      },
+      "test",
+      "req-slack-fence",
+      null,
+      { dependencies, workflowHandoff, requireSlackConfigGeneration: true },
+    );
+
+  await run();
+  assert.equal(
+    (await readChannelHandoff("slack", handoffDeliveryId))?.state,
+    "native-accepted",
+  );
+  await run();
+  assert.equal(forwardCalls, 1);
 });
 
 test("processChannelStep durably retries Slack boot cleanup after API rejection", async () => {
@@ -2712,7 +2969,8 @@ test("processChannelStep retires cleanup debt on permanent Slack rejection", asy
   }
 });
 
-test("processChannelStep retries invalid_auth cleanup with a rotated same-bot token", async () => {
+for (const authErrorCode of ["invalid_auth", "token_expired"] as const) {
+test(`processChannelStep retries ${authErrorCode} cleanup with a rotated same-bot token`, async () => {
   const originalConfig = {
     signingSecret: "slack-signing-secret",
     botToken: "xoxb-cleanup-old",
@@ -2740,7 +2998,7 @@ test("processChannelStep retries invalid_auth cleanup with a rotated same-bot to
       deleteAuthorizations.push(String(new Headers(init?.headers).get("authorization")));
       if (deleteAuthorizations.length === 1) {
         await setSlackChannelConfig(rotatedConfig);
-        return Response.json({ ok: false, error: "invalid_auth" });
+        return Response.json({ ok: false, error: authErrorCode });
       }
       return Response.json({ ok: true });
     },
@@ -2815,6 +3073,7 @@ test("processChannelStep retries invalid_auth cleanup with a rotated same-bot to
     fetchMock.mock.restore();
   }
 });
+}
 
 test("processChannelStep retires cleanup after the rotated token also rejects", async () => {
   const originalConfig = {
@@ -4433,6 +4692,61 @@ test("admitted direct-local Telegram 500 remains unknown without retry", async (
     "acceptance-unknown",
   );
   assert.equal(result.attemptsDetail?.[0]?.acceptance, "unknown");
+});
+
+test("direct-local Telegram retries a refused loopback connection", async () => {
+  let localCalls = 0;
+  const result = await forwardToNativeHandlerWithRetry(
+    "telegram",
+    { update_id: 7004 },
+    asMeta({
+      status: "running",
+      sandboxId: "sbx-local-telegram-refused",
+      channels: {
+        telegram: createFallbackTelegramConfig(),
+        slack: null,
+        discord: null,
+        whatsapp: null,
+      },
+    }),
+    async () => "https://sandbox.example",
+    async () => {
+      localCalls += 1;
+      return localCalls === 1
+        ? {
+            ok: false,
+            status: 0,
+            durationMs: 1,
+            bodyLength: 0,
+            bodyHead: "",
+            headers: null,
+            transportErrorCode: "ECONNREFUSED",
+          }
+        : {
+            ok: true,
+            status: 200,
+            durationMs: 1,
+            bodyLength: 0,
+            bodyHead: "",
+            headers: { openclawDeliveryAccepted: "durable" },
+          };
+    },
+    true,
+    null,
+    null,
+    "telegram:bot:7004",
+    true,
+    false,
+    "https://control.example",
+  );
+
+  assert.equal(localCalls, 2);
+  assert.equal(result.acceptance, "accepted");
+  assert.equal(result.attemptsDetail?.[0]?.acceptance, "rejected");
+  assert.equal(
+    result.attemptsDetail?.[0]?.transportErrorCode,
+    "ECONNREFUSED",
+  );
 });
 
 test("admitted direct-local Telegram durable marker stays accepted", async () => {

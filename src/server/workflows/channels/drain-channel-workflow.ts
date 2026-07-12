@@ -30,6 +30,10 @@ export async function processChannelStep(
   );
 }
 
+// Cleanup owns a 25-attempt budget; Workflow counts this initial execution
+// separately from retries.
+processChannelStep.maxRetries = 24;
+
 export type DrainChannelWorkflowEnvelopeV1 = {
   version: 1;
   channel: string;

@@ -371,6 +371,25 @@ test("StatusPanel omits unsupported WhatsApp legacy cleanup state from configure
   assert.equal(html.includes("Channels"), false);
 });
 
+test("StatusPanel omits unsupported Discord legacy cleanup state from configured channels", () => {
+  const html = renderPanel(
+    makeStatus({
+      status: "stopped",
+      channels: {
+        ...CHANNELS,
+        discord: {
+          ...CHANNELS.discord,
+          configured: true,
+          nextSafeAction: "disconnect-legacy",
+        },
+      },
+    }),
+  );
+
+  assert.equal(html.includes("Discord (experimental)"), false);
+  assert.equal(html.includes("Channels"), false);
+});
+
 test("StatusPanel shows restore estimate from lifecycle metrics", () => {
   const html = renderPanel(
     makeStatus({

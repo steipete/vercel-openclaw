@@ -18,6 +18,7 @@ import {
   mutateMeta,
 } from "@/server/store/store";
 import { channelConfigLockKey } from "@/server/store/keyspace";
+import { HOSTED_DISCORD_UNAVAILABLE_MESSAGE } from "@/server/channels/discord/hosted-support";
 import {
   callRoute,
   buildPutRequest,
@@ -281,7 +282,18 @@ test("channel-secrets: repeated owner setup recovers cleanup authority", async (
     assert.equal(typeof cleanupToken, "string");
 
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => Response.json({ type: 1 });
+    globalThis.fetch = async (_input, init) => {
+      const payload = JSON.parse(String(init?.body)) as { type?: number };
+      return payload.type === 1
+        ? Response.json({ type: 1 })
+        : Response.json({
+            type: 4,
+            data: {
+              content: HOSTED_DISCORD_UNAVAILABLE_MESSAGE,
+              flags: 64,
+            },
+          });
+    };
     try {
       const dispatch = await callRoute(
         route.POST!,
@@ -296,6 +308,39 @@ test("channel-secrets: repeated owner setup recovers cleanup authority", async (
       assert.equal(dispatch.status, 200);
       assert.equal(
         (dispatch.json as { webhookAccepted?: unknown }).webhookAccepted,
+        false,
+      );
+      assert.equal(
+        (dispatch.json as { pingAcknowledged?: unknown }).pingAcknowledged,
+        true,
+      );
+      assert.equal(
+        (dispatch.json as { hostedFailClosed?: unknown }).hostedFailClosed,
+        false,
+      );
+
+      const failClosedDispatch = await callRoute(
+        route.POST!,
+        buildAuthPostRequest(
+          "/api/admin/channel-secrets",
+          JSON.stringify({
+            channel: "discord",
+            body: JSON.stringify({
+              id: "discord-smoke-command-id",
+              type: 2,
+            }),
+          }),
+        ),
+      );
+      assert.equal(failClosedDispatch.status, 200);
+      assert.equal(
+        (failClosedDispatch.json as { webhookAccepted?: unknown })
+          .webhookAccepted,
+        false,
+      );
+      assert.equal(
+        (failClosedDispatch.json as { hostedFailClosed?: unknown })
+          .hostedFailClosed,
         true,
       );
     } finally {

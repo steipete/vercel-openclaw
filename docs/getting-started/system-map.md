@@ -15,9 +15,12 @@ flowchart LR
   OpenClaw --> Plugins[Channel and tool plugins]
   Slack[Slack] --> Dashboard
   Telegram[Telegram] --> Dashboard
-  Discord[Discord] --> Dashboard
   Dashboard --> OpenClaw
 ```
+
+Slack and Telegram are the hosted delivery paths. Discord and WhatsApp remain
+local/upstream OpenClaw features; this dashboard exposes only fail-closed
+callbacks and legacy-configuration cleanup for those channels.
 
 ## Repo Responsibilities
 

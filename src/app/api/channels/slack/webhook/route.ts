@@ -385,6 +385,8 @@ export async function POST(request: Request): Promise<Response> {
       if (
         handoff?.state === "handed-off" ||
         handoff?.state === "processing" ||
+        handoff?.state === "workflow-dispatching" ||
+        handoff?.state === "native-accepted" ||
         handoff?.state === "terminal"
       ) {
         return Response.json({ ok: true });

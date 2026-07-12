@@ -195,7 +195,6 @@ function buildPhaseList(profile: SmokeProfile): PhaseFn[] {
     // Verify exact native channel acceptance without disrupting gateway chat.
     (b, t, _r) => channelGatewayContinuity(b, t, "slack", { requestTimeoutMs: 30_000 }),
     (b, t, _r) => channelGatewayContinuity(b, t, "telegram", { requestTimeoutMs: 30_000 }),
-    (b, t, _r) => channelGatewayContinuity(b, t, "discord", { requestTimeoutMs: 30_000 }),
   ];
 
   return [...safe, ...destroy];

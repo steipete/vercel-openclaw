@@ -69,6 +69,56 @@ describe("buildWhyNotReady", () => {
       assert.deepEqual(report.channels.whatsapp.blockers, []);
       assert.deepEqual(report.channels.whatsapp.observabilityGaps, []);
       assert.equal(report.channels.whatsapp.readinessSnapshot.lastForward, null);
+      assert.equal(
+        report.channels.whatsapp.readinessSnapshot.legacyConfigPresent,
+        legacyConfigPresent,
+      );
+      assert.equal(
+        report.channels.whatsapp.readinessSnapshot.cleanupRoute,
+        legacyConfigPresent ? "/api/channels/whatsapp" : null,
+      );
+    }
+  });
+
+  test("unsupported hosted Discord exposes cleanup evidence without readiness guidance", async () => {
+    for (const legacyConfigPresent of [false, true]) {
+      const meta = metaFixture();
+      meta.channels.discord = legacyConfigPresent
+        ? {
+            publicKey: "discord-public-key",
+            applicationId: "discord-app",
+            botToken: "discord-token",
+            configuredAt: Date.now(),
+            endpointConfigured: true,
+            endpointUrl: "https://app.example.com/api/channels/discord/webhook",
+            commandRegistered: true,
+            commandId: "cmd-1",
+          }
+        : null;
+      meta.channelDiagnostics = {
+        discord: {
+          lastForward: slackForward({
+            ok: true,
+            classification: "accepted",
+          }),
+        },
+      };
+
+      const report = await buildWhyNotReady(meta);
+
+      assert.equal(report.channels.discord.hostedDeliverySupported, false);
+      assert.equal(report.channels.discord.ready, true);
+      assert.deepEqual(report.channels.discord.blockers, []);
+      assert.deepEqual(report.channels.discord.observabilityGaps, []);
+      assert.equal(report.channels.discord.readinessSnapshot.lastForward, null);
+      assert.equal(
+        report.channels.discord.readinessSnapshot.legacyConfigPresent,
+        legacyConfigPresent,
+      );
+      assert.equal(
+        report.channels.discord.readinessSnapshot.cleanupRoute,
+        legacyConfigPresent ? "/api/channels/discord" : null,
+      );
     }
   });
 
@@ -241,109 +291,6 @@ describe("buildWhyNotReady", () => {
     assert.ok(blocker, "expected handler_not_ready blocker");
     assert.equal(blocker.evidence.sandboxPort, 8787);
     assert.equal(blocker.evidence.telegramListenerReady, false);
-  });
-
-  test("discord endpoint drift and missing command are separate blockers", async () => {
-    const meta = metaFixture();
-    meta.channels.discord = {
-      publicKey: "discord-public-key",
-      applicationId: "discord-app",
-      botToken: "discord-token",
-      configuredAt: Date.now(),
-      endpointConfigured: false,
-      endpointUrl: "https://old.example.com/api/channels/discord/webhook",
-      endpointError: "Discord interactions endpoint points at a different deployment.",
-      commandRegistered: false,
-    };
-
-    const report = await buildWhyNotReady(meta);
-
-    assert.equal(report.channels.discord.ready, false);
-    const kinds = report.channels.discord.blockers.map((b) => b.kind);
-    assert.ok(kinds.includes("endpoint_drift"), `expected endpoint_drift, got ${kinds.join(",")}`);
-    assert.ok(kinds.includes("command_missing"), `expected command_missing, got ${kinds.join(",")}`);
-  });
-
-  test("discord deferred ack without native forward is an observability gap", async () => {
-    const meta = metaFixture();
-    meta.channels.discord = {
-      publicKey: "discord-public-key",
-      applicationId: "discord-app",
-      botToken: "discord-token",
-      configuredAt: Date.now(),
-      endpointConfigured: true,
-      endpointUrl: "https://app.example.com/api/channels/discord/webhook",
-      commandRegistered: true,
-      commandId: "cmd-1",
-    };
-
-    const report = await buildWhyNotReady(meta);
-
-    assert.equal(
-      report.channels.discord.observabilityGaps[0]?.kind,
-      "deferred_ack_without_native_forward",
-    );
-  });
-
-  test("discord native acceptance without visible reply is still not fully ready", async () => {
-    const meta = metaFixture();
-    meta.channels.discord = {
-      publicKey: "discord-public-key",
-      applicationId: "discord-app",
-      botToken: "discord-token",
-      configuredAt: Date.now(),
-      endpointConfigured: true,
-      endpointUrl: "https://app.example.com/api/channels/discord/webhook",
-      commandRegistered: true,
-      commandId: "cmd-1",
-    };
-    meta.channelDiagnostics = {
-      discord: { lastForward: slackForward() },
-    };
-
-    const report = await buildWhyNotReady(meta);
-
-    assert.equal(report.channels.discord.ready, false);
-    assert.equal(
-      report.channels.discord.observabilityGaps[0]?.kind,
-      "native_accepted_without_user_visible_reply",
-    );
-  });
-
-  test("discord observed visible reply is required for why-not-ready readiness", async () => {
-    const meta = metaFixture();
-    const checkedAt = Date.now() - 400;
-    meta.channels.discord = {
-      publicKey: "discord-public-key",
-      applicationId: "discord-app",
-      botToken: "discord-token",
-      configuredAt: Date.now(),
-      endpointConfigured: true,
-      endpointUrl: "https://app.example.com/api/channels/discord/webhook",
-      commandRegistered: true,
-      commandId: "cmd-1",
-    };
-    meta.channelDiagnostics = {
-      discord: {
-        lastForward: slackForward({
-          deliveryId: "discord:interaction-1",
-          userVisibleReply: {
-            status: "observed",
-            checkedAt,
-            observedAt: checkedAt,
-            timeoutMs: null,
-            source: "platform-api",
-            reason: "interaction-edit-observed",
-            evidence: { observer: "discord-interaction-edit" },
-          },
-        }),
-      },
-    };
-
-    const report = await buildWhyNotReady(meta);
-
-    assert.equal(report.channels.discord.ready, true);
-    assert.deepEqual(report.channels.discord.observabilityGaps, []);
   });
 
   test("slack recent broken forward wins over stale green config-sync", async () => {

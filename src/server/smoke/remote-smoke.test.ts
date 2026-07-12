@@ -433,17 +433,7 @@ test("channelRoundTrip phase: correlates exact native acceptance", async () => {
               reply: { status: "unknown" },
             },
           },
-          discord: {
-            connected: true,
-            lastError: null,
-            lastDeliveryState: {
-              deliveryId: "synthetic:1",
-              state: "visibility-unknown",
-              terminal: true,
-              native: { ok: true, classification: "accepted" },
-              reply: { status: "unknown" },
-            },
-          },
+          discord: { connected: false, lastError: null },
         }),
     },
   ]);
@@ -462,7 +452,7 @@ test("channelRoundTrip phase: correlates exact native acceptance", async () => {
         | undefined) ?? [];
     assert.deepEqual(
       channels.map((entry) => entry.channel).sort(),
-      ["discord", "slack", "telegram"],
+      ["slack", "telegram"],
     );
     assert.ok(channels.every((entry) => entry.deliveryId === "synthetic:1"));
     assert.ok(channels.every((entry) => entry.nativeAccepted));
@@ -763,7 +753,7 @@ test("channelRoundTrip phase: owned cleanup failure fails the phase", async () =
           configured = true;
           return Response.json({
             cleanupToken: "opaque-cleanup-token",
-            createdChannels: ["slack", "telegram", "discord"],
+            createdChannels: ["slack", "telegram"],
             recoveredChannels: [],
             preservedChannels: [],
           });
@@ -790,7 +780,7 @@ test("channelRoundTrip phase: owned cleanup failure fails the phase", async () =
       response: () =>
         Response.json(
           Object.fromEntries(
-            ["slack", "telegram", "discord"].map((channel) => [
+            ["slack", "telegram"].map((channel) => [
               channel,
               {
                 connected: configured,
@@ -834,7 +824,7 @@ test("channelRoundTrip phase: cleanup response loss recovers idempotently", asyn
           configured = true;
           return Response.json({
             cleanupToken: "opaque-cleanup-token",
-            createdChannels: ["slack", "telegram", "discord"],
+            createdChannels: ["slack", "telegram"],
             recoveredChannels: [],
             preservedChannels: [],
           });
@@ -865,7 +855,7 @@ test("channelRoundTrip phase: cleanup response loss recovers idempotently", asyn
       response: () =>
         Response.json(
           Object.fromEntries(
-            ["slack", "telegram", "discord"].map((channel) => [
+            ["slack", "telegram"].map((channel) => [
               channel,
               {
                 connected: configured,
@@ -1410,10 +1400,10 @@ test("destructive flow: unavailable synthetic setup fails wake proof", async () 
   }
 });
 
-test("CLI: safe-only mode runs 8 phases, --destructive runs 16", async () => {
+test("CLI: safe-only mode runs 8 phases, --destructive runs 15", async () => {
   // We just test the safe count (already tested above) and verify --destructive
-  // adds 8 destructive phases (ensure, chatCompletions, channelRoundTrip,
-  // channelWakeFromSleep, chatCompletions, and three continuity phases)
+  // adds 7 destructive phases (ensure, chatCompletions, channelRoundTrip,
+  // channelWakeFromSleep, chatCompletions, and two continuity phases)
   // by running with a mock server that handles the destructive endpoints.
   const { createServer } = await import("node:http");
   let sandboxToken = "fresh-token";
@@ -1509,7 +1499,7 @@ test("CLI: safe-only mode runs 8 phases, --destructive runs 16", async () => {
 
     const report = JSON.parse(result.stdout);
     assert.equal(report.passed, true);
-    assert.equal(report.phases.length, 16);
+    assert.equal(report.phases.length, 15);
 
     // Verify destructive phase names are present
     const names = report.phases.map((p: PhaseResult) => p.phase);
@@ -1517,7 +1507,7 @@ test("CLI: safe-only mode runs 8 phases, --destructive runs 16", async () => {
     assert.ok(names.includes("channelWakeFromSleep"));
     assert.ok(names.includes("channelGatewayContinuity:slack"));
     assert.ok(names.includes("channelGatewayContinuity:telegram"));
-    assert.ok(names.includes("channelGatewayContinuity:discord"));
+    assert.ok(!names.includes("channelGatewayContinuity:discord"));
     // chatCompletions appears multiple times (safe + destructive)
     assert.ok(names.filter((n: string) => n === "chatCompletions").length >= 2);
 

@@ -13,6 +13,7 @@ import { extractRequestId, logInfo, logWarn } from "@/server/log";
 import { buildPublicDisplayUrl, buildPublicUrl } from "@/server/public-url";
 import { extractChannelPlatformDeliveryId } from "@/server/channels/delivery-id";
 import { withChannelConfigLease } from "@/server/channels/config-lock";
+import { HOSTED_DISCORD_UNAVAILABLE_MESSAGE } from "@/server/channels/discord/hosted-support";
 import {
   smokeChannelConfigLockKey,
   smokeDiscordKeyPairKey,
@@ -709,6 +710,18 @@ export async function POST(request: Request): Promise<Response> {
       headers: { "Content-Type": "application/json", ...headers },
       body: payloadBody,
     });
+    const responseBody = (await res.json().catch(() => null)) as
+      | {
+          type?: unknown;
+          data?: { content?: unknown; flags?: unknown };
+        }
+      | null;
+    const pingAcknowledged = res.ok && responseBody?.type === 1;
+    const hostedFailClosed =
+      res.ok &&
+      responseBody?.type === 4 &&
+      responseBody.data?.content === HOSTED_DISCORD_UNAVAILABLE_MESSAGE &&
+      responseBody.data.flags === 64;
 
     logInfo("admin.smoke_webhook_dispatch_completed", {
       requestId,
@@ -716,12 +729,16 @@ export async function POST(request: Request): Promise<Response> {
       status: res.status,
       ok: res.ok,
       deliveryId,
+      pingAcknowledged,
+      hostedFailClosed,
     });
     return authJsonOk(
       {
         configured: true,
         sent: res.ok,
-        webhookAccepted: res.ok,
+        webhookAccepted: false,
+        pingAcknowledged,
+        hostedFailClosed,
         status: res.status,
         channel,
         deliveryId,

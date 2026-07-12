@@ -229,6 +229,84 @@ test("telegram publishes the new webhook secret before registering it remotely",
   });
 });
 
+test("telegram same-bot rotation preserves the queued delivery identity", async () => {
+  await withHarness(async (h) => {
+    _setAiGatewayTokenOverrideForTesting("oidc-token");
+    const originalAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    process.env.NEXT_PUBLIC_APP_URL = "https://openclaw.example";
+    await h.mutateMeta((meta) => {
+      meta.channels.telegram = {
+        botToken: "old-token",
+        botId: "200",
+        deliveryNamespace: "bot:200",
+        webhookSecret: "old-secret",
+        webhookUrl: "https://openclaw.example/api/channels/telegram/webhook",
+        botUsername: "same_bot",
+        configuredAt: 1,
+      };
+    });
+    let pendingSecret: string | null = null;
+    const fetchMock = mock.method(
+      globalThis,
+      "fetch",
+      async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/botrotated-token/getMe")) {
+          return Response.json({
+            ok: true,
+            result: {
+              id: 200,
+              is_bot: true,
+              first_name: "Same",
+              username: "same_bot",
+            },
+          });
+        }
+        if (url.endsWith("/botrotated-token/setWebhook")) {
+          const pending = (await h.getMeta()).channels.telegram;
+          assert.equal(pending?.webhookSetupPending, true);
+          assert.equal(pending?.botId, "200");
+          assert.equal(pending?.deliveryNamespace, "bot:200");
+          assert.equal(pending?.previousWebhookSecret, "old-secret");
+          assert.equal(pending?.previousBotId, "200");
+          assert.equal(pending?.previousDeliveryNamespace, "bot:200");
+          assert.equal(pending?.previousConfiguredAt, 1);
+          assert.equal(pending?.pendingWebhookCleanups, undefined);
+          pendingSecret = pending?.webhookSecret ?? null;
+          return Response.json({ ok: true, result: true });
+        }
+        if (url.endsWith("/botrotated-token/setMyCommands")) {
+          return Response.json({ ok: true, result: true });
+        }
+        throw new Error(`unexpected Telegram API call: ${url}`);
+      },
+    );
+
+    try {
+      const result = await callRoute(
+        getTelegramChannelRoute().PUT!,
+        buildAuthPutRequest(
+          "/api/channels/telegram",
+          JSON.stringify({ botToken: "rotated-token" }),
+        ),
+      );
+      assert.equal(result.status, 200);
+      const config = (await h.getMeta()).channels.telegram;
+      assert.ok(pendingSecret);
+      assert.equal(config?.webhookSecret, pendingSecret);
+      assert.equal(config?.webhookSetupPending, false);
+      assert.equal(config?.botId, "200");
+      assert.equal(config?.deliveryNamespace, "bot:200");
+      assert.equal(config?.previousWebhookSecret, "old-secret");
+      assert.equal(config?.previousDeliveryNamespace, "bot:200");
+    } finally {
+      fetchMock.mock.restore();
+      if (originalAppUrl === undefined) delete process.env.NEXT_PUBLIC_APP_URL;
+      else process.env.NEXT_PUBLIC_APP_URL = originalAppUrl;
+    }
+  });
+});
+
 test("telegram does not activate a new webhook when running config sync fails", async () => {
   await withHarness(async (h) => {
     _setAiGatewayTokenOverrideForTesting("oidc-token");

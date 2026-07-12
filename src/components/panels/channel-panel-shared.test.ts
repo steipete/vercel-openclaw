@@ -11,7 +11,10 @@ test("getChannelActionLabel keeps connect/update/disconnect vocabulary aligned",
   );
   assert.equal(
     getChannelActionLabel("discord", "disconnect"),
-    "Disconnect Discord (experimental)",
+    "Disconnect Discord (cleanup only)",
   );
-  assert.equal(getChannelActionLabel("whatsapp", "connect"), "Connect WhatsApp (experimental)");
+  assert.equal(
+    getChannelActionLabel("whatsapp", "disconnect"),
+    "Disconnect WhatsApp (cleanup only)",
+  );
 });

@@ -22,6 +22,8 @@ export type ChannelHandoffState =
   | "fast-path-dispatching"
   | "handed-off"
   | "processing"
+  | "workflow-dispatching"
+  | "native-accepted"
   | "start-failed"
   | "terminal";
 
@@ -45,7 +47,15 @@ type PrepareResult =
 
 export type FastPathDispatchDisposition =
   | { action: "dispatch"; attemptId: string }
-  | { action: "ack"; state: "handed-off" | "processing" | "terminal" }
+  | {
+      action: "ack";
+      state:
+        | "handed-off"
+        | "processing"
+        | "workflow-dispatching"
+        | "native-accepted"
+        | "terminal";
+    }
   | {
       action: "retry" | "settle-unknown";
       state: "fast-path-dispatching";
@@ -115,6 +125,8 @@ export async function prepareChannelHandoff(input: {
     if (
       current?.state === "handed-off" ||
       current?.state === "processing" ||
+      current?.state === "workflow-dispatching" ||
+      current?.state === "native-accepted" ||
       current?.state === "terminal"
     ) {
       return { action: "ack", state: current.state };
@@ -154,7 +166,12 @@ async function transitionChannelHandoff(input: {
 }): Promise<void> {
   await withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
     if (!current || current.attemptId !== input.attemptId) return;
-    if (current.state === "processing" || current.state === "terminal") return;
+    if (
+      current.state === "processing" ||
+      current.state === "workflow-dispatching" ||
+      current.state === "native-accepted" ||
+      current.state === "terminal"
+    ) return;
     await save({
       ...current,
       revision: current.revision + 1,
@@ -205,6 +222,12 @@ export async function claimChannelHandoff(input: {
   return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
     if (!current || current.attemptId !== input.attemptId) return false;
     if (current.state === "processing") return current.runId === input.runId;
+    if (
+      current.state === "workflow-dispatching" ||
+      current.state === "native-accepted"
+    ) {
+      return current.runId === input.runId;
+    }
     if (current.state === "terminal") return false;
     await save({
       ...current,
@@ -218,12 +241,109 @@ export async function claimChannelHandoff(input: {
   });
 }
 
+export type ChannelWorkflowDispatchDisposition =
+  | { action: "dispatch" }
+  | { action: "resume-accepted" }
+  | { action: "settle-unknown" }
+  | { action: "skip" };
+
+/** Fence the exact Workflow owner before its non-idempotent native dispatch. */
+export async function beginChannelWorkflowDispatch(input: {
+  channel: ChannelName;
+  deliveryId: string;
+  attemptId: string;
+  runId: string;
+}): Promise<ChannelWorkflowDispatchDisposition> {
+  return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+    if (
+      !current ||
+      current.attemptId !== input.attemptId ||
+      current.runId !== input.runId
+    ) {
+      return { action: "skip" };
+    }
+    if (current.state === "native-accepted") {
+      return { action: "resume-accepted" };
+    }
+    if (current.state === "workflow-dispatching") {
+      return { action: "settle-unknown" };
+    }
+    if (current.state !== "processing") {
+      return { action: "skip" };
+    }
+    await save({
+      ...current,
+      revision: current.revision + 1,
+      state: "workflow-dispatching",
+      updatedAt: Date.now(),
+      error: null,
+    });
+    return { action: "dispatch" };
+  });
+}
+
+/** Persist authoritative native acceptance without coupling it to UI cleanup. */
+export async function markChannelWorkflowNativeAccepted(input: {
+  channel: ChannelName;
+  deliveryId: string;
+  attemptId: string;
+  runId: string;
+}): Promise<boolean> {
+  return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+    if (
+      !current ||
+      current.attemptId !== input.attemptId ||
+      current.runId !== input.runId
+    ) {
+      return false;
+    }
+    if (current.state === "native-accepted") return true;
+    if (current.state !== "workflow-dispatching") return false;
+    await save({
+      ...current,
+      revision: current.revision + 1,
+      state: "native-accepted",
+      updatedAt: Date.now(),
+      error: null,
+    });
+    return true;
+  });
+}
+
+/** Re-open only a dispatch that the native handler definitely rejected. */
+export async function resetChannelWorkflowDispatch(input: {
+  channel: ChannelName;
+  deliveryId: string;
+  attemptId: string;
+  runId: string;
+}): Promise<boolean> {
+  return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+    if (
+      !current ||
+      current.state !== "workflow-dispatching" ||
+      current.attemptId !== input.attemptId ||
+      current.runId !== input.runId
+    ) {
+      return false;
+    }
+    await save({
+      ...current,
+      revision: current.revision + 1,
+      state: "processing",
+      updatedAt: Date.now(),
+      error: null,
+    });
+    return true;
+  });
+}
+
 export async function markChannelDeliveryTerminal(input: {
   channel: ChannelName;
   deliveryId: string;
   expectedAttemptId?: string | null;
 }): Promise<boolean> {
   return withHandoffLock(input.channel, input.deliveryId, async (current, save) => {
+    if (current?.state === "native-accepted") return false;
     if (
       input.expectedAttemptId &&
       (!current ||
@@ -258,6 +378,8 @@ export async function markChannelFastPathDispatching(input: {
     if (
       current?.state === "handed-off" ||
       current?.state === "processing" ||
+      current?.state === "workflow-dispatching" ||
+      current?.state === "native-accepted" ||
       current?.state === "terminal"
     ) {
       return { action: "ack", state: current.state };

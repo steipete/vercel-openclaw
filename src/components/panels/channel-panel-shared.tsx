@@ -13,8 +13,8 @@ export type ChannelActionKind = "connect" | "update" | "disconnect";
 const CHANNEL_DISPLAY_NAMES: Record<SupportedChannelName, string> = {
   slack: "Slack",
   telegram: "Telegram",
-  discord: "Discord (experimental)",
-  whatsapp: "WhatsApp (experimental)",
+  discord: "Discord (cleanup only)",
+  whatsapp: "WhatsApp (cleanup only)",
 };
 
 export function getChannelActionLabel(

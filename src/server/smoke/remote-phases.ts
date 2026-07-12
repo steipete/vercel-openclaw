@@ -7,10 +7,13 @@
 
 import { randomUUID } from "node:crypto";
 
+import {
+  HOSTED_DELIVERY_CHANNEL_NAMES,
+  type HostedDeliveryChannelName,
+} from "@/shared/channels";
 import { authHeaders, getAuthSource as _getAuthSource } from "./remote-auth.js";
 import {
   buildSlackSmokePayload,
-  buildDiscordSmokePayload,
   buildTelegramSmokePayload,
 } from "./remote-crypto.js";
 
@@ -680,7 +683,8 @@ async function removeTestChannels(
  * Returns admission status and an exact delivery ID, or null if the endpoint
  * is unreachable.
  */
-type SmokeChannel = "slack" | "telegram" | "discord";
+type SmokeChannel = HostedDeliveryChannelName | "discord";
+type HostedDeliverySmokeChannel = HostedDeliveryChannelName;
 
 function isSmokeChannel(value: unknown): value is SmokeChannel {
   return value === "slack" || value === "telegram" || value === "discord";
@@ -694,13 +698,13 @@ type SmokeDispatchResult = {
   deliveryId?: string | null;
 };
 
-type SmokeDispatchMap = Record<SmokeChannel, SmokeDispatchResult | null>;
+type SmokeDispatchMap = Record<HostedDeliverySmokeChannel, SmokeDispatchResult | null>;
 
 function attemptedSmokeDispatches(
   dispatches: SmokeDispatchMap,
-): Array<[SmokeChannel, SmokeDispatchResult | null]> {
+): Array<[HostedDeliverySmokeChannel, SmokeDispatchResult | null]> {
   return (Object.entries(dispatches) as Array<
-    [SmokeChannel, SmokeDispatchResult | null]
+    [HostedDeliverySmokeChannel, SmokeDispatchResult | null]
   >).filter(([, result]) => result === null || result.configured === true);
 }
 
@@ -790,7 +794,7 @@ type NativeAcceptanceProbe = {
 
 async function pollNativeAcceptance(input: {
   baseUrl: string;
-  channel: SmokeChannel;
+  channel: HostedDeliverySmokeChannel;
   deliveryId: string;
   timeoutMs: number;
   requestTimeoutMs: number;
@@ -851,7 +855,7 @@ export async function channelRoundTrip(baseUrl: string, opts?: PhaseOptions & { 
   const result = await (async (): Promise<PhaseResult> => {
     try {
     const dispatch = async (): Promise<SmokeDispatchMap> => {
-      const [slack, telegram, discord] = await Promise.all([
+      const [slack, telegram] = await Promise.all([
         sendSmokeWebhook(
           baseUrl,
           "slack",
@@ -864,21 +868,15 @@ export async function channelRoundTrip(baseUrl: string, opts?: PhaseOptions & { 
           buildTelegramSmokePayload(),
           reqTimeout,
         ),
-        sendSmokeWebhook(
-          baseUrl,
-          "discord",
-          buildDiscordSmokePayload(),
-          reqTimeout,
-        ),
       ]);
-      return { slack, telegram, discord };
+      return { slack, telegram };
     };
 
     let dispatches = await dispatch();
     if (Object.values(dispatches).every((result) => result === null)) {
       const summary = await fetchChannelSummary(baseUrl, reqTimeout);
       const noConfiguredChannels = summary !== null &&
-        (["slack", "telegram", "discord"] as const).every(
+        HOSTED_DELIVERY_CHANNEL_NAMES.every(
           (channel) => summary[channel]?.connected === false,
         );
       if (noConfiguredChannels) {
@@ -908,7 +906,7 @@ export async function channelRoundTrip(baseUrl: string, opts?: PhaseOptions & { 
         const setup = await configureTestChannels(
           baseUrl,
           reqTimeout,
-          ["slack", "telegram", "discord"],
+          [...HOSTED_DELIVERY_CHANNEL_NAMES],
         );
         if (!setup) {
           log(phase, "failed", { reason: "auto-configure-failed" });
@@ -1072,7 +1070,7 @@ export async function channelWakeFromSleep(
       const setup = await configureTestChannels(
         baseUrl,
         reqTimeout,
-        ["slack", "telegram"],
+        [...HOSTED_DELIVERY_CHANNEL_NAMES],
       );
       if (!setup) {
         log(phase, "failed", { reason: "auto-configure-failed" });
@@ -1631,7 +1629,7 @@ async function readGatewayContinuityHealth(
   };
 }
 
-export type ContinuityChannel = "slack" | "telegram" | "discord";
+export type ContinuityChannel = HostedDeliverySmokeChannel;
 
 function buildChannelSmokePayload(channel: ContinuityChannel): string {
   switch (channel) {
@@ -1639,8 +1637,6 @@ function buildChannelSmokePayload(channel: ContinuityChannel): string {
       return buildSlackSmokePayload().body;
     case "telegram":
       return buildTelegramSmokePayload();
-    case "discord":
-      return buildDiscordSmokePayload();
   }
 }
 

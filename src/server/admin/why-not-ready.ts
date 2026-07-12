@@ -1,4 +1,7 @@
-import type { ChannelLastForward, ChannelName } from "@/shared/channels";
+import type {
+  ChannelLastForward,
+  HostedDeliveryChannelName,
+} from "@/shared/channels";
 import type { LogEntry, SingleMeta } from "@/shared/types";
 import { filterLogEntries, getServerLogs } from "@/server/log";
 import { getInitializedMeta } from "@/server/store/store";
@@ -10,10 +13,6 @@ const RELEVANT_LOG_PREFIXES = ["channels.", "sandbox.", "gateway.", "proxy."] as
 export type Blocker = {
   kind:
     | "no_credentials"
-    | "endpoint_missing"
-    | "endpoint_drift"
-    | "command_missing"
-    | "public_url_unusable"
     | "config_sync_failed"
     | "stale_port_url"
     | "handler_not_ready"
@@ -29,8 +28,6 @@ export type Blocker = {
 
 export type ObservabilityGap = {
   kind:
-    | "deferred_ack_without_native_forward"
-    | "native_accepted_without_user_visible_reply"
     | "user_visible_reply_unknown"
     | "user_visible_reply_timed_out";
   detail: string;
@@ -50,6 +47,8 @@ export type ChannelReport = {
     userVisibleReply: unknown;
     sandboxId: string | null;
     portUrls: Record<string, string> | null;
+    legacyConfigPresent?: boolean;
+    cleanupRoute?: string | null;
   };
 };
 
@@ -81,7 +80,7 @@ function isRecentForwardOk(
 }
 
 function buildChannelReport(
-  channel: ChannelName,
+  channel: HostedDeliveryChannelName,
   meta: SingleMeta,
   now: number,
 ): ChannelReport {
@@ -102,79 +101,6 @@ function buildChannelReport(
       suggestedAction: `Configure ${channel} credentials.`,
     });
   } else {
-    if (channel === "discord") {
-      const discordConfig = meta.channels.discord;
-      if (discordConfig) {
-        const endpointUrl = discordConfig.endpointUrl ?? null;
-        const storedDriftWarning =
-          typeof discordConfig.endpointError === "string" &&
-          discordConfig.endpointError.toLowerCase().includes("different deployment");
-        if (endpointUrl && (storedDriftWarning || discordConfig.endpointConfigured !== true)) {
-          blockers.push({
-            kind: "endpoint_drift",
-            detail: "Discord interactions endpoint points at a different deployment.",
-            evidence: {
-              endpointConfigured: discordConfig.endpointConfigured === true,
-              endpointUrl,
-              endpointError: discordConfig.endpointError ?? null,
-            },
-            firstObservedAt: discordConfig.configuredAt,
-            suggestedAction: "Use the Discord panel endpoint repair action before testing /ask.",
-          });
-        } else if (!endpointUrl) {
-          blockers.push({
-            kind: "endpoint_missing",
-            detail: "Discord interactions endpoint is not configured for this deployment.",
-            evidence: {
-              endpointConfigured: discordConfig.endpointConfigured === true,
-              endpointUrl,
-            },
-            firstObservedAt: discordConfig.configuredAt,
-            suggestedAction: "Configure the Discord interactions endpoint from the Discord panel.",
-          });
-        } else if (!endpointUrl.includes("/api/channels/discord/webhook")) {
-          blockers.push({
-            kind: "endpoint_drift",
-            detail: "Discord interactions endpoint does not point at the OpenClaw Discord webhook path.",
-            evidence: { endpointUrl },
-            firstObservedAt: discordConfig.configuredAt,
-            suggestedAction: "Use the Discord panel endpoint repair action before testing /ask.",
-          });
-        }
-
-        if (discordConfig.commandRegistered !== true) {
-          blockers.push({
-            kind: "command_missing",
-            detail: "Discord /ask command is not registered.",
-            evidence: { commandId: discordConfig.commandId ?? null },
-            firstObservedAt: discordConfig.configuredAt,
-            suggestedAction: "Register /ask from the Discord panel.",
-          });
-        }
-
-        try {
-          const endpoint = new URL(endpointUrl ?? "");
-          if (endpoint.protocol !== "https:") {
-            blockers.push({
-              kind: "public_url_unusable",
-              detail: "Discord interactions endpoint must be an HTTPS public URL.",
-              evidence: { endpointUrl },
-              firstObservedAt: discordConfig.configuredAt,
-              suggestedAction: "Set a public HTTPS app URL before configuring Discord.",
-            });
-          }
-        } catch {
-          blockers.push({
-            kind: "public_url_unusable",
-            detail: "Discord interactions endpoint URL is not parseable.",
-            evidence: { endpointUrl },
-            firstObservedAt: discordConfig.configuredAt,
-            suggestedAction: "Repair the endpoint from the Discord panel.",
-          });
-        }
-      }
-    }
-
     if (lastForward?.classification === "sandbox-not-listening") {
       blockers.push({
         kind: "sandbox_not_listening",
@@ -243,32 +169,12 @@ function buildChannelReport(
     const recentlyAccepted = isRecentForwardOk(lastForward, now);
     const userVisibleReply = lastForward?.userVisibleReply ?? null;
     if (
-      channel === "discord" &&
-      (lastForward === null || lastForward === undefined)
-    ) {
-      observabilityGaps.push({
-        kind: "deferred_ack_without_native_forward",
-        detail:
-          "Discord may accept and defer an interaction before any native OpenClaw forward has been recorded.",
-        evidence: {
-          lastForward: null,
-          ackSemantics: "deferred-only",
-        },
-        firstObservedAt: now,
-        suggestedAction: "Run a real Discord /ask and inspect channels.discord_* workflow logs.",
-      });
-    }
-
-    if (
       lastForward?.ok === true &&
       lastForward.classification === "accepted" &&
       userVisibleReply?.status === "unknown"
     ) {
       observabilityGaps.push({
-        kind:
-          channel === "discord"
-            ? "native_accepted_without_user_visible_reply"
-            : "user_visible_reply_unknown",
+        kind: "user_visible_reply_unknown",
         detail: `${channel} native handler accepted the delivery, but no platform-visible OpenClaw reply was observed.`,
         evidence: {
           deliveryId: lastForward.deliveryId,
@@ -336,14 +242,11 @@ function buildChannelReport(
 
   const recentlyAccepted = isRecentForwardOk(lastForward, now);
   const configSyncApplied = liveConfigSync?.outcome === "applied";
-  const userVisibleReplyVerified = lastForward?.userVisibleReply?.status === "observed";
   const ready =
     blockers.length === 0 &&
     (channel === "slack"
       ? recentlyAccepted || configSyncApplied
-      : channel === "discord"
-        ? recentlyAccepted && userVisibleReplyVerified
-        : recentlyAccepted);
+      : recentlyAccepted);
 
   return {
     hostedDeliverySupported: true,
@@ -360,7 +263,11 @@ function buildChannelReport(
   };
 }
 
-function buildUnsupportedWhatsAppReport(meta: SingleMeta): ChannelReport {
+function buildUnsupportedChannelReport(
+  channel: "discord" | "whatsapp",
+  meta: SingleMeta,
+): ChannelReport {
+  const legacyConfigPresent = meta.channels[channel] != null;
   return {
     // Unsupported hosted transport is not a readiness blocker. Legacy config
     // remains cleanup-only and must not produce configure/fix guidance.
@@ -374,6 +281,8 @@ function buildUnsupportedWhatsAppReport(meta: SingleMeta): ChannelReport {
       userVisibleReply: null,
       sandboxId: meta.sandboxId,
       portUrls: meta.portUrls,
+      legacyConfigPresent,
+      cleanupRoute: legacyConfigPresent ? `/api/channels/${channel}` : null,
     },
   };
 }
@@ -396,8 +305,8 @@ export async function buildWhyNotReady(
   const channels = {
     slack: buildChannelReport("slack", meta, now),
     telegram: buildChannelReport("telegram", meta, now),
-    discord: buildChannelReport("discord", meta, now),
-    whatsapp: buildUnsupportedWhatsAppReport(meta),
+    discord: buildUnsupportedChannelReport("discord", meta),
+    whatsapp: buildUnsupportedChannelReport("whatsapp", meta),
   };
 
   return {

@@ -171,7 +171,7 @@ When you add or change Redis keys, route every key through `src/server/store/key
 | `/api/admin/stop` | Stop the sandbox (v2 auto-snapshots on stop) |
 | `/api/admin/snapshot` | Stop the sandbox (same as stop for now; v2 auto-snapshots) |
 | `/api/admin/snapshots/delete` | Delete a past snapshot from Vercel and local history |
-| `/api/admin/channel-secrets` | Configure smoke credentials and dispatch signed synthetic channel webhooks. Smoke dispatch uses `buildPublicUrl()` (bypass included) for all channels. |
+| `/api/admin/channel-secrets` | Configure smoke credentials and dispatch signed synthetic webhooks. Slack/Telegram exercise native acceptance; Discord only proves the immediate fail-closed response. Smoke dispatch uses `buildPublicUrl()` (bypass included). |
 | `/api/admin/channel-forward-diag` | Read channel forward diagnostic from store |
 | `/api/cron/watchdog` | Cron watchdog for health repair and scheduled OpenClaw cron wake |
 | `/api/admin/watchdog` | Read cached watchdog report or run a fresh one |
@@ -180,7 +180,8 @@ When you add or change Redis keys, route every key through `src/server/store/key
 | `/api/channels/slack/webhook` | Public Slack webhook |
 | `/api/channels/telegram/webhook` | Public Telegram webhook |
 | `/api/channels/whatsapp/webhook` | Disabled hosted WhatsApp endpoint (returns `410`) |
-| `/api/channels/discord` | Discord channel config (experimental) |
+| `/api/channels/discord` | Disabled hosted Discord config; `DELETE` detaches retained legacy endpoints and removes credentials |
+| `/api/channels/discord/webhook` | Legacy signed Discord endpoint; PING is acknowledged and other interactions receive an immediate fail-closed reply |
 
 ## Verification behavior that is easy to miss
 

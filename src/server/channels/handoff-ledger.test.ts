@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test, { beforeEach, mock } from "node:test";
 
 import {
+  beginChannelWorkflowDispatch,
   CHANNEL_FAST_PATH_DISPATCH_STALE_MS,
   classifyFastPathDispatch,
   claimChannelHandoff,
@@ -10,9 +11,11 @@ import {
   markChannelHandoffHandedOff,
   markChannelHandoffStartFailed,
   markChannelHandoffStarting,
+  markChannelWorkflowNativeAccepted,
   prepareChannelHandoff,
   readChannelHandoff,
   renewChannelFastPathDispatch,
+  resetChannelWorkflowDispatch,
 } from "@/server/channels/handoff-ledger";
 import { _resetStoreForTesting } from "@/server/store/store";
 
@@ -254,4 +257,132 @@ test("late route handoff cannot overwrite workflow processing ownership", async 
   const record = await readChannelHandoff("telegram", "telegram:2");
   assert.equal(record?.state, "processing");
   assert.equal(record?.runId, "run-fast");
+});
+
+test("workflow dispatch fence prevents replay and preserves native acceptance", async () => {
+  const prepared = await prepareChannelHandoff({
+    channel: "slack",
+    deliveryId: "slack:user-message:C1:1.0",
+    envelope: { version: 1 },
+  });
+  assert.equal(prepared.action, "start");
+  if (prepared.action !== "start") return;
+  assert.equal(
+    await claimChannelHandoff({
+      channel: "slack",
+      deliveryId: "slack:user-message:C1:1.0",
+      attemptId: prepared.attemptId,
+      runId: "run-fenced",
+    }),
+    true,
+  );
+  assert.deepEqual(
+    await beginChannelWorkflowDispatch({
+      channel: "slack",
+      deliveryId: "slack:user-message:C1:1.0",
+      attemptId: prepared.attemptId,
+      runId: "run-fenced",
+    }),
+    { action: "dispatch" },
+  );
+  assert.deepEqual(
+    await beginChannelWorkflowDispatch({
+      channel: "slack",
+      deliveryId: "slack:user-message:C1:1.0",
+      attemptId: prepared.attemptId,
+      runId: "run-fenced",
+    }),
+    { action: "settle-unknown" },
+  );
+  assert.equal(
+    await markChannelWorkflowNativeAccepted({
+      channel: "slack",
+      deliveryId: "slack:user-message:C1:1.0",
+      attemptId: prepared.attemptId,
+      runId: "run-fenced",
+    }),
+    true,
+  );
+  assert.deepEqual(
+    await prepareChannelHandoff({
+      channel: "slack",
+      deliveryId: "slack:user-message:C1:1.0",
+      envelope: { version: 1 },
+    }),
+    { action: "ack", state: "native-accepted" },
+  );
+  assert.equal(
+    await claimChannelHandoff({
+      channel: "slack",
+      deliveryId: "slack:user-message:C1:1.0",
+      attemptId: prepared.attemptId,
+      runId: "run-fenced",
+    }),
+    true,
+  );
+  assert.deepEqual(
+    await beginChannelWorkflowDispatch({
+      channel: "slack",
+      deliveryId: "slack:user-message:C1:1.0",
+      attemptId: prepared.attemptId,
+      runId: "run-fenced",
+    }),
+    { action: "resume-accepted" },
+  );
+  assert.equal(
+    await markChannelDeliveryTerminal({
+      channel: "slack",
+      deliveryId: "slack:user-message:C1:1.0",
+    }),
+    false,
+  );
+});
+
+test("definite workflow rejection reopens only the exact dispatch owner", async () => {
+  const prepared = await prepareChannelHandoff({
+    channel: "slack",
+    deliveryId: "slack:event-rejected",
+    envelope: { version: 1 },
+  });
+  assert.equal(prepared.action, "start");
+  if (prepared.action !== "start") return;
+  await claimChannelHandoff({
+    channel: "slack",
+    deliveryId: "slack:event-rejected",
+    attemptId: prepared.attemptId,
+    runId: "run-rejected",
+  });
+  await beginChannelWorkflowDispatch({
+    channel: "slack",
+    deliveryId: "slack:event-rejected",
+    attemptId: prepared.attemptId,
+    runId: "run-rejected",
+  });
+  assert.equal(
+    await resetChannelWorkflowDispatch({
+      channel: "slack",
+      deliveryId: "slack:event-rejected",
+      attemptId: prepared.attemptId,
+      runId: "wrong-run",
+    }),
+    false,
+  );
+  assert.equal(
+    await resetChannelWorkflowDispatch({
+      channel: "slack",
+      deliveryId: "slack:event-rejected",
+      attemptId: prepared.attemptId,
+      runId: "run-rejected",
+    }),
+    true,
+  );
+  assert.deepEqual(
+    await beginChannelWorkflowDispatch({
+      channel: "slack",
+      deliveryId: "slack:event-rejected",
+      attemptId: prepared.attemptId,
+      runId: "run-rejected",
+    }),
+    { action: "dispatch" },
+  );
 });

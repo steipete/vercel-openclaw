@@ -30,7 +30,7 @@ const scanRoots = [
   "package.json",
   "vercel.json",
   "README.md",
-  "CLAUDE.md",
+  "AGENTS.md",
   "CONTRIBUTING.md",
   ".github/workflows",
   "Makefile",

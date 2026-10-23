@@ -15,7 +15,7 @@ const ROOT = process.cwd();
 const CANDIDATE_PATHS = [
   "package.json",
   "README.md",
-  "CLAUDE.md",
+  "AGENTS.md",
   "Makefile",
   ".github/workflows",
   "scripts",

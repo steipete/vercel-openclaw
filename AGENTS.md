@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents working in this repository.
 
 `vercel-openclaw` is a single-instance Next.js 16 app that manages exactly one persistent Vercel Sandbox running OpenClaw: auth, on-demand create/resume, proxy at `/gateway`, HTML injection for WebSocket rewrite and gateway-token handoff, firewall learning, and channel webhooks (Slack, Telegram, Discord, WhatsApp).
 
@@ -15,7 +15,7 @@ pnpm install
 pnpm dev
 node scripts/verify.mjs             # canonical CI entrypoint; runs lint/test/typecheck/build
 node scripts/verify.mjs --steps=test,typecheck
-pnpm check:verify-contract          # guards documented env vars across README/CLAUDE.md/CONTRIBUTING.md/.env.example
+pnpm check:verify-contract          # guards documented env vars across README/AGENTS.md/CONTRIBUTING.md/.env.example
 pnpm smoke:remote --base-url https://my-app.vercel.app [--destructive] [--auth-cookie "session=..."]
 ```
 
@@ -32,7 +32,7 @@ Guide pages:
 - `docs/getting-started/vclaw-create.md` — supported install flow, flags, non-interactive runs, and failure boundaries.
 - `docs/getting-started/release-and-reliability.md` — OpenClaw bundle assets, dashboard verification, CLI publish, and risk areas.
 
-Keep `README.md`, `docs/README.md`, and this file in sync when the guide moves or its scope changes. `AGENTS.md` is a symlink to this file, so updates here are also the agent-facing instructions.
+Keep `README.md`, `docs/README.md`, and this file in sync when the guide moves or its scope changes. `AGENTS.md` is the canonical agent-facing instructions file.
 
 ## Local dev against prod env
 
@@ -86,7 +86,7 @@ These are the things Claude will otherwise get wrong:
 - **`logDebug` vs `logInfo`**: the `/api/admin/logs` ring buffer only retains info-level entries. Use `logDebug` on any code that runs on every request (status polling, connectability, URL resolution) so operational logs don't get evicted.
 - **Test-only controller override**: `_setSandboxControllerForTesting()` is a no-op unless `NODE_ENV=test`. In production, `getSandboxController()` always returns the real `@vercel/sandbox` v2 SDK.
 - **`_setAiGatewayTokenOverrideForTesting()`** is the supported way to stub OIDC in tests — do not mock `@vercel/oidc` directly.
-- **Updating env vars**: changes to `.env.example`, `README.md`, `CONTRIBUTING.md`, and `CLAUDE.md` must stay in sync — enforced by `scripts/check-verifier-contract.mjs` (`pnpm check:verify-contract`).
+- **Updating env vars**: changes to `.env.example`, `README.md`, `CONTRIBUTING.md`, and `AGENTS.md` must stay in sync — enforced by `scripts/check-verifier-contract.mjs` (`pnpm check:verify-contract`).
 
 ## Debugging channel delivery
 
@@ -169,7 +169,7 @@ Merge gate before fixes: all lane handoffs are present, or any missing lane is e
    1. App connected.        2. Real Slack-UI msg reaches the bot.
    3. Bot replies in DM.    4. summary.lastForward.ok:true classification:accepted.
    5. deliveryReady && routeReady true.   6. why-not-ready has no blocker.
-   7. Tests pass.           8. Committed + pushed.   9. CLAUDE.md updated if new failure mode found.
+   7. Tests pass.           8. Committed + pushed.   9. AGENTS.md updated if new failure mode found.
    ```
 
 4. **Deployment-state proof.** Before reasoning about runtime behavior, prove the deployed code matches the source you're reading:
@@ -271,7 +271,7 @@ For cron incidents, start with `$cron-watchdog-debug`. It requires deployment pr
 3. SSH `tail /tmp/openclaw/openclaw-*.log` — boot sequence stops at `"starting..."` without ever reaching `"starting HTTP server..."`? → new gateway died on port-conflict.
 4. SSH `cat /home/vercel-sandbox/.openclaw/openclaw.json | grep channels` — config has `channels.slack`? → wrapper-side config is correct, this is a runtime kill bug.
 
-If all four match, you're seeing the openclaw-42 wedge. The deployed code already has the fix (commit after this CLAUDE.md update); existing sandboxes need either `POST /api/admin/reset` (regenerates the script and re-bootstraps) or a manual SSH `kill <pid>` of the old gateway followed by `bash /home/vercel-sandbox/.openclaw/.restart-gateway.sh`.
+If all four match, you're seeing the openclaw-42 wedge. The deployed code already has the fix (commit after this guidance update); existing sandboxes need either `POST /api/admin/reset` (regenerates the script and re-bootstraps) or a manual SSH `kill <pid>` of the old gateway followed by `bash /home/vercel-sandbox/.openclaw/.restart-gateway.sh`.
 
 ### The three failure modes that used to look identical
 

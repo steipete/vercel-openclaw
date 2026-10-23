@@ -37,5 +37,5 @@ The guide is the fast path. Use the existing deep docs when you need implementat
 ## Maintenance Notes
 
 - Keep this guide concise and link to deep docs instead of copying entire implementation walkthroughs.
-- Keep `README.md`, `docs/README.md`, and `CLAUDE.md`/`AGENTS.md` pointed at this guide as the main onboarding path.
+- Keep `README.md`, `docs/README.md`, and `AGENTS.md` pointed at this guide as the main onboarding path.
 - If `vclaw` flags, OpenClaw bundle assets, or dashboard verification gates change, update the relevant guide page in the same change.

@@ -71,7 +71,7 @@ Channel incidents are layered. Separate these states in reports and code: OAuth/
 
 The Workflow wake path forwards the original platform payload to OpenClaw's native channel handler after the sandbox is ready. Do not treat it as a generic chat-completions fallback when debugging delivery.
 
-For stuck delivery, start from live evidence: `GET /api/admin/why-not-ready`, `GET /api/channels/summary`, `GET /api/admin/sandbox-diag`, and `GET /api/admin/logs`. Use [Channels and Webhooks](../channels-and-webhooks.md) and the channel-debug instructions in `CLAUDE.md`/`AGENTS.md` before proposing fixes.
+For stuck delivery, start from live evidence: `GET /api/admin/why-not-ready`, `GET /api/channels/summary`, `GET /api/admin/sandbox-diag`, and `GET /api/admin/logs`. Use [Channels and Webhooks](../channels-and-webhooks.md) and the channel-debug instructions in `AGENTS.md` before proposing fixes.
 
 ## Verification Boundaries
 

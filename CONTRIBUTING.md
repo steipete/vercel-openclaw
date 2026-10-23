@@ -32,7 +32,7 @@ Additional verification commands:
 ```bash
 pnpm verify:observability-pass   # preflight + launch-verify + deploy-requirements + lifecycle tests
 pnpm check:deploy-readiness      # machine-checkable deployment readiness report
-pnpm check:verify-contract       # docs/env contract guard for README.md, CLAUDE.md, CONTRIBUTING.md, .env.example
+pnpm check:verify-contract       # docs/env contract guard for README.md, AGENTS.md, CONTRIBUTING.md, .env.example
 ```
 
 ### Maintainer observability contract
@@ -64,7 +64,7 @@ pnpm smoke:remote --base-url https://my-app.vercel.app
 pnpm smoke:remote --base-url https://my-app.vercel.app --destructive --timeout 180
 ```
 
-See `CLAUDE.md` for the full list of smoke test flags.
+See `AGENTS.md` for the full list of smoke test flags.
 
 ## Architecture
 
@@ -302,7 +302,7 @@ Example:
 
 Use this log for machine-readable postmortems. Use persisted `channelReadiness` for deployment-level readiness state that survives the request.
 
-See `CLAUDE.md` for the complete route table and detailed system documentation.
+See `AGENTS.md` for the complete route table and detailed system documentation.
 
 ## Documentation structure
 
@@ -313,7 +313,7 @@ See `CLAUDE.md` for the complete route table and detailed system documentation.
 | `docs/api-reference.md` | Machine-readable endpoints, payloads, automation contracts |
 | `docs/deployment-protection.md` | Bypass secrets, webhook URL behavior |
 | `CONTRIBUTING.md` | Architecture, routes, testing, development workflows |
-| `CLAUDE.md` | AI assistant instructions and system internals |
+| `AGENTS.md` | AI assistant instructions and system internals |
 
 See `SECURITY.md` for vulnerability reporting.
 See `CODE_OF_CONDUCT.md` for community participation standards.

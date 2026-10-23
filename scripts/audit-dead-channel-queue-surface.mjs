@@ -43,7 +43,7 @@ const TARGETS = [
   "src",
   "scripts",
   "README.md",
-  "CLAUDE.md",
+  "AGENTS.md",
   ".env.example",
   "package.json",
   "vercel.json",
@@ -76,6 +76,7 @@ const EXCLUDED_FILES = new Set([SELF_REL]);
  * as allowed exceptions, not violations.
  */
 const LAUNCH_VERIFY_ALLOWLIST = new Set([
+  "package.json::vercel-queue-dependency",
   "src/app/api/queues/launch-verify/route.ts::vercel-queue-dependency",
   "src/server/launch-verify/queue-probe.ts::vercel-queue-dependency",
   "src/app/api/admin/launch-verify/route.test.ts::vercel-queue-dependency",

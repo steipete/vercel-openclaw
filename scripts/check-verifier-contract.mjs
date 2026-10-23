@@ -56,7 +56,7 @@ if (!existsSync(makefilePath)) {
 // disallowed automation commands that would mislead external verifiers
 const docFiles = [
   "README.md",
-  "CLAUDE.md",
+  "AGENTS.md",
 ];
 const disallowedPatterns = [
   { pattern: /\bnpm(?:\s+run)?\s+(?:test|lint|typecheck|build)\b/g, label: "npm run <step>" },
@@ -84,7 +84,7 @@ for (const relPath of docFiles) {
 // (currently openclaw@2026.4.12). Docs must not contradict either of these facts.
 // ---------------------------------------------------------------------------
 
-const policyDocFiles = ["README.md", "CLAUDE.md", "CONTRIBUTING.md"];
+const policyDocFiles = ["README.md", "AGENTS.md", "CONTRIBUTING.md"];
 const policyContradictions = [
   {
     // Catches "fails (not warns)", "fail (not warn)", etc.
@@ -196,7 +196,7 @@ if (contractEnvNames.size === 0) {
 
 const envDocFiles = {
   "docs/environment-variables.md": path.join(rootDir, "docs", "environment-variables.md"),
-  "CLAUDE.md": path.join(rootDir, "CLAUDE.md"),
+  "AGENTS.md": path.join(rootDir, "AGENTS.md"),
   "CONTRIBUTING.md": path.join(rootDir, "CONTRIBUTING.md"),
   ".env.example": path.join(rootDir, ".env.example"),
 };
@@ -236,12 +236,12 @@ const wordingRequirements = [
   {
     snippet: "deployment contract **warns** — it does not fail",
     label: "OPENCLAW_PACKAGE_SPEC warn-only policy",
-    files: ["CLAUDE.md"],
+    files: ["AGENTS.md"],
   },
   {
     snippet: "warningChannelIds` is deprecated",
     label: "launch verification deprecated diagnostics field",
-    files: ["docs/api-reference.md", "CONTRIBUTING.md", "CLAUDE.md"],
+    files: ["docs/api-reference.md", "CONTRIBUTING.md", "AGENTS.md"],
   },
   {
     snippet: "verify.step.start",
@@ -271,7 +271,7 @@ for (const { snippet, label, files } of wordingRequirements) {
 
 // ---------------------------------------------------------------------------
 // Operator route documentation checks — ensure CONTRIBUTING.md documents
-// every operator-facing route that CLAUDE.md describes.
+// every operator-facing route that AGENTS.md describes.
 // ---------------------------------------------------------------------------
 
 const routeDocRequirements = [
@@ -332,25 +332,25 @@ const docsSurfaceRequirements = [
     optional: false,
   },
   {
-    files: ["docs/api-reference.md", "CONTRIBUTING.md", "CLAUDE.md"],
+    files: ["docs/api-reference.md", "CONTRIBUTING.md", "AGENTS.md"],
     snippet: "`GET /api/admin/launch-verify` returns",
     label: "launch-verify GET readiness surface",
     optional: false,
   },
   {
-    files: ["docs/api-reference.md", "CONTRIBUTING.md", "CLAUDE.md"],
+    files: ["docs/api-reference.md", "CONTRIBUTING.md", "AGENTS.md"],
     snippet: "channelReadiness",
     label: "launch-verify extended response payload",
     optional: false,
   },
   {
-    files: ["docs/api-reference.md", "CONTRIBUTING.md", "CLAUDE.md"],
+    files: ["docs/api-reference.md", "CONTRIBUTING.md", "AGENTS.md"],
     snippet: "ChannelReadiness",
     label: "launch-verify readiness type docs",
     optional: false,
   },
   {
-    files: ["docs/api-reference.md", "CONTRIBUTING.md", "CLAUDE.md"],
+    files: ["docs/api-reference.md", "CONTRIBUTING.md", "AGENTS.md"],
     snippet: "terminal `result` event carries the same extended payload",
     label: "launch-verify NDJSON result payload docs",
     optional: false,
